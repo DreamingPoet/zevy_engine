@@ -1,41 +1,69 @@
-## rust 相关
-* 当前项目使用稳定版 Rust
+# zevy_engine
+
+`zevy_engine` is a custom VR rendering engine project built with Rust, [Bevy](https://bevyengine.org/), and OpenXR.
+
+The goal of this project is to support the production of real-time, first-person, interactive VR experiences with modern rendering features such as:
+
+- PBR materials
+- Multiple light sources
+- OpenXR support
+- Vulkan-based rendering
+
+## Development Environment
+
+This project uses the stable Rust toolchain.
+
+Set the local toolchain to stable:
+
 ```bash
 rustup override set stable
 ```
-* 查看版本
+
+Check the installed Cargo version:
+
 ```bash
 cargo --version
 ```
 
-* 查看当前的最新版本是什么版本
+Inspect the currently installed Rust toolchains and check for updates:
+
 ```bash
 rustup show
 rustup check
-
 ```
-## 项目相关
-### 开发目标
-    定制开发一款VR体验内容（实时渲染的，第一人称，参与型的VR体验）制作和渲染引擎，支持PBR 材质，多灯光，支持OpenXR, 支持Vulkan 技术
 
-### 开发形式
-    本次开发采用 zevy_engine + demo内容开发的形式，在引擎开发完成之后，会有一个单独的内容包
-    代码需要区分为 zevy_engine 代码和demo内容代码，不能混淆
+## Project Structure
 
-### 开发流程
-    1. 完成 bevy + openxr
-    2. 
+This repository is intended to focus on engine development first.
 
+The overall development approach is:
 
-# 引擎开发内容
-1. 完成bevy引擎全部的更新
-2. 开发场景管理系统
-3. 开发物理系统
-4. 开发AI系统
-5. 开发特效系统
-6. 开发音效系统
-7. 开发UI系统
-8. 开发网络系统
-9. 开发物理系统
+- `zevy_engine` contains the engine-side code.
+- A separate demo or content package will be developed alongside the engine.
+- Engine code and demo/content code should remain clearly separated.
 
-# 内容开发内容
+## Current Status
+
+The current prototype already includes:
+
+- Bevy integration
+- OpenXR plugin setup
+- A simple 3D scene for initial rendering validation
+
+## Running the Project
+
+To build and run the current prototype:
+
+```bash
+cargo run
+```
+
+## Development Goals
+
+The planned work is divided into two tracks:
+
+1. Engine development
+   - Complete the Bevy + OpenXR integration
+   - Continue expanding the rendering and VR feature set
+2. Content development
+   - Build interactive demo content on top of the engine
