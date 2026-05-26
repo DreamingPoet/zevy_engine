@@ -6,3 +6,5 @@ edition = "2024"
 [dependencies]
 bevy = "0.16.1"
 bevy_mod_openxr = "0.3.0"
+bevy_mod_xr = "0.3.0"
+bevy_xr_utils = "0.3.0"

@@ -1330,6 +1330,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "bevy_xr_utils"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b308b7a2f23be028726c0315e932ff7e18c273703ac2bc08c85d643e8ecb9626"
+dependencies = [
+ "bevy",
+ "bevy_mod_openxr",
+ "bevy_mod_xr",
+ "openxr",
+]
+
+[[package]]
 name = "bindgen"
 version = "0.70.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5461,6 +5473,8 @@ version = "0.1.0"
 dependencies = [
  "bevy",
  "bevy_mod_openxr",
+ "bevy_mod_xr",
+ "bevy_xr_utils",
 ]
 
 [[package]]
