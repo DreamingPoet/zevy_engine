@@ -1,11 +1,29 @@
 use std::env;
 
-use bevy::{math::vec3, prelude::*, render::pipelined_rendering::PipelinedRenderingPlugin};
-use bevy_mod_openxr::{
-    action_binding::OxrSendActionBindings, add_xr_plugins, helper_traits::ToQuat,
-    resources::OxrViews,
+use bevy::{
+    math::vec3,
+    prelude::*,
+    render::{RenderPlugin, pipelined_rendering::PipelinedRenderingPlugin},
+    utils::default,
+    window::{PresentMode, Window, WindowPlugin},
 };
-use bevy_mod_xr::session::{XrSessionCreated, XrTracker, XrTrackingRoot};
+use bevy_mod_openxr::{
+    action_binding::{OxrActionBindingPlugin, OxrSendActionBindings},
+    action_set_attaching::OxrActionAttachingPlugin,
+    action_set_syncing::OxrActionSyncingPlugin,
+    features::{handtracking::HandTrackingPlugin, overlay::OxrOverlayPlugin},
+    helper_traits::ToQuat,
+    init::OxrInitPlugin,
+    poll_events::OxrEventsPlugin,
+    reference_space::OxrReferenceSpacePlugin,
+    render::OxrRenderPlugin,
+    resources::OxrViews,
+    spaces::{OxrSpacePatchingPlugin, OxrSpatialPlugin},
+};
+use bevy_mod_xr::{
+    camera::XrCameraPlugin,
+    session::{XrSessionCreated, XrSessionPlugin, XrTracker, XrTrackingRoot},
+};
 use bevy_xr_utils::{
     tracking_utils::{
         TrackingUtilitiesPlugin, XrTrackedLeftGrip, XrTrackedRightGrip, XrTrackedView,
@@ -26,19 +44,17 @@ fn main() {
             app.add_plugins(DefaultPlugins);
         }
         LaunchMode::Xr => {
-            app.add_plugins(add_xr_plugins(
-                DefaultPlugins.build().disable::<PipelinedRenderingPlugin>(),
-            ))
-            .add_plugins(TrackingUtilitiesPlugin)
-            .add_plugins(XRUtilsActionsPlugin)
-            .add_plugins(bevy_mod_xr::hand_debug_gizmos::HandGizmosPlugin)
-            .add_systems(
-                Startup,
-                setup_xr_actions.before(XRUtilsActionSystemSet::CreateEvents),
-            )
-            .add_systems(OxrSendActionBindings, suggest_action_bindings)
-            .add_systems(XrSessionCreated, spawn_xr_anchor_visuals)
-            .add_systems(Update, (handle_xr_locomotion, log_xr_trigger_input));
+            app.add_plugins(xr_plugins())
+                .add_plugins(TrackingUtilitiesPlugin)
+                .add_plugins(XRUtilsActionsPlugin)
+                .add_plugins(bevy_mod_xr::hand_debug_gizmos::HandGizmosPlugin)
+                .add_systems(
+                    Startup,
+                    setup_xr_actions.before(XRUtilsActionSystemSet::CreateEvents),
+                )
+                .add_systems(OxrSendActionBindings, suggest_action_bindings)
+                .add_systems(XrSessionCreated, spawn_xr_anchor_visuals)
+                .add_systems(Update, (handle_xr_locomotion, log_xr_trigger_input));
         }
     }
 
@@ -46,6 +62,39 @@ fn main() {
         .insert_resource(ClearColor(Color::srgb(0.02, 0.02, 0.03)))
         .add_systems(Startup, (log_launch_mode, setup_scene))
         .run();
+}
+
+fn xr_plugins() -> impl PluginGroup {
+    let mut oxr_init = OxrInitPlugin::default();
+    oxr_init.exts.disable_fb_passthrough();
+
+    DefaultPlugins
+        .build()
+        .disable::<PipelinedRenderingPlugin>()
+        .disable::<RenderPlugin>()
+        .add_before::<RenderPlugin>(XrSessionPlugin { auto_handle: true })
+        .add_before::<RenderPlugin>(oxr_init)
+        .add(OxrEventsPlugin)
+        .add(OxrReferenceSpacePlugin::default())
+        .add(OxrRenderPlugin::default())
+        .add(HandTrackingPlugin::default())
+        .add(XrCameraPlugin)
+        .add(OxrActionAttachingPlugin)
+        .add(OxrActionBindingPlugin)
+        .add(OxrActionSyncingPlugin)
+        .add(OxrOverlayPlugin)
+        .add(OxrSpatialPlugin)
+        .add(OxrSpacePatchingPlugin)
+        .set(WindowPlugin {
+            primary_window: Some(Window {
+                transparent: true,
+                present_mode: PresentMode::AutoNoVsync,
+                ..default()
+            }),
+            #[cfg(target_os = "android")]
+            close_when_requested: true,
+            ..default()
+        })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
