@@ -6,6 +6,11 @@ authors.workspace = true
 
 [dependencies]
 hmd_protocol = { path = "../hmd_protocol" }
-device_query = "1.1"
 nalgebra = "0.32"
-
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }

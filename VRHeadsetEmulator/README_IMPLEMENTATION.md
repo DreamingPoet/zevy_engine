@@ -90,14 +90,14 @@ This mirrors Valve's `simplehmd` style and avoids hand-written Rust vtable layou
 
 ## Controller
 
-`controller_app` sends pose frames at roughly 90Hz.
+`controller_app` opens a fixed Win32 control window and sends pose frames at roughly 90Hz. Keyboard and mouse input is processed only while that window has focus. When the window loses focus, held movement keys are cleared and mouse deltas are ignored.
 
 Controls:
 
 - `W` / `S`: forward / backward
 - `A` / `D`: strafe left / right
-- `Space` / `Left Ctrl`: up / down
-- Mouse movement: yaw / pitch
+- `E` / `Q`: up / down
+- Hold right mouse button + mouse movement: yaw / pitch
 - `R`: reset pose
 - `C`: toggle virtual HMD connected / disconnected
 
@@ -181,4 +181,3 @@ Remove-Item "$env:TEMP\VRHeadsetEmulator_driver_cpp.log" -Force -ErrorAction Sil
 - Valve OpenVR driver header: `third_party/openvr/openvr_driver.h`
 - Valve `simplehmd` driver sample: https://chromium.googlesource.com/external/github.com/ValveSoftware/openvr/+/master/samples/drivers/drivers/simplehmd/
 - OpenVR Driver API documentation: https://github.com/ValveSoftware/openvr/blob/master/docs/Driver_API_Documentation.md
-
