@@ -1,0 +1,300 @@
+# zevy_engine Spec
+
+## Project Goal
+
+`zevy_engine` is a custom VR engine for producing real-time, first-person, interactive VR experiences.
+
+The engine must support:
+
+- PBR materials.
+- Multiple light sources.
+- OpenXR-based XR runtime integration.
+- Vulkan-based rendering.
+- Android XR devices, with PICO 4 Ultra as the first target device.
+- Windows as the editor, debug, and desktop validation platform.
+
+This project is not a one-off demo. It should evolve into a reusable engine foundation that can support production content.
+
+## Non-Negotiable Direction
+
+- OpenXR is the primary XR abstraction.
+- Vulkan is the primary rendering backend.
+- PICO-specific work must be layered on top of the OpenXR/Vulkan path where possible.
+- Windows support exists to make iteration, debugging, tools, and editor workflows practical.
+- Android/PICO support exists to validate the real production runtime path.
+- Engine code and content/demo code must remain clearly separated.
+- The project should move in small, verifiable iterations.
+
+## Current Project Shape
+
+- Main project: Rust, Bevy, and OpenXR.
+- Current crate path: `G:\zevy_engine\zevy_engine`.
+- Current entry point: `src/main.rs`.
+- PICO XR UE5.5 plugin source exists at `G:\zevy_engine\PICOXR`.
+- The PICO XR UE source is reference material only. It should inform Android manifest settings, PICO permissions, native runtime behavior, input mapping, and performance features, but it should not turn this project into a UE plugin port.
+
+## Platform Strategy
+
+### Windows
+
+Windows is the development and debug platform.
+
+Required uses:
+
+- Fast `cargo check` and desktop validation.
+- Debugging engine systems before deploying to device.
+- Future editor/tooling work.
+- Desktop XR validation when useful.
+
+Windows must remain easy to run while Android support is added.
+
+### Android XR / PICO 4 Ultra
+
+PICO 4 Ultra is the first production device target.
+
+Required uses:
+
+- Build an installable Android arm64 APK.
+- Launch as a VR app on the headset.
+- Create an OpenXR instance and session through the Android runtime.
+- Render through Vulkan.
+- Track HMD pose.
+- Support controller input.
+- Validate performance and lifecycle behavior on real hardware.
+
+Initial Android support should target `arm64-v8a` only.
+
+## Android Environment Baseline
+
+The local Android environment observed during planning:
+
+- SDK path currently exposed by environment variables: `F:\AndriodSDK\AndriodSDK`.
+- JDK: `F:\AndriodSDK\AndriodSDK\JAVA\jdk-17.0.10`.
+- Installed NDKs:
+  - `25.1.8937393`.
+  - `27.0.12077973`.
+- First build pass should prefer NDK `25.1.8937393`, matching the provided Unreal Android SDK screenshot.
+- Installed Android platforms include `android-29`, `android-34`, and newer.
+
+Important: the screenshot used `F:\AndroidSDK\AndroidSDK`, but the actual local environment uses `F:\AndriodSDK\AndriodSDK`. This mismatch must be handled explicitly before Android build work.
+
+## PICO Reference Notes
+
+The PICO XR UE5.5 source is useful for identifying PICO Android requirements.
+
+Important reference file:
+
+- `G:\zevy_engine\PICOXR\Source\PICOXRHMD\PICOXR_UPL.xml`.
+
+Useful PICO reference items:
+
+- `pvr.app.type=vr`.
+- PICO controller and hand tracking manifest metadata.
+- PICO hand, eye, face, body, spatial anchor, scene, and mesh permissions.
+- Vulkan-first runtime behavior.
+- PICO runtime version queries.
+- PICO Java and native SDK integration patterns.
+
+Initial Rust/OpenXR implementation should not copy PICO UE Java/JAR/native SDK code unless standard OpenXR Android runtime initialization proves insufficient.
+
+## Architecture Principles
+
+- Keep engine systems modular and testable.
+- Prefer cross-platform OpenXR behavior before device-specific APIs.
+- Put PICO-specific behavior behind explicit platform/device gates.
+- Avoid hard-coding PICO assumptions into generic XR systems.
+- Keep rendering, XR session management, input, platform packaging, and demo scene logic separable.
+- Preserve the desktop path while adding Android support.
+- Add logging around all platform boundaries: runtime creation, session state, swapchain setup, input binding, lifecycle events, and device capabilities.
+
+## Iteration Roadmap
+
+### Phase 1: Build Baseline
+
+Goal: preserve the current working desktop baseline.
+
+Tasks:
+
+- Keep `cargo check` passing on Windows.
+- Confirm `cargo run` desktop mode remains usable.
+- Confirm `cargo run -- --xr` remains the explicit XR launch mode.
+- Document any platform-specific assumptions.
+
+Exit criteria:
+
+- Windows `cargo check` passes.
+- Existing scene still compiles.
+
+### Phase 2: Android Toolchain
+
+Goal: make the project capable of producing Android artifacts.
+
+Tasks:
+
+- Install Rust target `aarch64-linux-android`.
+- Install or choose Android packaging tooling, such as `cargo-apk` or `cargo-ndk` plus Gradle.
+- Standardize SDK, NDK, and JDK paths.
+- Add a repeatable Android build command or PowerShell script.
+
+Exit criteria:
+
+- Android target compilation starts from a clean command.
+- Toolchain versions are documented.
+
+### Phase 3: Android APK Skeleton
+
+Goal: produce an installable APK before solving all XR behavior.
+
+Tasks:
+
+- Add Android package metadata.
+- Add Android manifest template.
+- Configure app label, package id, version code, and version name.
+- Package required native libraries and assets.
+- Target `arm64-v8a`.
+
+Exit criteria:
+
+- APK builds successfully.
+- APK installs on a connected Android device.
+
+### Phase 4: PICO 4 Ultra OpenXR Launch
+
+Goal: launch the app as a VR app on PICO 4 Ultra.
+
+Tasks:
+
+- Add minimum PICO VR manifest metadata.
+- Verify Android OpenXR loader initialization.
+- Log runtime name, runtime version, system id, view configuration, blend mode, swapchain format, and render resolution.
+- Handle Android activity lifecycle events cleanly.
+
+Exit criteria:
+
+- App launches on PICO 4 Ultra.
+- OpenXR instance and session are created.
+- Session state transitions are visible in logs.
+
+### Phase 5: Vulkan Stereo Rendering
+
+Goal: render the current scene through OpenXR on device.
+
+Tasks:
+
+- Confirm Vulkan is used on Android.
+- Confirm swapchain creation and frame submission.
+- Validate stereo view rendering.
+- Keep the scene simple while proving render correctness.
+
+Exit criteria:
+
+- PICO headset displays the test scene.
+- No persistent black screen after session begins.
+- Frame loop remains stable.
+
+### Phase 6: PICO Controller Input
+
+Goal: support first-person interactive control on PICO 4 Ultra.
+
+Tasks:
+
+- Detect or confirm PICO controller interaction profile.
+- Add PICO controller bindings for locomotion and trigger input.
+- Keep existing desktop and other controller bindings where useful.
+- Log action sync and input state changes.
+
+Exit criteria:
+
+- Right thumbstick moves the XR tracking root.
+- Trigger input is detected.
+- Input behavior is stable after pause/resume.
+
+### Phase 7: Production Rendering Features
+
+Goal: grow from prototype rendering toward production VR visuals.
+
+Tasks:
+
+- Expand PBR material coverage.
+- Validate multiple dynamic and static lights.
+- Add performance-aware lighting constraints for mobile VR.
+- Profile render cost on PICO 4 Ultra.
+
+Exit criteria:
+
+- Multiple-light PBR scene renders on Windows and PICO.
+- Performance costs are visible and documented.
+
+### Phase 8: Vulkan Multi-view Rendering
+
+Goal: add a performance-oriented stereo rendering path for mobile XR.
+
+Vulkan Multi-view is a medium-term rendering target, especially for PICO 4 Ultra and other mobile XR devices. It should be introduced after the basic OpenXR Vulkan stereo path is stable.
+
+Tasks:
+
+- Detect Vulkan Multi-view feature and extension support at runtime.
+- Add a Multi-view stereo render path when supported by the device.
+- Keep the normal two-eye stereo path as a fallback.
+- Compare CPU/GPU frame cost against the non-Multi-view stereo path.
+- Document device support and measured behavior on PICO 4 Ultra.
+
+Exit criteria:
+
+- Engine can report whether Vulkan Multi-view is supported.
+- Multi-view can be enabled only when supported.
+- Unsupported devices continue to render through the normal stereo path.
+- PICO 4 Ultra performance comparison is recorded.
+
+### Phase 9: PICO-Specific Enhancements
+
+Goal: add useful PICO features without compromising the OpenXR-first architecture.
+
+Possible tasks:
+
+- Hand tracking.
+- Passthrough / MR features.
+- Spatial anchors.
+- Scene mesh.
+- Foveated rendering.
+- Refresh rate or performance controls.
+
+Exit criteria:
+
+- Each PICO-specific feature is gated, documented, and optional.
+- Generic OpenXR path remains intact.
+
+## Development Checklist
+
+Before each implementation step:
+
+- Confirm the work supports the project goal.
+- Confirm whether the change belongs to engine, platform, rendering, XR, input, or demo content.
+- Check that Windows debug flow remains intact.
+- Check that Android/PICO work does not leak into generic systems unnecessarily.
+
+During implementation:
+
+- Prefer small commits or small logical changes.
+- Keep logs useful at platform boundaries.
+- Avoid large unrelated refactors.
+- Keep build commands repeatable.
+
+Before considering a phase complete:
+
+- Run the relevant local build or check.
+- Record commands used.
+- Record device/runtime observations if testing on PICO.
+- Update this spec if the project direction changes.
+
+## Current Immediate Plan
+
+The next development step should be:
+
+1. Standardize Android SDK, NDK, and JDK paths for CLI builds.
+2. Add Rust Android target support.
+3. Choose and configure the Android packaging path.
+4. Build the first `arm64-v8a` APK skeleton.
+5. Install and test on PICO 4 Ultra once the device is connected through ADB.
+
+Do not start by porting the PICO UE plugin. Use it as reference while preserving the Rust + Bevy + OpenXR + Vulkan engine direction.

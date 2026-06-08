@@ -8,6 +8,7 @@ The goal of this project is to support the production of real-time, first-person
 - Multiple light sources
 - OpenXR support
 - Vulkan-based rendering
+- Support Platform：Android XR device(PICO 4 Ultra), Windows(editor, debug)
 
 ## Development Environment
 
@@ -56,6 +57,28 @@ To build and run the current prototype:
 
 ```bash
 cargo run
+
+cargo run -- --xr
+```
+
+## Android / PICO 4 Ultra
+
+Build the first Android XR APK:
+
+```powershell
+.\scripts\build_android_pico.ps1
+```
+
+The debug APK is written to:
+
+```text
+target\debug\apk\zevy_engine.apk
+```
+
+With a PICO 4 Ultra connected over ADB, install and launch it:
+
+```powershell
+.\scripts\deploy_pico.ps1
 ```
 
 ## Development Goals
