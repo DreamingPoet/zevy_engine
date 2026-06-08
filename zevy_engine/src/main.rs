@@ -17,12 +17,12 @@ use bevy_mod_openxr::{
     poll_events::OxrEventsPlugin,
     reference_space::OxrReferenceSpacePlugin,
     render::OxrRenderPlugin,
-    resources::OxrViews,
+    resources::{OxrCurrentSessionConfig, OxrViews},
     spaces::{OxrSpacePatchingPlugin, OxrSpatialPlugin},
 };
 use bevy_mod_xr::{
-    camera::XrCameraPlugin,
-    session::{XrSessionCreated, XrSessionPlugin, XrTracker, XrTrackingRoot},
+    camera::{XrCamera, XrCameraPlugin},
+    session::{XrSessionCreated, XrSessionPlugin, XrState, XrTracker, XrTrackingRoot},
 };
 use bevy_xr_utils::{
     tracking_utils::{
@@ -37,6 +37,8 @@ use bevy_xr_utils::{
 
 fn main() {
     let launch_mode = LaunchMode::from_args();
+    eprintln!("Starting zevy_engine in {} mode", launch_mode.label());
+
     let mut app = App::new();
 
     match launch_mode {
@@ -54,7 +56,16 @@ fn main() {
                 )
                 .add_systems(OxrSendActionBindings, suggest_action_bindings)
                 .add_systems(XrSessionCreated, spawn_xr_anchor_visuals)
-                .add_systems(Update, (handle_xr_locomotion, log_xr_trigger_input));
+                .add_systems(
+                    Update,
+                    (
+                        handle_xr_locomotion,
+                        log_xr_trigger_input,
+                        sync_mirror_camera,
+                        log_xr_state_changes,
+                        log_xr_render_status,
+                    ),
+                );
         }
     }
 
@@ -112,6 +123,9 @@ struct XrMoveAction;
 #[derive(Component)]
 struct XrTriggerAction;
 
+#[derive(Component)]
+struct MirrorCamera;
+
 impl LaunchMode {
     fn from_args() -> Self {
         let mut mode = Self::Desktop;
@@ -140,6 +154,7 @@ fn log_launch_mode(startup_mode: Res<StartupMode>) {
 }
 
 fn setup_scene(
+    startup_mode: Res<StartupMode>,
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
@@ -173,11 +188,19 @@ fn setup_scene(
         Transform::from_xyz(4.0, 8.0, 4.0),
     ));
 
-    commands.spawn((
-        Name::new("DesktopCamera"),
+    let camera_name = match startup_mode.0 {
+        LaunchMode::Desktop => "DesktopCamera",
+        LaunchMode::Xr => "MirrorCamera",
+    };
+    let mut camera = commands.spawn((
+        Name::new(camera_name),
         Camera3d::default(),
         Transform::from_xyz(-2.5, 4.5, 9.0).looking_at(Vec3::ZERO, Vec3::Y),
     ));
+
+    if startup_mode.0 == LaunchMode::Xr {
+        camera.insert(MirrorCamera);
+    }
 }
 
 fn setup_xr_actions(mut commands: Commands) {
@@ -351,5 +374,77 @@ fn log_xr_trigger_input(action_query: Query<&XRUtilsActionState, With<XrTriggerA
         {
             info!("XR trigger pressed");
         }
+    }
+}
+
+fn sync_mirror_camera(
+    views: Res<OxrViews>,
+    tracking_root_query: Query<&Transform, With<XrTrackingRoot>>,
+    mut mirror_camera_query: Query<&mut Transform, (With<MirrorCamera>, Without<XrTrackingRoot>)>,
+) {
+    let Some(view) = views.first() else {
+        return;
+    };
+    let Ok(tracking_root) = tracking_root_query.single() else {
+        return;
+    };
+
+    let view_transform = Transform {
+        translation: Vec3::new(
+            view.pose.position.x,
+            view.pose.position.y,
+            view.pose.position.z,
+        ),
+        rotation: view.pose.orientation.to_quat(),
+        scale: Vec3::ONE,
+    };
+    let mirror_transform = tracking_root.mul_transform(view_transform);
+
+    for mut camera_transform in &mut mirror_camera_query {
+        *camera_transform = mirror_transform;
+    }
+}
+
+fn log_xr_render_status(
+    mut logged: Local<bool>,
+    mut last_missing_log: Local<f32>,
+    state: Option<Res<XrState>>,
+    session_config: Option<Res<OxrCurrentSessionConfig>>,
+    xr_cameras: Query<&XrCamera>,
+    time: Res<Time>,
+) {
+    if *logged {
+        return;
+    }
+
+    let camera_count = xr_cameras.iter().count();
+    let Some(session_config) = session_config else {
+        let now = time.elapsed_secs();
+        if now - *last_missing_log >= 2.0 {
+            eprintln!(
+                "XR waiting for render resources: state={:?}, cameras={}",
+                state.as_deref(),
+                camera_count,
+            );
+            *last_missing_log = now;
+        }
+        return;
+    };
+
+    eprintln!(
+        "XR render ready: state={:?}, cameras={}, resolution={}x{}, blend_mode={:?}, format={:?}",
+        state.as_deref(),
+        camera_count,
+        session_config.resolution.x,
+        session_config.resolution.y,
+        session_config.blend_mode,
+        session_config.format,
+    );
+    *logged = true;
+}
+
+fn log_xr_state_changes(mut state_events: EventReader<bevy_mod_xr::session::XrStateChanged>) {
+    for event in state_events.read() {
+        eprintln!("XR state changed: {:?}", event.0);
     }
 }
