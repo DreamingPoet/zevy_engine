@@ -1,0 +1,20 @@
+[package]
+name = "driver_virtual_hmd"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[lib]
+name = "driver_virtual_hmd"
+crate-type = ["cdylib"]
+
+[dependencies]
+hmd_protocol = { path = "../hmd_protocol" }
+nalgebra = "0.32"
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+] }

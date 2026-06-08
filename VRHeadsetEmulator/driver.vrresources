@@ -1,0 +1,7 @@
+{
+  "drivername": "virtual_hmd",
+  "resources": "resources",
+  "webextensions": "webextensions",
+  "legacy_bindings": true
+}
+

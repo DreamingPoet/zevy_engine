@@ -1,0 +1,11 @@
+[package]
+name = "controller_app"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
+hmd_protocol = { path = "../hmd_protocol" }
+device_query = "1.1"
+nalgebra = "0.32"
+

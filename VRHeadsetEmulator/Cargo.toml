@@ -1,0 +1,13 @@
+[workspace]
+members = [
+    "hmd_protocol",
+    "driver_plugin",
+    "controller_app",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["VRHeadsetEmulator contributors"]
+
