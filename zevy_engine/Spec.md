@@ -549,7 +549,7 @@ Changes made:
 - `src/app.rs` owns launch mode selection, plugin assembly, and global app startup.
 - `src/platform.rs` owns Android NativeActivity bridging, Android lifecycle polling, display refresh-rate setup, and Android OpenXR session begin behavior.
 - `src/xr.rs` owns OpenXR plugin composition, XR anchor visuals, mirror camera sync, and XR render/state logging.
-- `src/input.rs` owns keyboard/mouse/OpenXR input abstraction, XR action setup, semantic input events/state, and the first locomotion input consumer.
+- `src/input.rs` owns keyboard/mouse/OpenXR input abstraction, XR action setup, and semantic input events/state.
 - `src/scene.rs` owns the Level system: default Level, current Level, `OpenLevel`, unload/load flow.
 - `src/scene/levels.rs` owns concrete Level content for the current prototype Levels.
 - The previous performance lighting scene is now `LevelId::PerformanceLab`.
@@ -585,7 +585,32 @@ Changes made:
   - right mouse button -> `InputButton::SecondaryAction`.
 - Moved OpenXR action creation from `src/xr.rs` to `src/input.rs`.
 - Moved PICO/OpenXR right thumbstick and right trigger interpretation into `src/input.rs`.
-- Kept XR locomotion as the first gameplay-facing consumer of `EngineInputState::axis2(InputAxis2::Move)`.
+- `FogPyramid` is the first gameplay-facing consumer of `EngineInputState::axis2(InputAxis2::Move)`.
+
+Validation commands:
+
+- `cargo check`
+- `cargo check --target aarch64-linux-android`
+- `.\scripts\build_android_pico.ps1 -Profile release`
+
+### 2026-06-09: FogPyramid Camera Movement
+
+Status: implemented.
+
+Changes made:
+
+- Added `FogPyramidPlayerCamera` to the desktop camera spawned by `FogPyramid`.
+- Added `move_fog_pyramid_player`.
+- Windows desktop movement:
+  - `W/A/S/D` and arrow keys move the FogPyramid camera.
+  - Movement is relative to the current camera forward/right directions.
+  - Movement is flattened onto the ground plane.
+- Android/PICO XR movement:
+  - Right-hand controller thumbstick moves the XR tracking root.
+  - Movement direction follows the current HMD/camera forward/right directions.
+  - Movement is flattened onto the ground plane.
+- Removed global XR locomotion from `src/input.rs`; input stays an abstraction and Level/gameplay code owns movement behavior.
+- `FogPyramid` movement runs after `EngineInputSet::Collect` so it consumes current-frame input state.
 
 Validation commands:
 

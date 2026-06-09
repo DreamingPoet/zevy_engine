@@ -2,7 +2,10 @@ mod levels;
 
 use bevy::prelude::*;
 
-use crate::app::{LaunchMode, StartupMode};
+use crate::{
+    app::{LaunchMode, StartupMode},
+    input::EngineInputSet,
+};
 
 pub struct ScenePlugin;
 
@@ -18,6 +21,7 @@ impl Plugin for ScenePlugin {
                 (
                     open_level,
                     apply_active_level_fog_to_cameras,
+                    levels::move_fog_pyramid_player.after(EngineInputSet::Collect),
                     levels::animate_orbiting_lights,
                 ),
             );

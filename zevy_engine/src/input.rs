@@ -1,10 +1,13 @@
-use bevy::{input::mouse::MouseMotion, math::vec3, prelude::*};
-use bevy_mod_openxr::helper_traits::ToQuat;
-use bevy_mod_openxr::resources::OxrViews;
-use bevy_mod_xr::session::XrTrackingRoot;
+use bevy::{input::mouse::MouseMotion, prelude::*};
 use bevy_xr_utils::xr_utils_actions::{
     ActiveSet, XRUtilsAction, XRUtilsActionSet, XRUtilsActionState, XRUtilsBinding,
 };
+
+const XR_CONTROLLER_PROFILES: &[&str] = &[
+    "/interaction_profiles/oculus/touch_controller",
+    "/interaction_profiles/valve/index_controller",
+    "/interaction_profiles/bytedance/pico4s_controller",
+];
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub enum InputSource {
@@ -79,20 +82,39 @@ pub struct XrTriggerAction;
 
 pub struct EngineInputPlugin;
 
+#[derive(SystemSet, Debug, Clone, Copy, Eq, PartialEq, Hash)]
+pub enum EngineInputSet {
+    Reset,
+    Collect,
+    React,
+}
+
 impl Plugin for EngineInputPlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(EngineInputState::default())
             .add_event::<EngineInputEvent>()
-            .add_systems(
+            .configure_sets(
                 Update,
                 (
-                    reset_frame_input_state,
-                    collect_keyboard_mouse_input,
-                    collect_xr_controller_input,
-                    handle_xr_locomotion,
-                    log_primary_action_input,
+                    EngineInputSet::Reset,
+                    EngineInputSet::Collect,
+                    EngineInputSet::React,
                 )
                     .chain(),
+            )
+            .add_systems(
+                Update,
+                reset_frame_input_state.in_set(EngineInputSet::Reset),
+            )
+            .add_systems(
+                Update,
+                (collect_keyboard_mouse_input, collect_xr_controller_input)
+                    .chain()
+                    .in_set(EngineInputSet::Collect),
+            )
+            .add_systems(
+                Update,
+                log_primary_action_input.in_set(EngineInputSet::React),
             );
     }
 }
@@ -120,13 +142,10 @@ pub fn setup_xr_actions(mut commands: Commands) {
         ))
         .id();
 
-    for binding in [
-        "/interaction_profiles/oculus/touch_controller",
-        "/interaction_profiles/valve/index_controller",
-    ] {
+    for binding in XR_CONTROLLER_PROFILES {
         let binding_entity = commands
             .spawn(XRUtilsBinding {
-                profile: binding.into(),
+                profile: (*binding).into(),
                 binding: "/user/hand/right/input/thumbstick".into(),
             })
             .id();
@@ -156,14 +175,11 @@ pub fn setup_xr_actions(mut commands: Commands) {
         ))
         .id();
 
-    for binding in [
-        "/interaction_profiles/oculus/touch_controller",
-        "/interaction_profiles/valve/index_controller",
-    ] {
+    for binding in XR_CONTROLLER_PROFILES {
         let binding_entity = commands
             .spawn(XRUtilsBinding {
-                profile: binding.into(),
-                binding: "/user/hand/right/input/trigger".into(),
+                profile: (*binding).into(),
+                binding: "/user/hand/right/input/trigger/click".into(),
             })
             .id();
         commands.entity(trigger_action).add_child(binding_entity);
@@ -227,12 +243,16 @@ fn collect_keyboard_mouse_input(
 }
 
 fn collect_xr_controller_input(
+    time: Res<Time>,
     move_query: Query<&XRUtilsActionState, With<XrMoveAction>>,
     trigger_query: Query<&XRUtilsActionState, With<XrTriggerAction>>,
     mut state: ResMut<EngineInputState>,
     mut events: EventWriter<EngineInputEvent>,
+    mut last_logged_move: Local<Option<Vec2>>,
+    mut seconds_since_move_log: Local<f32>,
 ) {
     let mut xr_move = Vec2::ZERO;
+    let mut saw_active_move = false;
     for action_state in &move_query {
         let XRUtilsActionState::Vector(vector_state) = action_state else {
             continue;
@@ -242,6 +262,7 @@ fn collect_xr_controller_input(
             continue;
         }
 
+        saw_active_move = true;
         xr_move = Vec2::new(vector_state.current_state[0], vector_state.current_state[1]);
         state
             .axes2
@@ -256,6 +277,15 @@ fn collect_xr_controller_input(
         state
             .axes2
             .insert((InputSource::XrController, InputAxis2::Move), Vec2::ZERO);
+    }
+    *seconds_since_move_log += time.delta_secs();
+    let should_log_move = xr_move.length_squared() > 0.01
+        && last_logged_move.is_none_or(|last| last.distance_squared(xr_move) > 0.04)
+        || (saw_active_move && xr_move.length_squared() > 0.01 && *seconds_since_move_log >= 1.0);
+    if should_log_move {
+        info!("XR controller move axis: {xr_move:?}");
+        *last_logged_move = Some(xr_move);
+        *seconds_since_move_log = 0.0;
     }
 
     for action_state in &trigger_query {
@@ -276,39 +306,8 @@ fn collect_xr_controller_input(
             button: InputButton::PrimaryAction,
             pressed: button_state.current_state,
         });
+        info!("XR controller trigger click: {}", button_state.current_state);
     }
-}
-
-fn handle_xr_locomotion(
-    input_state: Res<EngineInputState>,
-    mut tracking_root_query: Query<&mut Transform, With<XrTrackingRoot>>,
-    views: Option<Res<OxrViews>>,
-    time: Res<Time>,
-) {
-    let input_vector = input_state.axis2(InputAxis2::Move);
-    if input_vector.length_squared() <= f32::EPSILON {
-        return;
-    }
-
-    let Ok(mut tracking_root) = tracking_root_query.single_mut() else {
-        return;
-    };
-
-    let Some(views) = views else {
-        return;
-    };
-
-    let Some(view) = views.first() else {
-        return;
-    };
-
-    let speed = 2.5;
-    let input_vector = vec3(input_vector.x, 0.0, -input_vector.y);
-    let view_rotation = tracking_root.rotation * view.pose.orientation.to_quat();
-    let locomotion = view_rotation.mul_vec3(input_vector);
-    let flat_locomotion = Vec3::new(locomotion.x, 0.0, locomotion.z).normalize_or_zero();
-
-    tracking_root.translation += flat_locomotion * speed * time.delta_secs();
 }
 
 fn log_primary_action_input(mut events: EventReader<EngineInputEvent>) {

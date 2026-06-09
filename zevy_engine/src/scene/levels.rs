@@ -2,11 +2,18 @@ use bevy::{
     pbr::{NotShadowCaster, NotShadowReceiver},
     prelude::*,
 };
+use bevy_mod_openxr::{helper_traits::ToQuat, resources::OxrViews};
+use bevy_mod_xr::session::XrTrackingRoot;
 
 use crate::{
     app::LaunchMode,
+    input::{EngineInputState, InputAxis2},
     scene::{LevelEntity, MirrorCamera},
 };
+
+use super::{CurrentLevel, LevelId};
+
+const FOG_PYRAMID_MOVE_SPEED: f32 = 2.5;
 
 #[derive(Component, Clone, Copy)]
 pub(super) struct OrbitingLight {
@@ -16,6 +23,9 @@ pub(super) struct OrbitingLight {
     phase: f32,
     speed: f32,
 }
+
+#[derive(Component)]
+pub(super) struct FogPyramidPlayerCamera;
 
 pub(super) fn level_fog(level: super::LevelId) -> Option<DistanceFog> {
     match level {
@@ -99,7 +109,12 @@ pub(super) fn spawn_fog_pyramid(
         Transform::from_xyz(0.0, 1.0, 0.0),
     ));
 
-    spawn_level_camera(launch_mode, level_fog, commands);
+    let Some(camera_entity) = spawn_level_camera(launch_mode, level_fog, commands) else {
+        return;
+    };
+    commands
+        .entity(camera_entity)
+        .insert(FogPyramidPlayerCamera);
 }
 
 pub(super) fn spawn_performance_lab(
@@ -293,17 +308,21 @@ pub(super) fn spawn_performance_lab(
         ));
     }
 
-    spawn_level_camera(launch_mode, None, commands);
+    let _ = spawn_level_camera(launch_mode, None, commands);
 }
 
 pub(super) fn spawn_empty(launch_mode: LaunchMode, commands: &mut Commands) {
-    spawn_level_camera(launch_mode, None, commands);
+    let _ = spawn_level_camera(launch_mode, None, commands);
 }
 
-fn spawn_level_camera(launch_mode: LaunchMode, fog: Option<DistanceFog>, commands: &mut Commands) {
+fn spawn_level_camera(
+    launch_mode: LaunchMode,
+    fog: Option<DistanceFog>,
+    commands: &mut Commands,
+) -> Option<Entity> {
     #[cfg(target_os = "android")]
     if launch_mode == LaunchMode::Xr {
-        return;
+        return None;
     }
 
     let camera_name = match launch_mode {
@@ -324,6 +343,8 @@ fn spawn_level_camera(launch_mode: LaunchMode, fog: Option<DistanceFog>, command
     if launch_mode == LaunchMode::Xr {
         camera.insert(MirrorCamera);
     }
+
+    Some(camera.id())
 }
 
 fn fog_pyramid_fog() -> DistanceFog {
@@ -350,4 +371,57 @@ pub(super) fn animate_orbiting_lights(
         let angle = light.phase + seconds * light.speed;
         transform.translation = orbit_position(light.center, light.radius, light.height, angle);
     }
+}
+
+pub(super) fn move_fog_pyramid_player(
+    current_level: Res<CurrentLevel>,
+    input_state: Res<EngineInputState>,
+    time: Res<Time>,
+    mut transforms: ParamSet<(
+        Query<&mut Transform, With<FogPyramidPlayerCamera>>,
+        Query<&mut Transform, With<XrTrackingRoot>>,
+    )>,
+    views: Option<Res<OxrViews>>,
+) {
+    if current_level.0 != Some(LevelId::FogPyramid) {
+        return;
+    }
+
+    let input_axis = input_state.axis2(InputAxis2::Move);
+    if input_axis.length_squared() <= f32::EPSILON {
+        return;
+    }
+
+    let delta_seconds = time.delta_secs();
+
+    for mut transform in &mut transforms.p0() {
+        let movement = camera_relative_flat_movement(transform.rotation, input_axis);
+        transform.translation += movement * FOG_PYRAMID_MOVE_SPEED * delta_seconds;
+    }
+
+    let Some(views) = views else {
+        return;
+    };
+    let Some(view) = views.first() else {
+        return;
+    };
+
+    let mut tracking_roots = transforms.p1();
+    let Ok(mut tracking_root) = tracking_roots.single_mut() else {
+        return;
+    };
+    let view_rotation = tracking_root.rotation * view.pose.orientation.to_quat();
+    let movement = camera_relative_flat_movement(view_rotation, input_axis);
+    tracking_root.translation += movement * FOG_PYRAMID_MOVE_SPEED * delta_seconds;
+}
+
+fn camera_relative_flat_movement(rotation: Quat, input_axis: Vec2) -> Vec3 {
+    let forward = flatten_direction(rotation.mul_vec3(Vec3::NEG_Z));
+    let right = flatten_direction(rotation.mul_vec3(Vec3::X));
+
+    (right * input_axis.x + forward * input_axis.y).normalize_or_zero()
+}
+
+fn flatten_direction(direction: Vec3) -> Vec3 {
+    Vec3::new(direction.x, 0.0, direction.z).normalize_or_zero()
 }

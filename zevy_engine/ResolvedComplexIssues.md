@@ -189,3 +189,102 @@ Headset observation after adding `NoIndirectDrawing`:
 - For XR bring-up, correctness and stereo stability come before advanced GPU preprocessing.
 - Keep diagnostic clear colors temporary and remove them once the root cause is confirmed.
 
+## 2026-06-09: Startup Crash After FogPyramid Movement System
+
+### Status
+
+Resolved.
+
+### Symptoms
+
+- `cargo run` on Windows exited immediately.
+- PICO launched to the startup page and then returned home.
+- Android logcat showed `Fatal signal 6 (SIGABRT)` in `android_main`.
+- Windows panic showed Bevy error `B0001` in `zevy_engine::scene::levels::move_fog_pyramid_player`.
+
+### Root Cause
+
+`move_fog_pyramid_player` had two mutable `Transform` queries in the same system:
+
+- `Query<&mut Transform, With<FogPyramidPlayerCamera>>`
+- `Query<&mut Transform, With<XrTrackingRoot>>`
+
+Even though those entities are intended to be different, Bevy cannot prove the filters are disjoint. Because both queries mutably access `Transform`, Bevy rejects the system at startup to prevent aliasing.
+
+### Final Solution
+
+- Replaced the two independent mutable queries with a `ParamSet`.
+- Desktop camera movement uses `transforms.p0()`.
+- XR tracking-root movement uses `transforms.p1()`.
+
+### Validation
+
+- `cargo check` passed.
+- Short `cargo run` no longer panicked during startup.
+- `cargo check --target aarch64-linux-android` passed.
+- Release APK built successfully.
+- Release APK deployed to PICO 4 Ultra and entered the XR frame loop without `Fatal signal`, panic, or `B0001`.
+
+### Lessons
+
+- When a Bevy system needs two mutable queries over the same component type, use `ParamSet` unless the query filters are explicitly disjoint through `Without<T>` or equivalent filters.
+- Startup-time Bevy ECS validation failures on Android may appear as native `SIGABRT`, so always reproduce with Windows `cargo run` when possible.
+
+## 2026-06-09: PICO Controller Actions Did Not Reach Gameplay
+
+### Status
+
+Code-side OpenXR binding issue resolved for PICO 4 Ultra. Live input still needs one headset check with the right controller awake.
+
+### Symptoms
+
+- Windows `W/A/S/D` movement worked in `FogPyramid`.
+- On PICO 4 Ultra, controller/hand tracking could render, but the right controller thumbstick and trigger did not affect gameplay.
+
+### Root Cause
+
+Gameplay movement was already correctly wired through `EngineInputState::axis2(InputAxis2::Move)`. The missing part was the OpenXR action binding layer for PICO controller input.
+
+- The input module only suggested Oculus Touch and Valve Index interaction profiles.
+- PICO 4 Ultra uses `/interaction_profiles/bytedance/pico4s_controller`.
+- The trigger binding used `/user/hand/right/input/trigger`, while PICO's OpenXR native sample binds trigger click through `/user/hand/right/input/trigger/click`.
+
+### Investigation Path
+
+- Checked `G:\zevy_engine\OpenXR_Native_SDK\Samples\framework\src\openxrWrapper\BasicOpenXrWrapper.cpp`.
+- Confirmed PICO controller paths:
+  - right thumbstick vector: `/user/hand/right/input/thumbstick`
+  - right trigger click: `/user/hand/right/input/trigger/click`
+  - right trigger analog: `/user/hand/right/input/trigger/value`
+- Deployed to PICO 4 Ultra Enterprise and checked logcat.
+- The runtime selected `/interaction_profiles/bytedance/pico4s_controller`.
+- The same runtime reported `/interaction_profiles/bytedance/pico4_controller`, `/interaction_profiles/bytedance/pico_neo3_controller`, and `/interaction_profiles/bytedance/pico_g3_controller` as unsupported on this headset.
+
+### Final Solution
+
+- Added `/interaction_profiles/bytedance/pico4s_controller` to the OpenXR controller binding profile set.
+- Kept right thumbstick movement bound to `/user/hand/right/input/thumbstick`.
+- Changed the primary trigger button binding to `/user/hand/right/input/trigger/click`.
+- Added low-volume logs for XR thumbstick movement and trigger transitions:
+  - `XR controller move axis: ...`
+  - `XR controller trigger click: ...`
+- Removed non-Ultra PICO profiles from the default binding set to avoid unsupported-profile runtime errors on PICO 4 Ultra.
+
+### Validation
+
+- `cargo check` passed.
+- `cargo check --target aarch64-linux-android` passed.
+- Release APK built successfully.
+- Release APK deployed to PICO 4 Ultra.
+- PICO logcat confirmed:
+  - app starts in XR mode,
+  - `FogPyramid` opens,
+  - `/interaction_profiles/bytedance/pico4s_controller` is suggested and selected,
+  - unsupported ByteDance profile errors are gone after narrowing the binding set.
+
+### Remaining Runtime Check
+
+- The deployment-time logcat sample showed both controllers offline, so no live thumbstick/trigger action was observed in that capture.
+- When the right controller is awake/connected, verify:
+  - pushing the right thumbstick prints `XR controller move axis`,
+  - clicking the trigger prints `XR controller trigger click` and `Primary action pressed from XrController`.
