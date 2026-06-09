@@ -108,7 +108,7 @@ Implemented:
 - Added keyboard and mouse event/state collection.
 - Moved OpenXR action creation from `xr.rs` into `input.rs`.
 - Moved OpenXR right thumbstick and trigger interpretation into `input.rs`.
-- `FogPyramid` is the first gameplay-facing consumer of `EngineInputState::axis2(InputAxis2::Move)`.
+- `FogPyramid` and `PerformanceLab` consume `EngineInputState::axis2(InputAxis2::Move)` for player movement.
 
 ### 2026-06-09: FogPyramid Camera Movement
 
@@ -121,6 +121,15 @@ Implemented:
   - left/right follows the current camera or HMD right direction.
 - Removed global input-module locomotion so movement behavior belongs to Level/gameplay logic.
 - `FogPyramid` movement runs after `EngineInputSet::Collect`.
+
+### 2026-06-09: PerformanceLab Movement
+
+Implemented:
+
+- `PerformanceLab` is now the default Level.
+- Windows desktop: `PerformanceLab` camera moves with `W/A/S/D` and arrow keys.
+- Android/PICO XR: `PerformanceLab` moves the XR tracking root with the right controller thumbstick.
+- Movement reuses the same Level-side camera/HMD-relative locomotion path as `FogPyramid`.
 
 ### 2026-06-09: PICO Controller Binding Fix
 

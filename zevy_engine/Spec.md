@@ -268,8 +268,8 @@ The engine should borrow Unreal Engine's Level concept at the project level:
 
 Initial implementation:
 
-- `LevelId::FogPyramid` is the current default Level.
-- `LevelId::PerformanceLab` remains available as a performance stress-test Level.
+- `LevelId::PerformanceLab` is the current default Level.
+- `LevelId::FogPyramid` remains available as the fog/volumetric reference Level.
 - `OpenLevel(LevelId)` is the first runtime API for Level switching.
 - `CurrentLevel` tracks the active Level.
 - `LevelEntity` marks entities owned by the currently opened Level.
@@ -553,7 +553,7 @@ Changes made:
 - `src/scene.rs` owns the Level system: default Level, current Level, `OpenLevel`, unload/load flow.
 - `src/scene/levels.rs` owns concrete Level content for the current prototype Levels.
 - The previous performance lighting scene is now `LevelId::PerformanceLab`.
-- The default Level is configured through `DefaultLevel(LevelId::FogPyramid)`.
+- The default Level is configured through `DefaultLevel(LevelId::PerformanceLab)`.
 - Runtime Level switching starts with the `OpenLevel(LevelId)` event.
 
 Validation commands:
@@ -585,7 +585,7 @@ Changes made:
   - right mouse button -> `InputButton::SecondaryAction`.
 - Moved OpenXR action creation from `src/xr.rs` to `src/input.rs`.
 - Moved PICO/OpenXR right thumbstick and right trigger interpretation into `src/input.rs`.
-- `FogPyramid` is the first gameplay-facing consumer of `EngineInputState::axis2(InputAxis2::Move)`.
+- `FogPyramid` and `PerformanceLab` are gameplay-facing consumers of `EngineInputState::axis2(InputAxis2::Move)`.
 
 Validation commands:
 
@@ -599,8 +599,8 @@ Status: implemented.
 
 Changes made:
 
-- Added `FogPyramidPlayerCamera` to the desktop camera spawned by `FogPyramid`.
-- Added `move_fog_pyramid_player`.
+- Added the initial FogPyramid player camera marker to the desktop camera spawned by `FogPyramid`.
+- Added the initial FogPyramid movement system. This was later generalized to `move_level_player`.
 - Windows desktop movement:
   - `W/A/S/D` and arrow keys move the FogPyramid camera.
   - Movement is relative to the current camera forward/right directions.
@@ -610,13 +610,25 @@ Changes made:
   - Movement direction follows the current HMD/camera forward/right directions.
   - Movement is flattened onto the ground plane.
 - Removed global XR locomotion from `src/input.rs`; input stays an abstraction and Level/gameplay code owns movement behavior.
-- `FogPyramid` movement runs after `EngineInputSet::Collect` so it consumes current-frame input state.
+- Level movement runs after `EngineInputSet::Collect` so it consumes current-frame input state.
+
+### 2026-06-09: PerformanceLab Player Movement and Default Level
+
+Status: implemented.
+
+Changes made:
+
+- Set `DefaultLevel(LevelId::PerformanceLab)`.
+- Replaced the FogPyramid-only player camera marker with a reusable Level player camera marker.
+- Renamed the movement system to `move_level_player`.
+- `PerformanceLab` desktop camera now supports `W/A/S/D` and arrow-key movement.
+- `PerformanceLab` on Android/PICO XR now supports right-hand controller thumbstick locomotion through the XR tracking root.
+- Movement remains camera/HMD-relative and flattened onto the ground plane.
 
 Validation commands:
 
 - `cargo check`
 - `cargo check --target aarch64-linux-android`
-- `.\scripts\build_android_pico.ps1 -Profile release`
 
 ### 2026-06-09: FogPyramid Default Level
 
@@ -629,7 +641,7 @@ Source reference:
 Changes made:
 
 - Added `LevelId::FogPyramid`.
-- Set `DefaultLevel(LevelId::FogPyramid)`.
+- Initially set `DefaultLevel(LevelId::FogPyramid)`. The current default was later changed to `LevelId::PerformanceLab`.
 - Ported only the scene content from the Bevy fog example:
   - stone pillar structure,
   - stepped pyramid,

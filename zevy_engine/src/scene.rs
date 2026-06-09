@@ -11,7 +11,7 @@ pub struct ScenePlugin;
 
 impl Plugin for ScenePlugin {
     fn build(&self, app: &mut App) {
-        app.insert_resource(DefaultLevel(LevelId::FogPyramid))
+        app.insert_resource(DefaultLevel(LevelId::PerformanceLab))
             .insert_resource(CurrentLevel(None))
             .insert_resource(ActiveLevelFog(None))
             .add_event::<OpenLevel>()
@@ -21,7 +21,7 @@ impl Plugin for ScenePlugin {
                 (
                     open_level,
                     apply_active_level_fog_to_cameras,
-                    levels::move_fog_pyramid_player.after(EngineInputSet::Collect),
+                    levels::move_level_player.after(EngineInputSet::Collect),
                     levels::animate_orbiting_lights,
                 ),
             );
@@ -30,6 +30,7 @@ impl Plugin for ScenePlugin {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LevelId {
+    #[allow(dead_code)]
     FogPyramid,
     #[allow(dead_code)]
     PerformanceLab,

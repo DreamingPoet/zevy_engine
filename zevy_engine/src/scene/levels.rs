@@ -13,7 +13,7 @@ use crate::{
 
 use super::{CurrentLevel, LevelId};
 
-const FOG_PYRAMID_MOVE_SPEED: f32 = 2.5;
+const LEVEL_PLAYER_MOVE_SPEED: f32 = 2.5;
 
 #[derive(Component, Clone, Copy)]
 pub(super) struct OrbitingLight {
@@ -25,7 +25,7 @@ pub(super) struct OrbitingLight {
 }
 
 #[derive(Component)]
-pub(super) struct FogPyramidPlayerCamera;
+pub(super) struct LevelPlayerCamera;
 
 pub(super) fn level_fog(level: super::LevelId) -> Option<DistanceFog> {
     match level {
@@ -112,9 +112,7 @@ pub(super) fn spawn_fog_pyramid(
     let Some(camera_entity) = spawn_level_camera(launch_mode, level_fog, commands) else {
         return;
     };
-    commands
-        .entity(camera_entity)
-        .insert(FogPyramidPlayerCamera);
+    commands.entity(camera_entity).insert(LevelPlayerCamera);
 }
 
 pub(super) fn spawn_performance_lab(
@@ -308,7 +306,9 @@ pub(super) fn spawn_performance_lab(
         ));
     }
 
-    let _ = spawn_level_camera(launch_mode, None, commands);
+    if let Some(camera_entity) = spawn_level_camera(launch_mode, None, commands) {
+        commands.entity(camera_entity).insert(LevelPlayerCamera);
+    }
 }
 
 pub(super) fn spawn_empty(launch_mode: LaunchMode, commands: &mut Commands) {
@@ -373,17 +373,20 @@ pub(super) fn animate_orbiting_lights(
     }
 }
 
-pub(super) fn move_fog_pyramid_player(
+pub(super) fn move_level_player(
     current_level: Res<CurrentLevel>,
     input_state: Res<EngineInputState>,
     time: Res<Time>,
     mut transforms: ParamSet<(
-        Query<&mut Transform, With<FogPyramidPlayerCamera>>,
+        Query<&mut Transform, With<LevelPlayerCamera>>,
         Query<&mut Transform, With<XrTrackingRoot>>,
     )>,
     views: Option<Res<OxrViews>>,
 ) {
-    if current_level.0 != Some(LevelId::FogPyramid) {
+    if !matches!(
+        current_level.0,
+        Some(LevelId::FogPyramid | LevelId::PerformanceLab)
+    ) {
         return;
     }
 
@@ -396,7 +399,7 @@ pub(super) fn move_fog_pyramid_player(
 
     for mut transform in &mut transforms.p0() {
         let movement = camera_relative_flat_movement(transform.rotation, input_axis);
-        transform.translation += movement * FOG_PYRAMID_MOVE_SPEED * delta_seconds;
+        transform.translation += movement * LEVEL_PLAYER_MOVE_SPEED * delta_seconds;
     }
 
     let Some(views) = views else {
@@ -412,7 +415,7 @@ pub(super) fn move_fog_pyramid_player(
     };
     let view_rotation = tracking_root.rotation * view.pose.orientation.to_quat();
     let movement = camera_relative_flat_movement(view_rotation, input_axis);
-    tracking_root.translation += movement * FOG_PYRAMID_MOVE_SPEED * delta_seconds;
+    tracking_root.translation += movement * LEVEL_PLAYER_MOVE_SPEED * delta_seconds;
 }
 
 fn camera_relative_flat_movement(rotation: Quat, input_axis: Vec2) -> Vec3 {
