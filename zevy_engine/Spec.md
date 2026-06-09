@@ -298,3 +298,54 @@ The next development step should be:
 5. Install and test on PICO 4 Ultra once the device is connected through ADB.
 
 Do not start by porting the PICO UE plugin. Use it as reference while preserving the Rust + Bevy + OpenXR + Vulkan engine direction.
+
+## Progress Log
+
+### 2026-06-09: PICO 4 Ultra First Visible XR Scene
+
+Status: major bring-up milestone reached.
+
+Validated on headset:
+
+- Android APK builds, installs, and launches on PICO 4 Ultra.
+- PICO OpenXR runtime loads successfully.
+- Vulkan OpenXR swapchain is created.
+- Black loading screen blocker was fixed by moving Android XR runtime execution closer to the PICO Native SDK sample model:
+  - Android XR disables the winit event loop.
+  - Android XR uses a schedule runner for continuous engine ticks.
+  - NativeActivity lifecycle events are polled explicitly.
+  - Android headless window mode uses `WindowPlugin.exit_condition = DontExit`.
+- The test scene now renders in the headset.
+- XR hand tracking is detected.
+- XR hand rendering is stable and correct.
+- PICO runtime metrics show sustained frame submission instead of a single submitted frame.
+
+Important implementation notes:
+
+- Do not reintroduce a winit-driven Android XR frame loop unless there is a clear reason and a full lifecycle test.
+- `primary_window = None` on Android XR is valid only with `ExitCondition::DontExit`.
+- Keep PICO Native SDK samples under `G:\zevy_engine\OpenXR_Native_SDK` as the main lifecycle reference.
+- `XR_FB_display_refresh_rate` is available on the target runtime and can be queried/requested, but refresh-rate request alone did not fix the earlier loading issue.
+- `com.picovr.globalui.permission.GLOBAL_UI` is a signature/system permission and should not be relied on for normal APK builds.
+
+Current headset-observed issues:
+
+1. Left-eye scene rendering flickers about once per second.
+2. Right-eye scene rendering flickers occasionally.
+3. XR hand tracking/rendering is stable and does not flicker.
+4. Frame rate is too low, observed around 18 FPS in headset.
+
+Current interpretation:
+
+- Because XR hand rendering is stable while the scene flickers, the next investigation should focus on the scene render path, stereo projection layer submission, camera/render target lifetime, or PBR/depth handling rather than basic tracking.
+- Left-eye-dominant flicker suggests an eye-index, array-layer, swapchain image, view order, or per-eye camera extraction issue should be investigated before adding new features.
+- Low FPS is now a Phase 5/7 blocker. Stabilize stereo rendering and reduce frame cost before expanding scene complexity.
+
+Next immediate plan:
+
+1. Reduce diagnostics/logging and remove frame-step spam from the Android build path.
+2. Add focused render diagnostics for per-eye camera/view index, swapchain image index, layer count, and `should_render`.
+3. Test a minimal unlit/mobile scene to separate PBR/lighting cost from XR frame-loop cost.
+4. Check whether hand-rendering and scene-rendering use different pipelines or layers.
+5. Inspect vendored `bevy_mod_openxr` stereo rendering for array-layer or left/right eye handling bugs.
+6. Profile frame time on PICO and target stable 72 Hz as the first performance goal.
