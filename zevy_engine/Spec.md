@@ -225,6 +225,33 @@ Exit criteria:
 - Multiple-light PBR scene renders on Windows and PICO.
 - Performance costs are visible and documented.
 
+### Phase 7A: Level and Scene Organization
+
+Goal: keep scene/content work separate from platform, XR session, and rendering infrastructure.
+
+The engine should borrow Unreal Engine's Level concept at the project level:
+
+- A Level is a named loadable scene unit.
+- The engine has one default Level.
+- Runtime code can request opening another Level.
+- Level entities should be tagged so they can be unloaded cleanly.
+- Demo/test Levels must not be mixed into Android lifecycle or OpenXR session code.
+
+Initial implementation:
+
+- `LevelId::PerformanceLab` is the current default Level.
+- `OpenLevel(LevelId)` is the first runtime API for Level switching.
+- `CurrentLevel` tracks the active Level.
+- `LevelEntity` marks entities owned by the currently opened Level.
+- `LevelId::Empty` exists as a reserved minimal Level for future loading and lifecycle tests.
+
+Future tasks:
+
+- Move each substantial Level into its own file or folder.
+- Add asset-backed Level descriptions when hand-authored Rust spawning becomes too limiting.
+- Add loading transition rules for XR so Level switches do not disturb the OpenXR session.
+- Add editor/debug commands for setting default Level and opening Levels on Windows.
+
 ### Phase 8: Vulkan Multi-view Rendering
 
 Goal: add a performance-oriented stereo rendering path for mobile XR.
@@ -481,3 +508,31 @@ Next immediate plan:
 1. Use this scene to measure optimization work.
 2. Add quality tiers for dynamic light count, shadow count, and shadow resolution.
 3. Explore cheaper lighting strategies for production scenes: fewer shadow casters, baked/static lighting where possible, clustered light limits, and selective shadows.
+
+### 2026-06-09: Code Organization and Initial Level System
+
+Status: first architecture cleanup implemented.
+
+Changes made:
+
+- `src/lib.rs` is now only the crate/native entry point.
+- `src/app.rs` owns launch mode selection, plugin assembly, and global app startup.
+- `src/platform.rs` owns Android NativeActivity bridging, Android lifecycle polling, display refresh-rate setup, and Android OpenXR session begin behavior.
+- `src/xr.rs` owns OpenXR plugin composition, XR action setup, locomotion, trigger logging, XR anchor visuals, mirror camera sync, and XR render/state logging.
+- `src/scene.rs` owns the Level system: default Level, current Level, `OpenLevel`, unload/load flow.
+- `src/scene/levels.rs` owns concrete Level content for the current prototype Levels.
+- The previous performance lighting scene is now `LevelId::PerformanceLab`.
+- The default Level is configured through `DefaultLevel(LevelId::PerformanceLab)`.
+- Runtime Level switching starts with the `OpenLevel(LevelId)` event.
+
+Validation commands:
+
+- `cargo check`
+- `cargo check --target aarch64-linux-android`
+- `.\scripts\build_android_pico.ps1 -Profile release`
+
+Current interpretation:
+
+- Platform/XR code and scene code now have a cleaner boundary.
+- The first Level system is intentionally simple and entity-tag based.
+- Future Level work should extend `src/scene/levels.rs` or split larger Levels into dedicated files under `src/scene/`, instead of adding scene content back into `lib.rs`.
