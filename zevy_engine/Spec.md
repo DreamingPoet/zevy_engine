@@ -435,7 +435,7 @@ Next immediate plan:
 
 ### 2026-06-09: Dynamic Lighting Performance Test Scene
 
-Status: implemented as a stress scene.
+Status: implemented as a stress scene and then adjusted into a more practical mobile XR lighting test.
 
 Changes made:
 
@@ -445,7 +445,7 @@ Changes made:
 - Enabled dynamic shadows on all 8 lights.
 - Added slow orbit animation for the lights around the model cluster.
 
-PICO 4 Ultra release APK metrics:
+First PICO 4 Ultra release APK metrics with all 8 lights casting shadows:
 
 - `Pkg=com.zevy.engine`
 - Observed `PXRSDK_PM ENGINE FPS` around `23-30` after warmup.
@@ -459,6 +459,22 @@ Current interpretation:
 - The current stress scene is GPU-bound.
 - 8 shadow-casting point lights are too expensive for the current mobile XR baseline, especially with stereo rendering and `NoIndirectDrawing` enabled for XR camera stability.
 - Keep this scene as a stress/performance test, not as the default production budget target.
+
+Follow-up adjustment:
+
+- The 8 dynamic point lights remain in the scene.
+- Each light now has a visible small self-emissive sphere marker so its position can be observed in the headset.
+- Only 2 lights, currently `OrbitLight0` and `OrbitLight4`, cast dynamic shadows.
+- The other 6 lights still move and illuminate the scene, but do not render shadow maps.
+- Light marker meshes are marked `NotShadowCaster` so they do not add unnecessary shadow workload.
+
+Validation after the follow-up adjustment:
+
+- `cargo check --target aarch64-linux-android` passed.
+- `.\scripts\build_android_pico.ps1 -Profile release` built and signed the release APK.
+- `.\scripts\deploy_pico.ps1 -Profile release` installed and launched the APK on PICO 4 Ultra.
+- CLI logcat sampling reported `PXRSDK_PM ENGINE FPS` around `72-73` and `PxrMetric FPS=71-72/72`.
+- The sampled `LayerCnt=0` and very low reported `FrmGpu` suggest this log window should be treated as a deployment/performance smoke test only until headset visual confirmation verifies that the full XR scene was visible.
 
 Next immediate plan:
 

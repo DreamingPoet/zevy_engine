@@ -8,6 +8,7 @@ use bevy::window::ExitCondition;
 use bevy::window::{PresentMode, Window};
 use bevy::{
     math::vec3,
+    pbr::NotShadowCaster,
     prelude::*,
     render::{
         RenderPlugin, pipelined_rendering::PipelinedRenderingPlugin, render_resource::TextureFormat,
@@ -462,7 +463,7 @@ struct XrTriggerAction;
 #[derive(Component)]
 struct MirrorCamera;
 
-#[derive(Component)]
+#[derive(Component, Clone, Copy)]
 struct OrbitingLight {
     center: Vec3,
     radius: f32,
@@ -609,22 +610,32 @@ fn setup_scene(
         Transform::default(),
     ));
 
+    let light_marker_mesh = meshes.add(Sphere::new(0.045).mesh().ico(1).unwrap());
     let light_colors = [
-        Color::srgb(0.92, 0.62, 0.58),
-        Color::srgb(0.96, 0.74, 0.48),
-        Color::srgb(0.78, 0.86, 0.52),
-        Color::srgb(0.55, 0.84, 0.65),
-        Color::srgb(0.52, 0.80, 0.86),
-        Color::srgb(0.58, 0.66, 0.92),
-        Color::srgb(0.72, 0.58, 0.90),
-        Color::srgb(0.90, 0.58, 0.74),
+        (Color::srgb(0.92, 0.62, 0.58), LinearRgba::rgb(2.76, 1.86, 1.74)),
+        (Color::srgb(0.96, 0.74, 0.48), LinearRgba::rgb(2.88, 2.22, 1.44)),
+        (Color::srgb(0.78, 0.86, 0.52), LinearRgba::rgb(2.34, 2.58, 1.56)),
+        (Color::srgb(0.55, 0.84, 0.65), LinearRgba::rgb(1.65, 2.52, 1.95)),
+        (Color::srgb(0.52, 0.80, 0.86), LinearRgba::rgb(1.56, 2.40, 2.58)),
+        (Color::srgb(0.58, 0.66, 0.92), LinearRgba::rgb(1.74, 1.98, 2.76)),
+        (Color::srgb(0.72, 0.58, 0.90), LinearRgba::rgb(2.16, 1.74, 2.70)),
+        (Color::srgb(0.90, 0.58, 0.74), LinearRgba::rgb(2.70, 1.74, 2.22)),
     ];
 
-    for (index, color) in light_colors.into_iter().enumerate() {
+    for (index, (color, emissive)) in light_colors.into_iter().enumerate() {
         let phase = index as f32 / 8.0 * std::f32::consts::TAU;
         let radius = 1.05 + (index % 2) as f32 * 0.18;
         let height = 0.72 + (index % 3) as f32 * 0.08;
         let position = orbit_position(Vec3::ZERO, radius, height, phase);
+        let orbit = OrbitingLight {
+            center: Vec3::ZERO,
+            radius,
+            height,
+            phase,
+            speed: 0.18 + index as f32 * 0.012,
+        };
+        let casts_shadow = matches!(index, 0 | 4);
+
         commands.spawn((
             Name::new(format!("OrbitLight{index}")),
             PointLight {
@@ -632,16 +643,24 @@ fn setup_scene(
                 intensity: 85_000.0,
                 range: 3.0,
                 radius: 0.035,
-                shadows_enabled: true,
+                shadows_enabled: casts_shadow,
                 ..default()
             },
-            OrbitingLight {
-                center: Vec3::ZERO,
-                radius,
-                height,
-                phase,
-                speed: 0.18 + index as f32 * 0.012,
-            },
+            orbit,
+            Transform::from_translation(position),
+        ));
+
+        commands.spawn((
+            Name::new(format!("OrbitLightMarker{index}")),
+            Mesh3d(light_marker_mesh.clone()),
+            MeshMaterial3d(materials.add(StandardMaterial {
+                base_color: color,
+                emissive,
+                perceptual_roughness: 0.25,
+                ..default()
+            })),
+            NotShadowCaster,
+            orbit,
             Transform::from_translation(position),
         ));
     }
