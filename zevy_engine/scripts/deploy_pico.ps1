@@ -19,6 +19,12 @@ if ($ConnectedDevices.Count -eq 0) {
 }
 
 & $Adb install -r $Apk
-& $Adb shell monkey -p $PackageName -c android.intent.category.LAUNCHER 1
+& $Adb shell setprop debug.xr.graphicsPlugin Vulkan
+& $Adb shell am force-stop $PackageName
+& $Adb shell am start -W `
+    -n "$PackageName/$ActivityName" `
+    -a android.intent.action.MAIN `
+    -c android.intent.category.LAUNCHER `
+    -c com.picovr.intent.category.VR
 
 Write-Host "Launched $PackageName/$ActivityName"
