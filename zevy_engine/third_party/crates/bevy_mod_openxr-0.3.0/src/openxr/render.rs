@@ -207,14 +207,6 @@ pub fn update_cameras(
     for (mut camera, xr_camera) in &mut cameras {
         camera.target =
             RenderTarget::TextureView(ManualTextureViewHandle(XR_TEXTURE_INDEX + xr_camera.0));
-        #[cfg(target_os = "android")]
-        {
-            camera.clear_color = if xr_camera.0 == 0 {
-                ClearColorConfig::Custom(Color::srgb(0.0, 0.03, 0.12))
-            } else {
-                ClearColorConfig::Custom(Color::srgb(1.0, 0.0, 0.8))
-            };
-        }
     }
     if frame_state.is_changed() {
         for (mut camera, _) in &mut cameras {

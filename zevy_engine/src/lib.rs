@@ -10,8 +10,7 @@ use bevy::{
     math::vec3,
     prelude::*,
     render::{
-        RenderPlugin, pipelined_rendering::PipelinedRenderingPlugin,
-        render_resource::TextureFormat, view::NoFrustumCulling,
+        RenderPlugin, pipelined_rendering::PipelinedRenderingPlugin, render_resource::TextureFormat,
     },
     utils::default,
     window::WindowPlugin,
@@ -510,7 +509,6 @@ fn setup_scene(
             perceptual_roughness: 0.15,
             ..default()
         })),
-        NoFrustumCulling,
         Transform::from_xyz(0.0, 0.5, 0.0),
     ));
 
@@ -518,7 +516,6 @@ fn setup_scene(
         Name::new("Ground"),
         Mesh3d(meshes.add(Circle::new(6.0))),
         MeshMaterial3d(materials.add(Color::srgb(0.08, 0.09, 0.1))),
-        NoFrustumCulling,
         Transform::from_rotation(Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2)),
     ));
 

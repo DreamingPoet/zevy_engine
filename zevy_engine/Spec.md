@@ -301,6 +301,8 @@ Do not start by porting the PICO UE plugin. Use it as reference while preserving
 
 ## Progress Log
 
+Complex resolved issues are tracked in `ResolvedComplexIssues.md`. Use that document for root-cause records of hard Android/PICO/OpenXR/rendering problems; keep this spec focused on project direction, current status, and next development priorities.
+
 ### 2026-06-09: PICO 4 Ultra First Visible XR Scene
 
 Status: major bring-up milestone reached.
@@ -390,3 +392,43 @@ Next immediate plan:
 1. Ask for headset confirmation on the release APK: left-eye flicker, right-eye flicker, hand stability, and perceived latency.
 2. If flicker remains, add focused per-eye render diagnostics without increasing per-frame log pressure.
 3. If flicker is resolved, move to the next production milestone: OpenXR session lifecycle cleanup and stable Android XR release build documentation.
+
+### 2026-06-09: Stereo Scene Stability on PICO 4 Ultra
+
+Status: resolved for current demo scene.
+
+Validated on headset:
+
+- Left eye remains stable.
+- Right eye scene rendering is stable after disabling indirect drawing for XR cameras.
+- Reaching hands into view no longer causes scene/background flicker.
+- XR hand tracking remains stable in both eyes.
+- Final release APK removes the temporary right-eye magenta diagnostic clear color.
+
+Important implementation notes:
+
+- The main OpenXR projection layer should remain opaque.
+- OpenXR swapchain acquire/wait and manual texture view insertion must happen before Bevy prepares view targets.
+- Current XR cameras use `NoIndirectDrawing` to avoid Bevy GPU preprocessing/indirect drawing instability in Android OpenXR stereo rendering.
+- Do not remove `NoIndirectDrawing` from XR cameras without testing both eyes on PICO 4 Ultra with hand tracking visible.
+- The detailed root-cause writeup is in `ResolvedComplexIssues.md`.
+
+Validation commands:
+
+- `cargo check --target aarch64-linux-android`
+- `.\scripts\build_android_pico.ps1 -Profile release`
+- `.\scripts\deploy_pico.ps1 -Profile release`
+
+PICO 4 Ultra logcat metrics from the final release APK:
+
+- `Pkg=com.zevy.engine`
+- Sustained `PXRSDK_PM ENGINE FPS` around `89-90`.
+- `PxrMetric` reports `FPS=89-90/90`.
+- `FrmCpu` about `4.8-5.2ms` in the sampled window.
+- `FrmGpu` about `8.9-9.5ms` in the sampled window after disabling indirect drawing.
+
+Next immediate plan:
+
+1. Confirm final no-diagnostic-color headset view with the user.
+2. Keep Android XR release build as the baseline path.
+3. Start the next production milestone: OpenXR lifecycle cleanup, input interaction profile cleanup, and mobile rendering budget tracking.
