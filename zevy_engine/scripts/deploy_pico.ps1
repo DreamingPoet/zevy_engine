@@ -1,14 +1,19 @@
+param(
+    [ValidateSet("release", "debug")]
+    [string]$Profile = "release"
+)
+
 $ErrorActionPreference = "Stop"
 
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
 $AndroidHome = "F:\AndriodSDK\AndriodSDK"
 $Adb = Join-Path $AndroidHome "platform-tools\adb.exe"
-$Apk = Join-Path $ProjectRoot "target\debug\apk\zevy_engine.apk"
+$Apk = Join-Path $ProjectRoot "target\$Profile\apk\zevy_engine.apk"
 $PackageName = "com.zevy.engine"
 $ActivityName = "android.app.NativeActivity"
 
 if (!(Test-Path $Apk)) {
-    throw "APK not found: $Apk. Run scripts\build_android_pico.ps1 first."
+    throw "APK not found: $Apk. Run scripts\build_android_pico.ps1 -Profile $Profile first."
 }
 
 $Devices = & $Adb devices -l

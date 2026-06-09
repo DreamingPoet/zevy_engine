@@ -349,3 +349,44 @@ Next immediate plan:
 4. Check whether hand-rendering and scene-rendering use different pipelines or layers.
 5. Inspect vendored `bevy_mod_openxr` stereo rendering for array-layer or left/right eye handling bugs.
 6. Profile frame time on PICO and target stable 72 Hz as the first performance goal.
+
+### 2026-06-09: Android Release Performance Baseline
+
+Status: performance blocker largely resolved for the current demo scene.
+
+Changes made:
+
+- Android/PICO build and deploy scripts now default to the optimized `release` APK path.
+- `scripts\build_android_pico.ps1 -Profile debug` and `scripts\deploy_pico.ps1 -Profile debug` remain available for slower diagnostic builds.
+- The release APK is signed with the local Android debug keystore for device iteration only. This is not a production/store signing key.
+- Android XR no longer spawns a desktop mirror camera, because the APK runs headless with `primary_window = None`.
+- Android XR no longer emits per-frame winit redraw requests after disabling winit.
+- The Android test scene disables dynamic shadows and reduces sphere mesh subdivision to lower mobile frame cost.
+- Removed experimental per-frame JNI attach calls from the vendored OpenXR render frame release/end path.
+
+Validation commands:
+
+- `cargo check --target aarch64-linux-android`
+- `.\scripts\build_android_pico.ps1 -Profile release`
+- `.\scripts\deploy_pico.ps1 -Profile release`
+
+PICO 4 Ultra logcat metrics from the release APK:
+
+- `Pkg=com.zevy.engine`
+- Sustained `PXRSDK_PM ENGINE FPS` around `89-90`.
+- `PxrMetric` reports `FPS=88-90/90` over the sampled window.
+- `FrmCpu` dropped from the debug build's approximate `16-26ms` range to about `3.3-5.6ms` after warmup.
+- `FrmGpu` is about `5.6-10.7ms` in this demo scene, so the next optimization pass should watch GPU cost as scene complexity grows.
+- `LayerCnt=3`, matching the expected simple projection/hand/XR composition footprint better than the previous debug run's noisy layer count.
+
+Current interpretation:
+
+- The observed 18 FPS issue was primarily caused by testing an unoptimized debug APK on device.
+- The release APK now meets the first performance target of stable 72 Hz and is close to the device's current 90 Hz runtime rate.
+- The left/right eye flicker still needs headset-side visual confirmation on this release APK. If flicker remains at 89-90 FPS, continue investigating stereo swapchain array-layer handling, eye camera extraction, projection layer view ordering, and `should_render`/session timing.
+
+Next immediate plan:
+
+1. Ask for headset confirmation on the release APK: left-eye flicker, right-eye flicker, hand stability, and perceived latency.
+2. If flicker remains, add focused per-eye render diagnostics without increasing per-frame log pressure.
+3. If flicker is resolved, move to the next production milestone: OpenXR session lifecycle cleanup and stable Android XR release build documentation.

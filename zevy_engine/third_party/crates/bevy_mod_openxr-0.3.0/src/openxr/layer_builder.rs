@@ -36,7 +36,6 @@ impl LayerProvider for ProjectionLayer {
 
         Some(Box::new(
             CompositionLayerProjection::new()
-                .layer_flags(CompositionLayerFlags::BLEND_TEXTURE_SOURCE_ALPHA)
                 .space(stage)
                 .views(&[
                     CompositionLayerProjectionView::new()

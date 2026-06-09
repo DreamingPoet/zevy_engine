@@ -10,7 +10,8 @@ use bevy::{
     math::vec3,
     prelude::*,
     render::{
-        RenderPlugin, pipelined_rendering::PipelinedRenderingPlugin, render_resource::TextureFormat,
+        RenderPlugin, pipelined_rendering::PipelinedRenderingPlugin,
+        render_resource::TextureFormat, view::NoFrustumCulling,
     },
     utils::default,
     window::WindowPlugin,
@@ -374,9 +375,7 @@ fn begin_android_xr_session_after_action_attach(
 fn begin_android_xr_session_after_action_attach() {}
 
 #[cfg(target_os = "android")]
-fn request_android_xr_redraw(mut redraw: EventWriter<bevy::window::RequestRedraw>) {
-    redraw.write(bevy::window::RequestRedraw);
-}
+fn request_android_xr_redraw() {}
 
 #[cfg(not(target_os = "android"))]
 fn request_android_xr_redraw() {}
@@ -499,15 +498,19 @@ fn setup_scene(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
+    let mobile_xr = cfg!(target_os = "android") && startup_mode.0 == LaunchMode::Xr;
+    let sphere_subdivisions = if mobile_xr { 3 } else { 5 };
+
     commands.spawn((
         Name::new("SceneSphere"),
-        Mesh3d(meshes.add(Sphere::new(1.0).mesh().ico(5).unwrap())),
+        Mesh3d(meshes.add(Sphere::new(0.5).mesh().ico(sphere_subdivisions).unwrap())),
         MeshMaterial3d(materials.add(StandardMaterial {
             base_color: Color::srgb(0.2, 0.7, 0.9),
             metallic: 0.85,
             perceptual_roughness: 0.15,
             ..default()
         })),
+        NoFrustumCulling,
         Transform::from_xyz(0.0, 0.5, 0.0),
     ));
 
@@ -515,18 +518,24 @@ fn setup_scene(
         Name::new("Ground"),
         Mesh3d(meshes.add(Circle::new(6.0))),
         MeshMaterial3d(materials.add(Color::srgb(0.08, 0.09, 0.1))),
+        NoFrustumCulling,
         Transform::from_rotation(Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2)),
     ));
 
     commands.spawn((
         Name::new("KeyLight"),
         PointLight {
-            shadows_enabled: true,
-            intensity: 2_000_000.0,
+            shadows_enabled: !mobile_xr,
+            intensity: if mobile_xr { 250_000.0 } else { 2_000_000.0 },
             ..default()
         },
         Transform::from_xyz(4.0, 8.0, 4.0),
     ));
+
+    #[cfg(target_os = "android")]
+    if startup_mode.0 == LaunchMode::Xr {
+        return;
+    }
 
     let camera_name = match startup_mode.0 {
         LaunchMode::Desktop => "DesktopCamera",

@@ -42,6 +42,14 @@ openxr = "0.19"
 [patch.crates-io]
 bevy_mod_openxr = { path = "third_party/crates/bevy_mod_openxr-0.3.0" }
 
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = false
+strip = "symbols"
+panic = "abort"
+
 [package.metadata.android]
 package = "com.zevy.engine"
 build_targets = ["aarch64-linux-android"]

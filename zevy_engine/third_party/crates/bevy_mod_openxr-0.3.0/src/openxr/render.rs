@@ -7,7 +7,8 @@ use bevy::{
         extract_resource::ExtractResourcePlugin,
         pipelined_rendering::PipelinedRenderingPlugin,
         view::{ExtractedView, NoFrustumCulling},
-        Render, RenderApp,
+        view::NoIndirectDrawing,
+        Render, RenderApp, RenderSet,
     },
     transform::TransformSystem,
 };
@@ -99,12 +100,13 @@ impl Plugin for OxrRenderPlugin {
                 (
                     begin_frame,
                     insert_texture_views,
+                    wait_image,
                     locate_views,
                     update_views_render_world,
-                    wait_image,
                 )
                     .chain()
-                    .in_set(XrRenderSet::PreRender)
+                    .in_set(RenderSet::ManageViews)
+                    .before(bevy::render::view::prepare_view_attachments)
                     .run_if(should_run_frame_loop),
             )
             .add_systems(
@@ -181,6 +183,7 @@ pub fn init_views<const SPAWN_CAMERAS: bool>(
                 XrCamera(index),
                 Projection::custom(XrProjection::default()),
                 NoFrustumCulling,
+                NoIndirectDrawing,
             ));
         }
     }
@@ -204,6 +207,14 @@ pub fn update_cameras(
     for (mut camera, xr_camera) in &mut cameras {
         camera.target =
             RenderTarget::TextureView(ManualTextureViewHandle(XR_TEXTURE_INDEX + xr_camera.0));
+        #[cfg(target_os = "android")]
+        {
+            camera.clear_color = if xr_camera.0 == 0 {
+                ClearColorConfig::Custom(Color::srgb(0.0, 0.03, 0.12))
+            } else {
+                ClearColorConfig::Custom(Color::srgb(1.0, 0.0, 0.8))
+            };
+        }
     }
     if frame_state.is_changed() {
         for (mut camera, _) in &mut cameras {
@@ -370,12 +381,6 @@ pub fn begin_frame(mut frame_stream: ResMut<OxrFrameStream>, mut log_count: Loca
 }
 
 pub fn release_image(mut swapchain: ResMut<OxrSwapchain>, mut log_count: Local<u32>) {
-    #[cfg(target_os = "android")]
-    {
-        let ctx = ndk_context::android_context();
-        let vm = unsafe { jni::JavaVM::from_raw(ctx.vm().cast()) }.unwrap();
-        let env = vm.attach_current_thread_as_daemon();
-    }
     let _span = debug_span!("xr_release_image").entered();
     log_frame_step(&mut log_count, "XR frame step: release_image begin");
     swapchain.release_image().unwrap();
@@ -385,12 +390,6 @@ pub fn release_image(mut swapchain: ResMut<OxrSwapchain>, mut log_count: Local<u
 static END_FRAME_LOG_COUNT: AtomicU32 = AtomicU32::new(0);
 
 pub fn end_frame(world: &mut World) {
-    #[cfg(target_os = "android")]
-    {
-        let ctx = ndk_context::android_context();
-        let vm = unsafe { jni::JavaVM::from_raw(ctx.vm().cast()) }.unwrap();
-        let env = vm.attach_current_thread_as_daemon();
-    }
     world.resource_scope::<OxrFrameStream, ()>(|world, mut frame_stream| {
         let mut layers = vec![];
         let frame_state = world.resource::<OxrFrameState>();
