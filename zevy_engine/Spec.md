@@ -239,7 +239,8 @@ The engine should borrow Unreal Engine's Level concept at the project level:
 
 Initial implementation:
 
-- `LevelId::PerformanceLab` is the current default Level.
+- `LevelId::FogPyramid` is the current default Level.
+- `LevelId::PerformanceLab` remains available as a performance stress-test Level.
 - `OpenLevel(LevelId)` is the first runtime API for Level switching.
 - `CurrentLevel` tracks the active Level.
 - `LevelEntity` marks entities owned by the currently opened Level.
@@ -522,7 +523,7 @@ Changes made:
 - `src/scene.rs` owns the Level system: default Level, current Level, `OpenLevel`, unload/load flow.
 - `src/scene/levels.rs` owns concrete Level content for the current prototype Levels.
 - The previous performance lighting scene is now `LevelId::PerformanceLab`.
-- The default Level is configured through `DefaultLevel(LevelId::PerformanceLab)`.
+- The default Level is configured through `DefaultLevel(LevelId::FogPyramid)`.
 - Runtime Level switching starts with the `OpenLevel(LevelId)` event.
 
 Validation commands:
@@ -536,3 +537,31 @@ Current interpretation:
 - Platform/XR code and scene code now have a cleaner boundary.
 - The first Level system is intentionally simple and entity-tag based.
 - Future Level work should extend `src/scene/levels.rs` or split larger Levels into dedicated files under `src/scene/`, instead of adding scene content back into `lib.rs`.
+
+### 2026-06-09: FogPyramid Default Level
+
+Status: implemented.
+
+Source reference:
+
+- Bevy official `3D Rendering / Fog` example: `https://bevy.org/examples/3d-rendering/fog/`.
+
+Changes made:
+
+- Added `LevelId::FogPyramid`.
+- Set `DefaultLevel(LevelId::FogPyramid)`.
+- Ported only the scene content from the Bevy fog example:
+  - stone pillar structure,
+  - stepped pyramid,
+  - translucent green orb,
+  - large gray unlit sky cube,
+  - one shadow-casting point light,
+  - fixed linear distance fog.
+- Removed the Bevy example's Controls, Key Binding, UI text, fog editing, and orbiting camera update system.
+- Added `ActiveLevelFog` so fog settings are applied to generated XR cameras as well as desktop cameras.
+
+Validation commands:
+
+- `cargo check`
+- `cargo check --target aarch64-linux-android`
+- `.\scripts\build_android_pico.ps1 -Profile release`

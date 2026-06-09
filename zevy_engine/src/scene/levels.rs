@@ -1,4 +1,7 @@
-use bevy::{pbr::NotShadowCaster, prelude::*};
+use bevy::{
+    pbr::{NotShadowCaster, NotShadowReceiver},
+    prelude::*,
+};
 
 use crate::{
     app::LaunchMode,
@@ -12,6 +15,91 @@ pub(super) struct OrbitingLight {
     height: f32,
     phase: f32,
     speed: f32,
+}
+
+pub(super) fn level_fog(level: super::LevelId) -> Option<DistanceFog> {
+    match level {
+        super::LevelId::FogPyramid => Some(fog_pyramid_fog()),
+        super::LevelId::PerformanceLab | super::LevelId::Empty => None,
+    }
+}
+
+pub(super) fn spawn_fog_pyramid(
+    launch_mode: LaunchMode,
+    level_fog: Option<DistanceFog>,
+    commands: &mut Commands,
+    meshes: &mut ResMut<Assets<Mesh>>,
+    materials: &mut ResMut<Assets<StandardMaterial>>,
+) {
+    let stone = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.157, 0.133, 0.106),
+        perceptual_roughness: 1.0,
+        ..default()
+    });
+
+    for (x, z) in &[(-1.5, -1.5), (1.5, -1.5), (1.5, 1.5), (-1.5, 1.5)] {
+        commands.spawn((
+            Name::new("FogPillar"),
+            LevelEntity,
+            Mesh3d(meshes.add(Cuboid::new(1.0, 3.0, 1.0))),
+            MeshMaterial3d(stone.clone()),
+            Transform::from_xyz(*x, 1.5, *z),
+        ));
+    }
+
+    commands.spawn((
+        Name::new("FogOrb"),
+        LevelEntity,
+        Mesh3d(meshes.add(Sphere::default())),
+        MeshMaterial3d(materials.add(StandardMaterial {
+            base_color: Color::srgba(0.071, 0.384, 0.071, 0.8),
+            reflectance: 1.0,
+            perceptual_roughness: 0.0,
+            metallic: 0.5,
+            alpha_mode: AlphaMode::Blend,
+            ..default()
+        })),
+        Transform::from_scale(Vec3::splat(1.75)).with_translation(Vec3::new(0.0, 4.0, 0.0)),
+        NotShadowCaster,
+        NotShadowReceiver,
+    ));
+
+    for i in 0..50 {
+        let half_size = i as f32 / 2.0 + 3.0;
+        let y = -i as f32 / 2.0;
+        commands.spawn((
+            Name::new("FogStep"),
+            LevelEntity,
+            Mesh3d(meshes.add(Cuboid::new(2.0 * half_size, 0.5, 2.0 * half_size))),
+            MeshMaterial3d(stone.clone()),
+            Transform::from_xyz(0.0, y + 0.25, 0.0),
+        ));
+    }
+
+    commands.spawn((
+        Name::new("FogSkyCube"),
+        LevelEntity,
+        Mesh3d(meshes.add(Cuboid::new(2.0, 1.0, 1.0))),
+        MeshMaterial3d(materials.add(StandardMaterial {
+            base_color: Color::srgb(0.533, 0.533, 0.533),
+            unlit: true,
+            cull_mode: None,
+            ..default()
+        })),
+        Transform::from_scale(Vec3::splat(1_000_000.0)),
+    ));
+
+    commands.spawn((
+        Name::new("FogPointLight"),
+        LevelEntity,
+        PointLight {
+            shadows_enabled: true,
+            ..default()
+        },
+        Transform::from_xyz(0.0, 1.0, 0.0),
+    ));
+
+    spawn_level_camera(launch_mode, level_fog, commands);
 }
 
 pub(super) fn spawn_performance_lab(
@@ -181,14 +269,18 @@ pub(super) fn spawn_performance_lab(
         ));
     }
 
-    spawn_level_camera(launch_mode, commands);
+    spawn_level_camera(launch_mode, None, commands);
 }
 
 pub(super) fn spawn_empty(launch_mode: LaunchMode, commands: &mut Commands) {
-    spawn_level_camera(launch_mode, commands);
+    spawn_level_camera(launch_mode, None, commands);
 }
 
-fn spawn_level_camera(launch_mode: LaunchMode, commands: &mut Commands) {
+fn spawn_level_camera(
+    launch_mode: LaunchMode,
+    fog: Option<DistanceFog>,
+    commands: &mut Commands,
+) {
     #[cfg(target_os = "android")]
     if launch_mode == LaunchMode::Xr {
         return;
@@ -205,8 +297,23 @@ fn spawn_level_camera(launch_mode: LaunchMode, commands: &mut Commands) {
         Transform::from_xyz(-2.5, 4.5, 9.0).looking_at(Vec3::ZERO, Vec3::Y),
     ));
 
+    if let Some(fog) = fog {
+        camera.insert(fog);
+    }
+
     if launch_mode == LaunchMode::Xr {
         camera.insert(MirrorCamera);
+    }
+}
+
+fn fog_pyramid_fog() -> DistanceFog {
+    DistanceFog {
+        color: Color::srgb(0.25, 0.25, 0.25),
+        falloff: FogFalloff::Linear {
+            start: 5.0,
+            end: 20.0,
+        },
+        ..default()
     }
 }
 
