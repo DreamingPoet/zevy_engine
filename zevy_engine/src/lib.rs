@@ -1,4 +1,5 @@
 mod app;
+mod input;
 mod platform;
 mod scene;
 mod xr;

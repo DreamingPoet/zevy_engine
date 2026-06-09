@@ -214,14 +214,38 @@ pub(super) fn spawn_performance_lab(
 
     let light_marker_mesh = meshes.add(Sphere::new(0.045).mesh().ico(1).unwrap());
     let light_colors = [
-        (Color::srgb(0.92, 0.62, 0.58), LinearRgba::rgb(2.76, 1.86, 1.74)),
-        (Color::srgb(0.96, 0.74, 0.48), LinearRgba::rgb(2.88, 2.22, 1.44)),
-        (Color::srgb(0.78, 0.86, 0.52), LinearRgba::rgb(2.34, 2.58, 1.56)),
-        (Color::srgb(0.55, 0.84, 0.65), LinearRgba::rgb(1.65, 2.52, 1.95)),
-        (Color::srgb(0.52, 0.80, 0.86), LinearRgba::rgb(1.56, 2.40, 2.58)),
-        (Color::srgb(0.58, 0.66, 0.92), LinearRgba::rgb(1.74, 1.98, 2.76)),
-        (Color::srgb(0.72, 0.58, 0.90), LinearRgba::rgb(2.16, 1.74, 2.70)),
-        (Color::srgb(0.90, 0.58, 0.74), LinearRgba::rgb(2.70, 1.74, 2.22)),
+        (
+            Color::srgb(0.92, 0.62, 0.58),
+            LinearRgba::rgb(2.76, 1.86, 1.74),
+        ),
+        (
+            Color::srgb(0.96, 0.74, 0.48),
+            LinearRgba::rgb(2.88, 2.22, 1.44),
+        ),
+        (
+            Color::srgb(0.78, 0.86, 0.52),
+            LinearRgba::rgb(2.34, 2.58, 1.56),
+        ),
+        (
+            Color::srgb(0.55, 0.84, 0.65),
+            LinearRgba::rgb(1.65, 2.52, 1.95),
+        ),
+        (
+            Color::srgb(0.52, 0.80, 0.86),
+            LinearRgba::rgb(1.56, 2.40, 2.58),
+        ),
+        (
+            Color::srgb(0.58, 0.66, 0.92),
+            LinearRgba::rgb(1.74, 1.98, 2.76),
+        ),
+        (
+            Color::srgb(0.72, 0.58, 0.90),
+            LinearRgba::rgb(2.16, 1.74, 2.70),
+        ),
+        (
+            Color::srgb(0.90, 0.58, 0.74),
+            LinearRgba::rgb(2.70, 1.74, 2.22),
+        ),
     ];
 
     for (index, (color, emissive)) in light_colors.into_iter().enumerate() {
@@ -276,11 +300,7 @@ pub(super) fn spawn_empty(launch_mode: LaunchMode, commands: &mut Commands) {
     spawn_level_camera(launch_mode, None, commands);
 }
 
-fn spawn_level_camera(
-    launch_mode: LaunchMode,
-    fog: Option<DistanceFog>,
-    commands: &mut Commands,
-) {
+fn spawn_level_camera(launch_mode: LaunchMode, fog: Option<DistanceFog>, commands: &mut Commands) {
     #[cfg(target_os = "android")]
     if launch_mode == LaunchMode::Xr {
         return;

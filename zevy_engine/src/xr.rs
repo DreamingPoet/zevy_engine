@@ -1,14 +1,13 @@
 #[cfg(target_os = "android")]
 use std::time::Duration;
 
+#[cfg(not(target_os = "android"))]
+use bevy::window::{PresentMode, Window};
 use bevy::{
-    math::vec3,
     prelude::*,
     render::{RenderPlugin, pipelined_rendering::PipelinedRenderingPlugin},
     window::WindowPlugin,
 };
-#[cfg(not(target_os = "android"))]
-use bevy::window::{PresentMode, Window};
 use bevy_mod_openxr::{
     action_binding::OxrActionBindingPlugin,
     action_set_attaching::OxrActionAttachingPlugin,
@@ -26,20 +25,9 @@ use bevy_mod_xr::{
     camera::{XrCamera, XrCameraPlugin},
     session::{XrCreateSessionEvent, XrSessionPlugin, XrState, XrTracker, XrTrackingRoot},
 };
-use bevy_xr_utils::{
-    tracking_utils::{XrTrackedLeftGrip, XrTrackedRightGrip, XrTrackedView},
-    xr_utils_actions::{
-        ActiveSet, XRUtilsAction, XRUtilsActionSet, XRUtilsActionState, XRUtilsBinding,
-    },
-};
+use bevy_xr_utils::tracking_utils::{XrTrackedLeftGrip, XrTrackedRightGrip, XrTrackedView};
 
 use crate::{platform, scene::MirrorCamera};
-
-#[derive(Component)]
-pub struct XrMoveAction;
-
-#[derive(Component)]
-pub struct XrTriggerAction;
 
 pub fn plugins() -> bevy::app::PluginGroupBuilder {
     let mut oxr_init = OxrInitPlugin::default();
@@ -105,90 +93,6 @@ pub fn request_session_when_available(
     }
 }
 
-pub fn setup_actions(mut commands: Commands) {
-    let locomotion_set = commands
-        .spawn((
-            XRUtilsActionSet {
-                name: "locomotion".into(),
-                pretty_name: "Locomotion".into(),
-                priority: 0,
-            },
-            ActiveSet,
-        ))
-        .id();
-
-    let move_action = commands
-        .spawn((
-            XRUtilsAction {
-                action_name: "move".into(),
-                localized_name: "Move".into(),
-                action_type: bevy_mod_xr::actions::ActionType::Vector,
-            },
-            XrMoveAction,
-        ))
-        .id();
-
-    let move_binding_touch = commands
-        .spawn(XRUtilsBinding {
-            profile: "/interaction_profiles/oculus/touch_controller".into(),
-            binding: "/user/hand/right/input/thumbstick".into(),
-        })
-        .id();
-    let move_binding_index = commands
-        .spawn(XRUtilsBinding {
-            profile: "/interaction_profiles/valve/index_controller".into(),
-            binding: "/user/hand/right/input/thumbstick".into(),
-        })
-        .id();
-
-    commands.entity(move_action).add_child(move_binding_touch);
-    commands.entity(move_action).add_child(move_binding_index);
-    commands.entity(locomotion_set).add_child(move_action);
-
-    let input_set = commands
-        .spawn((
-            XRUtilsActionSet {
-                name: "input".into(),
-                pretty_name: "Input".into(),
-                priority: 1,
-            },
-            ActiveSet,
-        ))
-        .id();
-
-    let trigger_action = commands
-        .spawn((
-            XRUtilsAction {
-                action_name: "trigger_click".into(),
-                localized_name: "Trigger Click".into(),
-                action_type: bevy_mod_xr::actions::ActionType::Bool,
-            },
-            XrTriggerAction,
-        ))
-        .id();
-
-    let trigger_binding_touch = commands
-        .spawn(XRUtilsBinding {
-            profile: "/interaction_profiles/oculus/touch_controller".into(),
-            binding: "/user/hand/right/input/trigger".into(),
-        })
-        .id();
-    let trigger_binding_index = commands
-        .spawn(XRUtilsBinding {
-            profile: "/interaction_profiles/valve/index_controller".into(),
-            binding: "/user/hand/right/input/trigger".into(),
-        })
-        .id();
-
-    commands
-        .entity(trigger_action)
-        .add_child(trigger_binding_touch);
-    commands
-        .entity(trigger_action)
-        .add_child(trigger_binding_index);
-    commands.entity(input_set).add_child(trigger_action);
-}
-
 pub fn spawn_anchor_visuals(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
@@ -220,63 +124,6 @@ pub fn spawn_anchor_visuals(
         XrTrackedRightGrip,
         XrTracker,
     ));
-}
-
-pub fn handle_locomotion(
-    action_query: Query<&XRUtilsActionState, With<XrMoveAction>>,
-    mut tracking_root_query: Query<&mut Transform, With<XrTrackingRoot>>,
-    views: Res<OxrViews>,
-    time: Res<Time>,
-) {
-    let Ok(mut tracking_root) = tracking_root_query.single_mut() else {
-        return;
-    };
-
-    let Some(view) = views.first() else {
-        return;
-    };
-
-    for state in &action_query {
-        let XRUtilsActionState::Vector(vector_state) = state else {
-            continue;
-        };
-
-        if !vector_state.is_active {
-            continue;
-        }
-
-        let input_vector = vec3(
-            vector_state.current_state[0],
-            0.0,
-            -vector_state.current_state[1],
-        );
-
-        if input_vector.length_squared() <= f32::EPSILON {
-            continue;
-        }
-
-        let speed = 2.5;
-        let view_rotation = tracking_root.rotation * view.pose.orientation.to_quat();
-        let locomotion = view_rotation.mul_vec3(input_vector);
-        let flat_locomotion = Vec3::new(locomotion.x, 0.0, locomotion.z).normalize_or_zero();
-
-        tracking_root.translation += flat_locomotion * speed * time.delta_secs();
-    }
-}
-
-pub fn log_trigger_input(action_query: Query<&XRUtilsActionState, With<XrTriggerAction>>) {
-    for state in &action_query {
-        let XRUtilsActionState::Bool(button_state) = state else {
-            continue;
-        };
-
-        if button_state.is_active
-            && button_state.changed_since_last_sync
-            && button_state.current_state
-        {
-            info!("XR trigger pressed");
-        }
-    }
 }
 
 pub fn sync_mirror_camera(

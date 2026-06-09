@@ -3,11 +3,10 @@ use std::env;
 use bevy::{prelude::*, render::render_resource::TextureFormat, utils::default};
 use bevy_mod_openxr::resources::OxrSessionConfig;
 use bevy_xr_utils::{
-    tracking_utils::suggest_action_bindings,
-    xr_utils_actions::XRUtilsActionSystemSet,
+    tracking_utils::suggest_action_bindings, xr_utils_actions::XRUtilsActionSystemSet,
 };
 
-use crate::{platform, scene::ScenePlugin, xr};
+use crate::{input, input::EngineInputPlugin, platform, scene::ScenePlugin, xr};
 
 pub fn main() {
     run();
@@ -31,10 +30,16 @@ pub fn run() {
                 .add_plugins(bevy_mod_xr::hand_debug_gizmos::HandGizmosPlugin)
                 .add_systems(
                     Startup,
-                    xr::setup_actions.before(XRUtilsActionSystemSet::CreateEvents),
+                    input::setup_xr_actions.before(XRUtilsActionSystemSet::CreateEvents),
                 )
-                .add_systems(bevy_mod_openxr::action_binding::OxrSendActionBindings, suggest_action_bindings)
-                .add_systems(bevy_mod_xr::session::XrSessionCreated, xr::spawn_anchor_visuals)
+                .add_systems(
+                    bevy_mod_openxr::action_binding::OxrSendActionBindings,
+                    suggest_action_bindings,
+                )
+                .add_systems(
+                    bevy_mod_xr::session::XrSessionCreated,
+                    xr::spawn_anchor_visuals,
+                )
                 .add_systems(
                     PostUpdate,
                     (
@@ -56,8 +61,6 @@ pub fn run() {
                     Update,
                     (
                         platform::request_android_xr_redraw,
-                        xr::handle_locomotion,
-                        xr::log_trigger_input,
                         xr::sync_mirror_camera,
                         xr::log_state_changes,
                         xr::log_render_status,
@@ -78,6 +81,7 @@ pub fn run() {
     app.insert_resource(StartupMode(launch_mode))
         .insert_resource(ClearColor(Color::srgb(0.02, 0.02, 0.03)))
         .add_systems(Startup, log_launch_mode)
+        .add_plugins(EngineInputPlugin)
         .add_plugins(ScenePlugin)
         .run();
 }

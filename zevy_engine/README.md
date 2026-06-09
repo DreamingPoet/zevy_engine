@@ -41,14 +41,16 @@ rustup target add aarch64-linux-android
 
 ## Project Structure
 
-The project keeps platform, XR, and scene code separated:
+The project keeps platform, XR, input, and scene code separated:
 
 - `src/lib.rs`: crate/native entry point.
 - `src/app.rs`: launch mode selection, plugin assembly, global app startup.
 - `src/platform.rs`: Android NativeActivity bridge, Android lifecycle polling, display refresh-rate setup.
-- `src/xr.rs`: OpenXR plugin setup, XR actions, locomotion, hand/controller anchor visuals, XR logs.
+- `src/xr.rs`: OpenXR plugin setup, hand/controller anchor visuals, mirror camera sync, XR logs.
+- `src/input.rs`: keyboard, mouse, and OpenXR/PICO controller input abstraction.
 - `src/scene.rs`: Level management, default Level, `OpenLevel` event.
 - `src/scene/levels.rs`: current prototype Level content.
+- `InputSpec.md`: input module goal, design, implementation progress, and next steps.
 - `scripts/build_android_pico.ps1`: Android APK build script.
 - `scripts/deploy_pico.ps1`: install and launch script for PICO 4 Ultra.
 

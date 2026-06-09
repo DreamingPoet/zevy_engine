@@ -209,6 +209,35 @@ Exit criteria:
 - Trigger input is detected.
 - Input behavior is stable after pause/resume.
 
+### Phase 6A: Engine Input Module
+
+Goal: provide a reusable input abstraction for gameplay and engine logic.
+
+Input should be handled by a dedicated module, not directly inside XR runtime or scene code.
+
+Required uses:
+
+- Collect keyboard input for Windows editor/debug iteration.
+- Collect mouse button and mouse motion input for Windows editor/debug iteration.
+- Collect OpenXR controller actions for Android XR/PICO runtime input.
+- Map device-specific input into semantic engine input events and state.
+- Allow gameplay systems to consume input without depending on Bevy keyboard/mouse APIs or OpenXR action details.
+
+Initial implementation:
+
+- `InputSpec.md` records input module goals and progress.
+- `src/input.rs` owns `EngineInputPlugin`, `EngineInputEvent`, `EngineInputState`, semantic buttons, semantic axes, keyboard/mouse collection, and OpenXR controller action interpretation.
+- `src/xr.rs` no longer owns gameplay input interpretation.
+- PICO/OpenXR input is currently represented by:
+  - right thumbstick -> `InputAxis2::Move`,
+  - right trigger -> `InputButton::PrimaryAction`.
+
+Future tasks:
+
+- Add explicit PICO interaction profile bindings after headset/runtime path confirmation.
+- Add grip, A/B/X/Y, menu, thumbstick-click, left/right hand source detail, and configurable input maps.
+- Add tests around keyboard axis aggregation and button source aggregation.
+
 ### Phase 7: Production Rendering Features
 
 Goal: grow from prototype rendering toward production VR visuals.
@@ -519,7 +548,8 @@ Changes made:
 - `src/lib.rs` is now only the crate/native entry point.
 - `src/app.rs` owns launch mode selection, plugin assembly, and global app startup.
 - `src/platform.rs` owns Android NativeActivity bridging, Android lifecycle polling, display refresh-rate setup, and Android OpenXR session begin behavior.
-- `src/xr.rs` owns OpenXR plugin composition, XR action setup, locomotion, trigger logging, XR anchor visuals, mirror camera sync, and XR render/state logging.
+- `src/xr.rs` owns OpenXR plugin composition, XR anchor visuals, mirror camera sync, and XR render/state logging.
+- `src/input.rs` owns keyboard/mouse/OpenXR input abstraction, XR action setup, semantic input events/state, and the first locomotion input consumer.
 - `src/scene.rs` owns the Level system: default Level, current Level, `OpenLevel`, unload/load flow.
 - `src/scene/levels.rs` owns concrete Level content for the current prototype Levels.
 - The previous performance lighting scene is now `LevelId::PerformanceLab`.
@@ -537,6 +567,31 @@ Current interpretation:
 - Platform/XR code and scene code now have a cleaner boundary.
 - The first Level system is intentionally simple and entity-tag based.
 - Future Level work should extend `src/scene/levels.rs` or split larger Levels into dedicated files under `src/scene/`, instead of adding scene content back into `lib.rs`.
+
+### 2026-06-09: Initial Engine Input Module
+
+Status: implemented.
+
+Changes made:
+
+- Added `InputSpec.md`.
+- Added `src/input.rs`.
+- Added `EngineInputPlugin`.
+- Added `EngineInputEvent` for semantic button, axis, and mouse-motion events.
+- Added `EngineInputState` for continuously sampled semantic input state.
+- Added keyboard/mouse input collection:
+  - `W/A/S/D` and arrow keys -> `InputAxis2::Move`,
+  - `Space` and left mouse button -> `InputButton::PrimaryAction`,
+  - right mouse button -> `InputButton::SecondaryAction`.
+- Moved OpenXR action creation from `src/xr.rs` to `src/input.rs`.
+- Moved PICO/OpenXR right thumbstick and right trigger interpretation into `src/input.rs`.
+- Kept XR locomotion as the first gameplay-facing consumer of `EngineInputState::axis2(InputAxis2::Move)`.
+
+Validation commands:
+
+- `cargo check`
+- `cargo check --target aarch64-linux-android`
+- `.\scripts\build_android_pico.ps1 -Profile release`
 
 ### 2026-06-09: FogPyramid Default Level
 

@@ -3,10 +3,10 @@ use std::time::Duration;
 
 #[cfg(target_os = "android")]
 use bevy::{prelude::*, window::ExitCondition};
-#[cfg(target_os = "android")]
-use bevy_mod_openxr::{exts::OxrEnabledExtensions, init::OxrInitPlugin};
 #[cfg(not(target_os = "android"))]
 use bevy_mod_openxr::init::OxrInitPlugin;
+#[cfg(target_os = "android")]
+use bevy_mod_openxr::{exts::OxrEnabledExtensions, init::OxrInitPlugin};
 
 #[cfg(target_os = "android")]
 pub fn android_main(android_app: bevy::window::android_activity::AndroidApp) {
