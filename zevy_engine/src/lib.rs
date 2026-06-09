@@ -145,6 +145,7 @@ pub fn run() {
     app.insert_resource(StartupMode(launch_mode))
         .insert_resource(ClearColor(Color::srgb(0.02, 0.02, 0.03)))
         .add_systems(Startup, (log_launch_mode, setup_scene))
+        .add_systems(Update, animate_orbiting_lights)
         .run();
 }
 
@@ -461,6 +462,15 @@ struct XrTriggerAction;
 #[derive(Component)]
 struct MirrorCamera;
 
+#[derive(Component)]
+struct OrbitingLight {
+    center: Vec3,
+    radius: f32,
+    height: f32,
+    phase: f32,
+    speed: f32,
+}
+
 impl LaunchMode {
     fn from_args() -> Self {
         #[cfg(target_os = "android")]
@@ -498,36 +508,143 @@ fn setup_scene(
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
     let mobile_xr = cfg!(target_os = "android") && startup_mode.0 == LaunchMode::Xr;
-    let sphere_subdivisions = if mobile_xr { 3 } else { 5 };
+    let sphere_subdivisions = if mobile_xr { 2 } else { 4 };
 
-    commands.spawn((
-        Name::new("SceneSphere"),
-        Mesh3d(meshes.add(Sphere::new(0.5).mesh().ico(sphere_subdivisions).unwrap())),
-        MeshMaterial3d(materials.add(StandardMaterial {
-            base_color: Color::srgb(0.2, 0.7, 0.9),
-            metallic: 0.85,
-            perceptual_roughness: 0.15,
-            ..default()
-        })),
-        Transform::from_xyz(0.0, 0.5, 0.0),
-    ));
+    let brushed_metal = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.58, 0.61, 0.64),
+        metallic: 0.9,
+        perceptual_roughness: 0.28,
+        ..default()
+    });
+    let blue_ceramic = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.18, 0.42, 0.70),
+        metallic: 0.05,
+        perceptual_roughness: 0.18,
+        ..default()
+    });
+    let warm_plastic = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.76, 0.43, 0.30),
+        metallic: 0.0,
+        perceptual_roughness: 0.48,
+        ..default()
+    });
+    let matte_green = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.34, 0.55, 0.38),
+        metallic: 0.0,
+        perceptual_roughness: 0.72,
+        ..default()
+    });
+    let dark_rubber = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.06, 0.065, 0.07),
+        metallic: 0.0,
+        perceptual_roughness: 0.86,
+        ..default()
+    });
+    let muted_gloss = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.54, 0.46, 0.70),
+        metallic: 0.25,
+        perceptual_roughness: 0.22,
+        ..default()
+    });
+
+    let small_models = [
+        (
+            "PerfCube",
+            meshes.add(Cuboid::new(0.36, 0.36, 0.36)),
+            brushed_metal.clone(),
+            Transform::from_xyz(-0.55, 0.28, -0.35).with_rotation(Quat::from_rotation_y(0.45)),
+        ),
+        (
+            "PerfSphere",
+            meshes.add(Sphere::new(0.23).mesh().ico(sphere_subdivisions).unwrap()),
+            blue_ceramic.clone(),
+            Transform::from_xyz(0.0, 0.30, -0.45),
+        ),
+        (
+            "PerfCapsule",
+            meshes.add(Capsule3d::new(0.13, 0.18)),
+            warm_plastic.clone(),
+            Transform::from_xyz(0.55, 0.32, -0.34).with_rotation(Quat::from_rotation_z(0.35)),
+        ),
+        (
+            "PerfTorus",
+            meshes.add(Torus::default()),
+            matte_green.clone(),
+            Transform::from_xyz(-0.42, 0.34, 0.25)
+                .with_scale(Vec3::splat(0.24))
+                .with_rotation(Quat::from_rotation_x(1.1)),
+        ),
+        (
+            "PerfCylinder",
+            meshes.add(Cylinder::new(0.16, 0.42).mesh().resolution(24)),
+            dark_rubber.clone(),
+            Transform::from_xyz(0.18, 0.32, 0.20).with_rotation(Quat::from_rotation_x(0.15)),
+        ),
+        (
+            "PerfCone",
+            meshes.add(Cone::new(0.18, 0.42).mesh().resolution(24)),
+            muted_gloss.clone(),
+            Transform::from_xyz(0.58, 0.31, 0.23).with_rotation(Quat::from_rotation_y(-0.55)),
+        ),
+    ];
+
+    for (name, mesh, material, transform) in small_models {
+        commands.spawn((
+            Name::new(name),
+            Mesh3d(mesh),
+            MeshMaterial3d(material),
+            transform,
+        ));
+    }
 
     commands.spawn((
         Name::new("Ground"),
-        Mesh3d(meshes.add(Circle::new(6.0))),
-        MeshMaterial3d(materials.add(Color::srgb(0.08, 0.09, 0.1))),
-        Transform::from_rotation(Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2)),
+        Mesh3d(meshes.add(Plane3d::default().mesh().size(3.2, 3.2).subdivisions(4))),
+        MeshMaterial3d(materials.add(StandardMaterial {
+            base_color: Color::srgb(0.075, 0.08, 0.085),
+            metallic: 0.0,
+            perceptual_roughness: 0.64,
+            ..default()
+        })),
+        Transform::default(),
     ));
 
-    commands.spawn((
-        Name::new("KeyLight"),
-        PointLight {
-            shadows_enabled: !mobile_xr,
-            intensity: if mobile_xr { 250_000.0 } else { 2_000_000.0 },
-            ..default()
-        },
-        Transform::from_xyz(4.0, 8.0, 4.0),
-    ));
+    let light_colors = [
+        Color::srgb(0.92, 0.62, 0.58),
+        Color::srgb(0.96, 0.74, 0.48),
+        Color::srgb(0.78, 0.86, 0.52),
+        Color::srgb(0.55, 0.84, 0.65),
+        Color::srgb(0.52, 0.80, 0.86),
+        Color::srgb(0.58, 0.66, 0.92),
+        Color::srgb(0.72, 0.58, 0.90),
+        Color::srgb(0.90, 0.58, 0.74),
+    ];
+
+    for (index, color) in light_colors.into_iter().enumerate() {
+        let phase = index as f32 / 8.0 * std::f32::consts::TAU;
+        let radius = 1.05 + (index % 2) as f32 * 0.18;
+        let height = 0.72 + (index % 3) as f32 * 0.08;
+        let position = orbit_position(Vec3::ZERO, radius, height, phase);
+        commands.spawn((
+            Name::new(format!("OrbitLight{index}")),
+            PointLight {
+                color,
+                intensity: 85_000.0,
+                range: 3.0,
+                radius: 0.035,
+                shadows_enabled: true,
+                ..default()
+            },
+            OrbitingLight {
+                center: Vec3::ZERO,
+                radius,
+                height,
+                phase,
+                speed: 0.18 + index as f32 * 0.012,
+            },
+            Transform::from_translation(position),
+        ));
+    }
 
     #[cfg(target_os = "android")]
     if startup_mode.0 == LaunchMode::Xr {
@@ -546,6 +663,18 @@ fn setup_scene(
 
     if startup_mode.0 == LaunchMode::Xr {
         camera.insert(MirrorCamera);
+    }
+}
+
+fn orbit_position(center: Vec3, radius: f32, height: f32, angle: f32) -> Vec3 {
+    center + Vec3::new(angle.cos() * radius, height, angle.sin() * radius)
+}
+
+fn animate_orbiting_lights(time: Res<Time>, mut query: Query<(&OrbitingLight, &mut Transform)>) {
+    let seconds = time.elapsed_secs();
+    for (light, mut transform) in &mut query {
+        let angle = light.phase + seconds * light.speed;
+        transform.translation = orbit_position(light.center, light.radius, light.height, angle);
     }
 }
 

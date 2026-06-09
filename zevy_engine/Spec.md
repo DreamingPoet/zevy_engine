@@ -432,3 +432,36 @@ Next immediate plan:
 1. Confirm final no-diagnostic-color headset view with the user.
 2. Keep Android XR release build as the baseline path.
 3. Start the next production milestone: OpenXR lifecycle cleanup, input interaction profile cleanup, and mobile rendering budget tracking.
+
+### 2026-06-09: Dynamic Lighting Performance Test Scene
+
+Status: implemented as a stress scene.
+
+Changes made:
+
+- Replaced the simple demo object with multiple small PBR primitives no larger than about `0.5m`.
+- Added varied materials: metallic, glossy, matte, plastic, ceramic, and rubber-like surfaces.
+- Added 8 low-saturation colored dynamic point lights.
+- Enabled dynamic shadows on all 8 lights.
+- Added slow orbit animation for the lights around the model cluster.
+
+PICO 4 Ultra release APK metrics:
+
+- `Pkg=com.zevy.engine`
+- Observed `PXRSDK_PM ENGINE FPS` around `23-30` after warmup.
+- `PxrMetric` reported roughly `FPS=23-30/90`.
+- `FrmCpu` was about `14-16ms`.
+- `FrmGpu` was about `25-38ms`.
+- GPU was frequently at or near maximum clock/load.
+
+Current interpretation:
+
+- The current stress scene is GPU-bound.
+- 8 shadow-casting point lights are too expensive for the current mobile XR baseline, especially with stereo rendering and `NoIndirectDrawing` enabled for XR camera stability.
+- Keep this scene as a stress/performance test, not as the default production budget target.
+
+Next immediate plan:
+
+1. Use this scene to measure optimization work.
+2. Add quality tiers for dynamic light count, shadow count, and shadow resolution.
+3. Explore cheaper lighting strategies for production scenes: fewer shadow casters, baked/static lighting where possible, clustered light limits, and selective shadows.
