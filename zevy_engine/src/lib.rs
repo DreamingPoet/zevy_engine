@@ -5,6 +5,12 @@ mod scene;
 mod xr;
 
 pub use app::{main, run};
+pub use scene::{
+    ImportedZevyEntity, ImportedZevyLevel, ImportedZevyLight, ZevyBevyLightParameters,
+    ZevyLevelAsset, ZevyLevelAssetLoader, ZevyLevelEntityDefinition, ZevyLevelPlugin,
+    ZevyLevelSceneAsset, ZevyLevelTransform, ZevyLightDefinition, ZevyLightKind,
+    ZevyUnrealLightParameters, spawn_zevy_level,
+};
 
 #[cfg(target_os = "android")]
 #[unsafe(no_mangle)]

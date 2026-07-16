@@ -2,18 +2,17 @@ use bevy::{
     pbr::{NotShadowCaster, NotShadowReceiver},
     prelude::*,
 };
-use bevy_mod_openxr::{helper_traits::ToQuat, resources::OxrViews};
-use bevy_mod_xr::session::XrTrackingRoot;
+use bevy_mod_xr::{camera::XrCamera, session::XrTrackingRoot};
 
 use crate::{
     app::LaunchMode,
     input::{EngineInputState, InputAxis2},
-    scene::{LevelEntity, MirrorCamera},
+    scene::{LevelEntity, MirrorCamera, desktop_player::DesktopLevelPlayer},
 };
 
 use super::{CurrentLevel, LevelId};
 
-const LEVEL_PLAYER_MOVE_SPEED: f32 = 2.5;
+const XR_LEVEL_PLAYER_MOVE_SPEED: f32 = 2.5;
 
 #[derive(Component, Clone, Copy)]
 pub(super) struct OrbitingLight {
@@ -24,13 +23,10 @@ pub(super) struct OrbitingLight {
     speed: f32,
 }
 
-#[derive(Component)]
-pub(super) struct LevelPlayerCamera;
-
-pub(super) fn level_fog(level: super::LevelId) -> Option<DistanceFog> {
+pub(super) fn level_fog(level: &super::LevelId) -> Option<DistanceFog> {
     match level {
         super::LevelId::FogPyramid => Some(fog_pyramid_fog()),
-        super::LevelId::PerformanceLab | super::LevelId::Empty => None,
+        super::LevelId::PerformanceLab | super::LevelId::Empty | super::LevelId::Asset(_) => None,
     }
 }
 
@@ -109,10 +105,7 @@ pub(super) fn spawn_fog_pyramid(
         Transform::from_xyz(0.0, 1.0, 0.0),
     ));
 
-    let Some(camera_entity) = spawn_level_camera(launch_mode, level_fog, commands) else {
-        return;
-    };
-    commands.entity(camera_entity).insert(LevelPlayerCamera);
+    let _ = spawn_level_camera(launch_mode, level_fog, commands);
 }
 
 pub(super) fn spawn_performance_lab(
@@ -306,13 +299,11 @@ pub(super) fn spawn_performance_lab(
         ));
     }
 
-    if let Some(camera_entity) = spawn_level_camera(launch_mode, None, commands) {
-        commands.entity(camera_entity).insert(LevelPlayerCamera);
-    }
+    let _ = spawn_level_camera(launch_mode, None, commands);
 }
 
-pub(super) fn spawn_empty(launch_mode: LaunchMode, commands: &mut Commands) {
-    let _ = spawn_level_camera(launch_mode, None, commands);
+pub(super) fn spawn_empty(launch_mode: LaunchMode, commands: &mut Commands) -> Option<Entity> {
+    spawn_level_camera(launch_mode, None, commands)
 }
 
 fn spawn_level_camera(
@@ -340,8 +331,13 @@ fn spawn_level_camera(
         camera.insert(fog);
     }
 
-    if launch_mode == LaunchMode::Xr {
-        camera.insert(MirrorCamera);
+    match launch_mode {
+        LaunchMode::Desktop => {
+            camera.insert(DesktopLevelPlayer::default());
+        }
+        LaunchMode::Xr => {
+            camera.insert(MirrorCamera);
+        }
     }
 
     Some(camera.id())
@@ -373,19 +369,16 @@ pub(super) fn animate_orbiting_lights(
     }
 }
 
-pub(super) fn move_level_player(
+pub(super) fn move_xr_level_player(
     current_level: Res<CurrentLevel>,
     input_state: Res<EngineInputState>,
     time: Res<Time>,
-    mut transforms: ParamSet<(
-        Query<&mut Transform, With<LevelPlayerCamera>>,
-        Query<&mut Transform, With<XrTrackingRoot>>,
-    )>,
-    views: Option<Res<OxrViews>>,
+    mut tracking_roots: Query<&mut Transform, With<XrTrackingRoot>>,
+    xr_cameras: Query<(&XrCamera, &Transform), Without<XrTrackingRoot>>,
 ) {
     if !matches!(
-        current_level.0,
-        Some(LevelId::FogPyramid | LevelId::PerformanceLab)
+        current_level.0.as_ref(),
+        Some(LevelId::FogPyramid | LevelId::PerformanceLab | LevelId::Asset(_))
     ) {
         return;
     }
@@ -395,36 +388,22 @@ pub(super) fn move_level_player(
         return;
     }
 
-    let delta_seconds = time.delta_secs();
-
-    for mut transform in &mut transforms.p0() {
-        let movement = camera_relative_flat_movement(transform.rotation, input_axis);
-        transform.translation += movement * LEVEL_PLAYER_MOVE_SPEED * delta_seconds;
-    }
-
-    let Some(views) = views else {
-        return;
-    };
-    let Some(view) = views.first() else {
+    let Some((_, camera_transform)) = xr_cameras.iter().min_by_key(|(xr_camera, _)| xr_camera.0)
+    else {
         return;
     };
 
-    let mut tracking_roots = transforms.p1();
     let Ok(mut tracking_root) = tracking_roots.single_mut() else {
         return;
     };
-    let view_rotation = tracking_root.rotation * view.pose.orientation.to_quat();
-    let movement = camera_relative_flat_movement(view_rotation, input_axis);
-    tracking_root.translation += movement * LEVEL_PLAYER_MOVE_SPEED * delta_seconds;
+    let camera_world_rotation = tracking_root.rotation * camera_transform.rotation;
+    let movement = camera_relative_movement(camera_world_rotation, input_axis);
+    tracking_root.translation += movement * XR_LEVEL_PLAYER_MOVE_SPEED * time.delta_secs();
 }
 
-fn camera_relative_flat_movement(rotation: Quat, input_axis: Vec2) -> Vec3 {
-    let forward = flatten_direction(rotation.mul_vec3(Vec3::NEG_Z));
-    let right = flatten_direction(rotation.mul_vec3(Vec3::X));
+fn camera_relative_movement(rotation: Quat, input_axis: Vec2) -> Vec3 {
+    let forward = rotation.mul_vec3(Vec3::NEG_Z);
+    let right = rotation.mul_vec3(Vec3::X);
 
     (right * input_axis.x + forward * input_axis.y).normalize_or_zero()
-}
-
-fn flatten_direction(direction: Vec3) -> Vec3 {
-    Vec3::new(direction.x, 0.0, direction.z).normalize_or_zero()
 }

@@ -1,2 +1,14 @@
 PICOXR/
 OpenXR_Native_SDK/
+
+# Unreal Engine generated files
+ue_project/.vs/
+ue_project/Binaries/
+ue_project/DerivedDataCache/
+ue_project/Intermediate/
+ue_project/Saved/
+ue_project/*.sln
+ue_project/Plugins/*/Binaries/
+ue_project/Plugins/*/Intermediate/
+ue_project/Content/
+zevy_engine/assets/

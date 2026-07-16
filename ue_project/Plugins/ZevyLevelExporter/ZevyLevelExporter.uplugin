@@ -1,0 +1,29 @@
+{
+    "FileVersion": 3,
+    "Version": 1,
+    "VersionName": "0.1.0",
+    "FriendlyName": "Zevy Level Exporter",
+    "Description": "Exports Unreal Engine Levels to a Zevy/Bevy GLB scene and versioned Level manifest.",
+    "Category": "Exporters",
+    "CreatedBy": "Zevy",
+    "CanContainContent": false,
+    "EnabledByDefault": true,
+    "Modules": [
+        {
+            "Name": "ZevyLevelExporter",
+            "Type": "Editor",
+            "LoadingPhase": "Default",
+            "PlatformAllowList": [
+                "Win64",
+                "Linux",
+                "Mac"
+            ]
+        }
+    ],
+    "Plugins": [
+        {
+            "Name": "GLTFExporter",
+            "Enabled": true
+        }
+    ]
+}

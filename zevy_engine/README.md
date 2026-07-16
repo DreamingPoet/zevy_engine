@@ -74,6 +74,81 @@ Request XR mode on a desktop OpenXR runtime:
 cargo run -- --xr
 ```
 
+## Import an Unreal Engine Level
+
+The UE 5.5 test project includes the `ZevyLevelExporter` Editor plugin. In
+Unreal Editor, use:
+
+    Tools > Zevy > Export Current Level to Zevy...
+
+The plugin writes an editable schema-v2 Zevy Level manifest plus independent
+glTF assets under `assets/levels/<LevelName>/` by default:
+
+```text
+<LevelName>.zevy-level.json
+assets/<AssetName>_<Hash>/<AssetName>_<Hash>.gltf
+assets/<AssetName>_<Hash>/<AssetName>_<Hash>.bin
+assets/<AssetName>_<Hash>/*.png
+```
+
+The manifest owns Actor IDs, parent relationships, visibility, and editable
+local translation/rotation/scale. Reused model/material combinations share an
+asset while keeping independent Actor transforms. The loader still supports
+the older schema-v1 single-GLB format.
+
+Supported directional, point, and spot lights also keep reusable parameters in
+each entity's `lights` array. Zevy applies the exported Bevy color, intensity,
+range, source radius, shadow flag, and spot cone angles after glTF scene
+instantiation. The public `ImportedZevyLight` component retains both those Bevy
+values and the original Unreal units, temperature, attenuation mode/falloff
+exponent, attenuation radius, source dimensions, mobility, and shadow biases.
+Custom Unreal falloff exponents are retained as metadata and currently render
+with Bevy's standard inverse-square cut-off approximation.
+
+Load an exported Level on desktop:
+
+```powershell
+cargo run -- --level=levels/<LevelName>/<LevelName>.zevy-level.json
+```
+
+Desktop Level roaming uses an Unreal DefaultPawn/editor-style free-flight
+controller. It is attached only in `--desktop` mode; XR keeps using the
+OpenXR camera and tracking root.
+
+- `W/A/S/D` or arrow keys: move relative to the view.
+- Hold right mouse button: capture the cursor and look around.
+- `Q` / `E`: move down / up.
+- Hold either `Shift`: sprint.
+- Mouse wheel: decrease / increase the base movement speed.
+- `Esc`: release the captured cursor until the right mouse button is released.
+
+The current controller intentionally uses no-clip movement because imported
+collision data is not part of the Level schema yet.
+
+Run the headless end-to-end validator against the included fixture:
+
+```powershell
+cargo run --offline --bin validate_zevy_level -- levels/ZevyExporterFixture/ZevyExporterFixture.zevy-level.json
+```
+
+Validate the exported `Map_S03B` Level:
+
+```powershell
+cargo run --offline --bin validate_zevy_level -- levels/Map_S03B/Map_S03B.zevy-level.json
+```
+
+Render an automatically framed 1600x900 preview and exit:
+
+```powershell
+cargo run --offline -- --desktop `
+    --level=levels/Map_S03B/Map_S03B.zevy-level.json `
+    --screenshot=assets/levels/Map_S03B/Map_S03B_preview.png
+```
+
+The validator loads all recursive glTF dependencies, spawns every composed
+`SceneRoot`, and checks Actor IDs, hierarchy, editable local transforms,
+meshes, materials, supported lights, and the reusable light parameter overrides.
+
 ## Android / PICO 4 Ultra Environment
 
 The PowerShell scripts currently assume this local Android environment:

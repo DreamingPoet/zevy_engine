@@ -1,12 +1,26 @@
-use std::env;
+use std::{env, path::PathBuf, time::Instant};
 
-use bevy::{prelude::*, render::render_resource::TextureFormat, utils::default};
+use bevy::{
+    prelude::*,
+    render::{
+        render_resource::TextureFormat,
+        view::screenshot::{Screenshot, ScreenshotCaptured, save_to_disk},
+    },
+    utils::default,
+    window::WindowPlugin,
+};
 use bevy_mod_openxr::resources::OxrSessionConfig;
 use bevy_xr_utils::{
     tracking_utils::suggest_action_bindings, xr_utils_actions::XRUtilsActionSystemSet,
 };
 
-use crate::{input, input::EngineInputPlugin, platform, scene::ScenePlugin, xr};
+use crate::{
+    input,
+    input::EngineInputPlugin,
+    platform,
+    scene::{ImportedLevelCameraFramed, ScenePlugin},
+    xr,
+};
 
 pub fn main() {
     run();
@@ -14,6 +28,7 @@ pub fn main() {
 
 pub fn run() {
     let launch_mode = LaunchMode::from_args();
+    let screenshot_path = screenshot_path_from_args();
     eprintln!("Starting zevy_engine in {} mode", launch_mode.label());
     platform::log_android_context("run");
 
@@ -21,7 +36,18 @@ pub fn run() {
 
     match launch_mode {
         LaunchMode::Desktop => {
-            app.add_plugins(DefaultPlugins);
+            if screenshot_path.is_some() {
+                app.add_plugins(DefaultPlugins.set(WindowPlugin {
+                    primary_window: Some(Window {
+                        title: "Zevy Level Preview".to_owned(),
+                        resolution: (1600.0, 900.0).into(),
+                        ..default()
+                    }),
+                    ..default()
+                }));
+            } else {
+                app.add_plugins(DefaultPlugins);
+            }
         }
         LaunchMode::Xr => {
             app.add_plugins(xr::plugins())
@@ -82,8 +108,106 @@ pub fn run() {
         .insert_resource(ClearColor(Color::srgb(0.02, 0.02, 0.03)))
         .add_systems(Startup, log_launch_mode)
         .add_plugins(EngineInputPlugin)
-        .add_plugins(ScenePlugin)
-        .run();
+        .add_plugins(ScenePlugin);
+
+    if let Some(path) = screenshot_path {
+        if let Some(parent) = path.parent()
+            && let Err(error) = std::fs::create_dir_all(parent)
+        {
+            eprintln!(
+                "Failed to create screenshot directory '{}': {error}",
+                parent.display()
+            );
+        }
+
+        app.insert_resource(LevelScreenshotRequest {
+            path,
+            requested: false,
+            captured: false,
+            frames_after_framing: 0,
+            started_at: Instant::now(),
+        })
+        .add_systems(
+            Update,
+            (capture_level_screenshot, finish_level_screenshot).chain(),
+        );
+    }
+
+    app.run();
+}
+
+#[derive(Resource)]
+struct LevelScreenshotRequest {
+    path: PathBuf,
+    requested: bool,
+    captured: bool,
+    frames_after_framing: u16,
+    started_at: Instant,
+}
+
+fn screenshot_path_from_args() -> Option<PathBuf> {
+    let mut args = env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if let Some(path) = arg.strip_prefix("--screenshot=") {
+            if !path.trim().is_empty() {
+                return Some(PathBuf::from(path));
+            }
+        } else if arg == "--screenshot"
+            && let Some(path) = args.next().filter(|path| !path.trim().is_empty())
+        {
+            return Some(PathBuf::from(path));
+        }
+    }
+    None
+}
+
+fn capture_level_screenshot(
+    mut commands: Commands,
+    framed_cameras: Query<(), With<ImportedLevelCameraFramed>>,
+    mut request: ResMut<LevelScreenshotRequest>,
+) {
+    if request.requested || request.captured || framed_cameras.is_empty() {
+        return;
+    }
+
+    request.frames_after_framing += 1;
+    if request.frames_after_framing < 30 {
+        return;
+    }
+
+    let output_path = request.path.clone();
+    commands
+        .spawn(Screenshot::primary_window())
+        .observe(save_to_disk(output_path.clone()))
+        .observe(mark_level_screenshot_captured);
+    request.requested = true;
+    info!(
+        "Capturing Zevy Level screenshot to {}",
+        output_path.display()
+    );
+}
+
+fn mark_level_screenshot_captured(
+    _trigger: Trigger<ScreenshotCaptured>,
+    mut request: ResMut<LevelScreenshotRequest>,
+) {
+    request.captured = true;
+}
+
+fn finish_level_screenshot(request: Res<LevelScreenshotRequest>, mut exit: EventWriter<AppExit>) {
+    if request.captured {
+        info!(
+            "Zevy Level screenshot completed: {}",
+            request.path.display()
+        );
+        exit.write(AppExit::Success);
+    } else if request.started_at.elapsed().as_secs() >= 300 {
+        error!(
+            "Timed out while rendering Zevy Level screenshot: {}",
+            request.path.display()
+        );
+        exit.write(AppExit::error());
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
