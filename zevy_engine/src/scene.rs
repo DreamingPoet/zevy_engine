@@ -36,6 +36,7 @@ impl Plugin for ScenePlugin {
                     open_level,
                     apply_active_level_fog_to_cameras,
                     frame_asset_level_camera,
+                    apply_map_s03b_lighting_profile.after(frame_asset_level_camera),
                     desktop_player::update_desktop_level_player
                         .after(EngineInputSet::Collect)
                         .after(frame_asset_level_camera),
@@ -86,6 +87,9 @@ pub struct MirrorCamera;
 
 const MAP_S03B_ASSET_PATH: &str = "levels/Map_S03B/Map_S03B.zevy-level.json";
 const MAP_S03B_PLAYER_START_UE_CM: Vec3 = Vec3::new(12_370.0, -250.0, -2_000.0);
+const MAP_S03B_POINT_LIGHT_INTENSITY_SCALE: f32 = 1_000.0;
+const MAP_S03B_POINT_LIGHT_RANGE_SCALE: f32 = 4.0;
+const MAP_S03B_AMBIENT_BRIGHTNESS: f32 = 20.0;
 
 #[derive(Component)]
 struct AssetLevelCamera {
@@ -115,6 +119,17 @@ struct AssetLevelFallbackLight;
 #[derive(Component, Clone, Copy)]
 struct MapS03BXrStartApplied {
     previous_translation: Vec3,
+}
+
+#[derive(Component, Clone, Copy)]
+struct MapS03BPointLightTuningApplied {
+    previous_intensity: f32,
+    previous_range: f32,
+}
+
+#[derive(Component, Clone)]
+struct MapS03BCameraLightingApplied {
+    previous_ambient: Option<AmbientLight>,
 }
 
 fn load_default_level(
@@ -351,6 +366,81 @@ fn apply_map_s03b_xr_start(
         } else if !use_map_start && let Some(applied) = applied {
             transform.translation = applied.previous_translation;
             commands.entity(entity).remove::<MapS03BXrStartApplied>();
+        }
+    }
+}
+
+fn apply_map_s03b_lighting_profile(
+    current_level: Res<CurrentLevel>,
+    mut commands: Commands,
+    mut point_lights: Query<
+        (
+            Entity,
+            &mut PointLight,
+            Option<&MapS03BPointLightTuningApplied>,
+        ),
+        With<ImportedZevyLight>,
+    >,
+    mut cameras: Query<
+        (
+            Entity,
+            Option<&mut AmbientLight>,
+            Option<&MapS03BCameraLightingApplied>,
+        ),
+        With<Camera3d>,
+    >,
+) {
+    let use_profile = current_level
+        .0
+        .as_ref()
+        .is_some_and(|level| matches!(level, LevelId::Asset(path) if is_map_s03b_asset(path)));
+
+    for (entity, mut light, applied) in &mut point_lights {
+        if use_profile && applied.is_none() {
+            let tuning = MapS03BPointLightTuningApplied {
+                previous_intensity: light.intensity,
+                previous_range: light.range,
+            };
+            light.intensity *= MAP_S03B_POINT_LIGHT_INTENSITY_SCALE;
+            light.range *= MAP_S03B_POINT_LIGHT_RANGE_SCALE;
+            commands.entity(entity).insert(tuning);
+            info!(
+                "Applied Map_S03B PointLight tuning: intensity {:.3} -> {:.3} lm, range {:.3} -> {:.3} m",
+                tuning.previous_intensity, light.intensity, tuning.previous_range, light.range,
+            );
+        } else if !use_profile && let Some(applied) = applied {
+            light.intensity = applied.previous_intensity;
+            light.range = applied.previous_range;
+            commands
+                .entity(entity)
+                .remove::<MapS03BPointLightTuningApplied>();
+        }
+    }
+
+    for (entity, ambient, applied) in &mut cameras {
+        if use_profile && applied.is_none() {
+            let previous_ambient = ambient.as_deref().cloned();
+            if let Some(mut ambient) = ambient {
+                ambient.brightness = MAP_S03B_AMBIENT_BRIGHTNESS;
+            } else {
+                commands.entity(entity).insert(AmbientLight {
+                    color: Color::WHITE,
+                    brightness: MAP_S03B_AMBIENT_BRIGHTNESS,
+                    affects_lightmapped_meshes: true,
+                });
+            }
+            commands
+                .entity(entity)
+                .insert(MapS03BCameraLightingApplied { previous_ambient });
+        } else if !use_profile && let Some(applied) = applied {
+            if let Some(previous_ambient) = applied.previous_ambient.clone() {
+                commands.entity(entity).insert(previous_ambient);
+            } else {
+                commands.entity(entity).remove::<AmbientLight>();
+            }
+            commands
+                .entity(entity)
+                .remove::<MapS03BCameraLightingApplied>();
         }
     }
 }
