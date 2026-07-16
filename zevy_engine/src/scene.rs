@@ -5,6 +5,7 @@ mod zevy_level;
 use std::env;
 
 use bevy::{prelude::*, render::primitives::Aabb};
+use bevy_mod_xr::session::XrTrackingRoot;
 
 use crate::{
     app::{LaunchMode, StartupMode},
@@ -38,7 +39,10 @@ impl Plugin for ScenePlugin {
                     desktop_player::update_desktop_level_player
                         .after(EngineInputSet::Collect)
                         .after(frame_asset_level_camera),
-                    levels::move_xr_level_player.after(EngineInputSet::Collect),
+                    apply_map_s03b_xr_start.after(open_level),
+                    levels::move_xr_level_player
+                        .after(EngineInputSet::Collect)
+                        .after(apply_map_s03b_xr_start),
                     levels::animate_orbiting_lights,
                 ),
             );
@@ -80,11 +84,26 @@ pub(super) struct LevelEntity;
 #[derive(Component)]
 pub struct MirrorCamera;
 
-#[derive(Component, Default)]
+const MAP_S03B_ASSET_PATH: &str = "levels/Map_S03B/Map_S03B.zevy-level.json";
+const MAP_S03B_PLAYER_START_UE_CM: Vec3 = Vec3::new(12_370.0, -250.0, -2_000.0);
+
+#[derive(Component)]
 struct AssetLevelCamera {
     last_mesh_count: usize,
     stable_frames: u8,
     framed: bool,
+    auto_frame: bool,
+}
+
+impl Default for AssetLevelCamera {
+    fn default() -> Self {
+        Self {
+            last_mesh_count: 0,
+            stable_frames: 0,
+            framed: false,
+            auto_frame: true,
+        }
+    }
 }
 
 #[derive(Component)]
@@ -92,6 +111,11 @@ pub(crate) struct ImportedLevelCameraFramed;
 
 #[derive(Component)]
 struct AssetLevelFallbackLight;
+
+#[derive(Component, Clone, Copy)]
+struct MapS03BXrStartApplied {
+    previous_translation: Vec3,
+}
 
 fn load_default_level(
     default_level: Res<DefaultLevel>,
@@ -172,14 +196,23 @@ fn spawn_level(
             let level_camera = levels::spawn_empty(launch_mode, commands);
             if launch_mode == LaunchMode::Desktop {
                 if let Some(camera) = level_camera {
+                    let configured_start = map_s03b_player_start(asset_path);
                     commands.entity(camera).insert((
-                        AssetLevelCamera::default(),
+                        AssetLevelCamera {
+                            auto_frame: configured_start.is_none(),
+                            ..default()
+                        },
                         AmbientLight {
                             color: Color::WHITE,
                             brightness: 500.0,
                             affects_lightmapped_meshes: true,
                         },
                     ));
+                    if let Some(start) = configured_start {
+                        commands.entity(camera).insert(
+                            Transform::from_translation(start).looking_to(Vec3::X, Vec3::Y),
+                        );
+                    }
                 }
                 commands.spawn((
                     Name::new("AssetLevelFallbackSun"),
@@ -245,19 +278,24 @@ fn frame_asset_level_camera(
         let center = (minimum + maximum) * 0.5;
         let half_extents = (maximum - minimum) * 0.5;
         let radius = half_extents.length().max(1.0);
-        let direction = Vec3::new(-1.0, 0.7, 1.0).normalize();
+        let mut framing_distance = None;
 
-        let fov = match projection.as_ref() {
-            Projection::Perspective(perspective) => perspective.fov,
-            _ => std::f32::consts::FRAC_PI_4,
-        };
-        let distance = radius / (fov * 0.5).tan();
-        *camera_transform =
-            Transform::from_translation(center + direction * distance).looking_at(center, Vec3::Y);
+        if framing.auto_frame {
+            let direction = Vec3::new(-1.0, 0.7, 1.0).normalize();
+            let fov = match projection.as_ref() {
+                Projection::Perspective(perspective) => perspective.fov,
+                _ => std::f32::consts::FRAC_PI_4,
+            };
+            let distance = radius / (fov * 0.5).tan();
+            *camera_transform = Transform::from_translation(center + direction * distance)
+                .looking_at(center, Vec3::Y);
+            framing_distance = Some(distance);
+        }
 
         if let Projection::Perspective(perspective) = projection.as_mut() {
             perspective.near = (radius * 0.001).clamp(0.05, 1.0);
-            perspective.far = (distance + radius * 4.0).max(1000.0);
+            let distance_to_center = camera_transform.translation.distance(center);
+            perspective.far = (distance_to_center + radius * 4.0).max(1000.0);
         }
 
         let has_imported_lights = !imported_lights.is_empty();
@@ -274,14 +312,65 @@ fn frame_asset_level_camera(
             .entity(camera_entity)
             .insert(ImportedLevelCameraFramed);
         info!(
-            "Framed imported Level camera: meshes={} center={:?} size={:?} distance={:.2} imported_lights={}",
+            "Prepared imported Level camera: meshes={} auto_framed={} position={:?} center={:?} size={:?} framing_distance={:?} imported_lights={}",
             mesh_count,
+            framing.auto_frame,
+            camera_transform.translation,
             center,
             maximum - minimum,
-            distance,
+            framing_distance,
             has_imported_lights,
         );
     }
+}
+
+fn apply_map_s03b_xr_start(
+    current_level: Res<CurrentLevel>,
+    mut commands: Commands,
+    mut tracking_roots: Query<
+        (Entity, &mut Transform, Option<&MapS03BXrStartApplied>),
+        With<XrTrackingRoot>,
+    >,
+) {
+    let use_map_start = current_level
+        .0
+        .as_ref()
+        .is_some_and(|level| matches!(level, LevelId::Asset(path) if is_map_s03b_asset(path)));
+
+    for (entity, mut transform, applied) in &mut tracking_roots {
+        if use_map_start && applied.is_none() {
+            let previous_translation = transform.translation;
+            transform.translation = map_s03b_player_start_bevy();
+            commands.entity(entity).insert(MapS03BXrStartApplied {
+                previous_translation,
+            });
+            info!(
+                "Applied Map_S03B XR tracking origin: UE cm {:?} -> Bevy m {:?}",
+                MAP_S03B_PLAYER_START_UE_CM, transform.translation,
+            );
+        } else if !use_map_start && let Some(applied) = applied {
+            transform.translation = applied.previous_translation;
+            commands.entity(entity).remove::<MapS03BXrStartApplied>();
+        }
+    }
+}
+
+fn map_s03b_player_start(asset_path: &str) -> Option<Vec3> {
+    is_map_s03b_asset(asset_path).then(map_s03b_player_start_bevy)
+}
+
+fn is_map_s03b_asset(asset_path: &str) -> bool {
+    asset_path
+        .replace('\\', "/")
+        .eq_ignore_ascii_case(MAP_S03B_ASSET_PATH)
+}
+
+fn map_s03b_player_start_bevy() -> Vec3 {
+    ue_position_cm_to_bevy_m(MAP_S03B_PLAYER_START_UE_CM)
+}
+
+fn ue_position_cm_to_bevy_m(position: Vec3) -> Vec3 {
+    Vec3::new(position.x, position.z, position.y) * 0.01
 }
 
 fn world_mesh_bounds(
@@ -344,5 +433,61 @@ fn apply_active_level_fog_to_cameras(
                 commands.entity(entity).remove::<DistanceFog>();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn converts_map_s03b_ue_player_start_to_bevy_coordinates() {
+        assert!(
+            map_s03b_player_start_bevy().abs_diff_eq(Vec3::new(123.7, -20.0, -2.5), f32::EPSILON,)
+        );
+    }
+
+    #[test]
+    fn map_s03b_start_is_scoped_to_only_that_asset_level() {
+        assert_eq!(
+            map_s03b_player_start("levels\\Map_S03B\\Map_S03B.zevy-level.json"),
+            Some(Vec3::new(123.7, -20.0, -2.5)),
+        );
+        assert_eq!(
+            map_s03b_player_start("levels/Other/Other.zevy-level.json"),
+            None,
+        );
+    }
+
+    #[test]
+    fn applies_map_s03b_start_to_xr_tracking_root() {
+        let mut app = App::new();
+        app.insert_resource(CurrentLevel(Some(LevelId::asset(MAP_S03B_ASSET_PATH))))
+            .add_systems(Update, apply_map_s03b_xr_start);
+        let previous_translation = Vec3::new(4.0, 5.0, 6.0);
+        let root = app
+            .world_mut()
+            .spawn((
+                XrTrackingRoot,
+                Transform::from_translation(previous_translation),
+            ))
+            .id();
+
+        app.update();
+
+        let transform = app.world().entity(root).get::<Transform>().unwrap();
+        assert!(
+            transform
+                .translation
+                .abs_diff_eq(Vec3::new(123.7, -20.0, -2.5), f32::EPSILON,)
+        );
+        assert!(app.world().entity(root).contains::<MapS03BXrStartApplied>());
+
+        app.world_mut().resource_mut::<CurrentLevel>().0 = Some(LevelId::Empty);
+        app.update();
+
+        let transform = app.world().entity(root).get::<Transform>().unwrap();
+        assert_eq!(transform.translation, previous_translation);
+        assert!(!app.world().entity(root).contains::<MapS03BXrStartApplied>());
     }
 }
