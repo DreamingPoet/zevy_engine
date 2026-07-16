@@ -37,6 +37,7 @@ impl Plugin for ScenePlugin {
                     apply_active_level_fog_to_cameras,
                     frame_asset_level_camera,
                     apply_map_s03b_lighting_profile.after(frame_asset_level_camera),
+                    animate_map_s03b_candle_lights.after(apply_map_s03b_lighting_profile),
                     desktop_player::update_desktop_level_player
                         .after(EngineInputSet::Collect)
                         .after(frame_asset_level_camera),
@@ -125,6 +126,9 @@ struct MapS03BXrStartApplied {
 struct MapS03BPointLightTuningApplied {
     previous_intensity: f32,
     previous_range: f32,
+    base_intensity: f32,
+    base_range: f32,
+    flicker_phase: f32,
 }
 
 #[derive(Component, Clone)]
@@ -397,12 +401,17 @@ fn apply_map_s03b_lighting_profile(
 
     for (entity, mut light, applied) in &mut point_lights {
         if use_profile && applied.is_none() {
-            let tuning = MapS03BPointLightTuningApplied {
-                previous_intensity: light.intensity,
-                previous_range: light.range,
-            };
+            let previous_intensity = light.intensity;
+            let previous_range = light.range;
             light.intensity *= MAP_S03B_POINT_LIGHT_INTENSITY_SCALE;
             light.range *= MAP_S03B_POINT_LIGHT_RANGE_SCALE;
+            let tuning = MapS03BPointLightTuningApplied {
+                previous_intensity,
+                previous_range,
+                base_intensity: light.intensity,
+                base_range: light.range,
+                flicker_phase: entity.index() as f32 * 1.618_034,
+            };
             commands.entity(entity).insert(tuning);
             info!(
                 "Applied Map_S03B PointLight tuning: intensity {:.3} -> {:.3} lm, range {:.3} -> {:.3} m",
@@ -443,6 +452,37 @@ fn apply_map_s03b_lighting_profile(
                 .remove::<MapS03BCameraLightingApplied>();
         }
     }
+}
+
+fn animate_map_s03b_candle_lights(
+    current_level: Res<CurrentLevel>,
+    time: Res<Time>,
+    mut point_lights: Query<(&mut PointLight, &MapS03BPointLightTuningApplied)>,
+) {
+    let use_profile = current_level
+        .0
+        .as_ref()
+        .is_some_and(|level| matches!(level, LevelId::Asset(path) if is_map_s03b_asset(path)));
+    if !use_profile {
+        return;
+    }
+
+    let seconds = time.elapsed_secs();
+    for (mut light, tuning) in &mut point_lights {
+        let intensity_multiplier = candle_flicker_multiplier(seconds, tuning.flicker_phase);
+        let range_multiplier = 1.0 + (intensity_multiplier - 1.0) * 0.28;
+        light.intensity = tuning.base_intensity * intensity_multiplier;
+        light.range = tuning.base_range * range_multiplier;
+    }
+}
+
+fn candle_flicker_multiplier(seconds: f32, phase: f32) -> f32 {
+    let slow = (seconds * 1.9 + phase).sin() * 0.16;
+    let medium = (seconds * 5.7 + phase * 1.37).sin() * 0.11;
+    let fast = (seconds * 13.1 + phase * 2.11).sin() * 0.055;
+    let occasional_dip = (seconds * 3.3 + phase * 0.71).sin().max(0.0).powi(10) * 0.26;
+    let brief_flare = (seconds * 9.7 + phase * 1.91).sin().max(0.0).powi(14) * 0.14;
+    (1.0 + slow + medium + fast - occasional_dip + brief_flare).clamp(0.55, 1.40)
 }
 
 fn map_s03b_player_start(asset_path: &str) -> Option<Vec3> {
@@ -579,5 +619,22 @@ mod tests {
         let transform = app.world().entity(root).get::<Transform>().unwrap();
         assert_eq!(transform.translation, previous_translation);
         assert!(!app.world().entity(root).contains::<MapS03BXrStartApplied>());
+    }
+
+    #[test]
+    fn candle_flicker_is_visible_but_bounded() {
+        let samples = (0..600)
+            .map(|sample| candle_flicker_multiplier(sample as f32 / 60.0, 0.75))
+            .collect::<Vec<_>>();
+        let minimum = samples.iter().copied().fold(f32::INFINITY, f32::min);
+        let maximum = samples.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+
+        assert!(minimum >= 0.55);
+        assert!(maximum <= 1.40);
+        assert!(maximum - minimum > 0.50);
+        assert_ne!(
+            candle_flicker_multiplier(1.25, 0.25),
+            candle_flicker_multiplier(1.25, 2.25),
+        );
     }
 }
