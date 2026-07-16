@@ -810,8 +810,6 @@ dependencies = [
 [[package]]
 name = "bevy_mod_xr"
 version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "58439f80da6ab6a7bb04d2d089987d3feeb8fff6cf965f969f75e269bcc6faa3"
 dependencies = [
  "bevy",
 ]

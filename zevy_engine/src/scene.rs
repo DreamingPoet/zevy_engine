@@ -4,7 +4,11 @@ mod zevy_level;
 
 use std::env;
 
-use bevy::{prelude::*, render::primitives::Aabb};
+use bevy::{
+    pbr::{ClusterConfig, NotShadowCaster, NotShadowReceiver},
+    prelude::*,
+    render::primitives::Aabb,
+};
 use bevy_mod_xr::session::XrTrackingRoot;
 
 use crate::{
@@ -37,7 +41,8 @@ impl Plugin for ScenePlugin {
                     apply_active_level_fog_to_cameras,
                     frame_asset_level_camera,
                     apply_map_s03b_lighting_profile.after(frame_asset_level_camera),
-                    animate_map_s03b_candle_lights.after(apply_map_s03b_lighting_profile),
+                    sync_map_s03b_candle_visuals.after(apply_map_s03b_lighting_profile),
+                    animate_map_s03b_candle_lights.after(sync_map_s03b_candle_visuals),
                     desktop_player::update_desktop_level_player
                         .after(EngineInputSet::Collect)
                         .after(frame_asset_level_camera),
@@ -91,6 +96,9 @@ const MAP_S03B_PLAYER_START_UE_CM: Vec3 = Vec3::new(12_370.0, -250.0, -2_000.0);
 const MAP_S03B_POINT_LIGHT_INTENSITY_SCALE: f32 = 1_000.0;
 const MAP_S03B_POINT_LIGHT_RANGE_SCALE: f32 = 4.0;
 const MAP_S03B_AMBIENT_BRIGHTNESS: f32 = 20.0;
+const MAP_S03B_CANDLE_EMISSIVE_STRENGTH: f32 = 80.0;
+const MAP_S03B_CANDLE_HORIZONTAL_SWAY_M: f32 = 0.055;
+const MAP_S03B_CANDLE_VERTICAL_SWAY_M: f32 = 0.09;
 
 #[derive(Component)]
 struct AssetLevelCamera {
@@ -126,14 +134,29 @@ struct MapS03BXrStartApplied {
 struct MapS03BPointLightTuningApplied {
     previous_intensity: f32,
     previous_range: f32,
+    previous_translation: Vec3,
     base_intensity: f32,
     base_range: f32,
+    flicker_phase: f32,
+}
+
+#[derive(Component, Clone, Copy)]
+struct MapS03BCandleVisualSpawned {
+    child: Entity,
+}
+
+#[derive(Component, Clone)]
+struct MapS03BCandleGlow {
+    material: Handle<StandardMaterial>,
+    base_emissive: LinearRgba,
+    base_scale: Vec3,
     flicker_phase: f32,
 }
 
 #[derive(Component, Clone)]
 struct MapS03BCameraLightingApplied {
     previous_ambient: Option<AmbientLight>,
+    previous_cluster_config: Option<ClusterConfig>,
 }
 
 fn load_default_level(
@@ -381,6 +404,7 @@ fn apply_map_s03b_lighting_profile(
         (
             Entity,
             &mut PointLight,
+            &mut Transform,
             Option<&MapS03BPointLightTuningApplied>,
         ),
         With<ImportedZevyLight>,
@@ -389,6 +413,7 @@ fn apply_map_s03b_lighting_profile(
         (
             Entity,
             Option<&mut AmbientLight>,
+            Option<&mut ClusterConfig>,
             Option<&MapS03BCameraLightingApplied>,
         ),
         With<Camera3d>,
@@ -399,15 +424,17 @@ fn apply_map_s03b_lighting_profile(
         .as_ref()
         .is_some_and(|level| matches!(level, LevelId::Asset(path) if is_map_s03b_asset(path)));
 
-    for (entity, mut light, applied) in &mut point_lights {
+    for (entity, mut light, mut transform, applied) in &mut point_lights {
         if use_profile && applied.is_none() {
             let previous_intensity = light.intensity;
             let previous_range = light.range;
+            let previous_translation = transform.translation;
             light.intensity *= MAP_S03B_POINT_LIGHT_INTENSITY_SCALE;
             light.range *= MAP_S03B_POINT_LIGHT_RANGE_SCALE;
             let tuning = MapS03BPointLightTuningApplied {
                 previous_intensity,
                 previous_range,
+                previous_translation,
                 base_intensity: light.intensity,
                 base_range: light.range,
                 flicker_phase: entity.index() as f32 * 1.618_034,
@@ -420,15 +447,17 @@ fn apply_map_s03b_lighting_profile(
         } else if !use_profile && let Some(applied) = applied {
             light.intensity = applied.previous_intensity;
             light.range = applied.previous_range;
+            transform.translation = applied.previous_translation;
             commands
                 .entity(entity)
                 .remove::<MapS03BPointLightTuningApplied>();
         }
     }
 
-    for (entity, ambient, applied) in &mut cameras {
+    for (entity, ambient, cluster_config, applied) in &mut cameras {
         if use_profile && applied.is_none() {
             let previous_ambient = ambient.as_deref().cloned();
+            let previous_cluster_config = cluster_config.as_deref().copied();
             if let Some(mut ambient) = ambient {
                 ambient.brightness = MAP_S03B_AMBIENT_BRIGHTNESS;
             } else {
@@ -438,14 +467,27 @@ fn apply_map_s03b_lighting_profile(
                     affects_lightmapped_meshes: true,
                 });
             }
+            if let Some(mut cluster_config) = cluster_config {
+                *cluster_config = ClusterConfig::Single;
+            } else {
+                commands.entity(entity).insert(ClusterConfig::Single);
+            }
             commands
                 .entity(entity)
-                .insert(MapS03BCameraLightingApplied { previous_ambient });
+                .insert(MapS03BCameraLightingApplied {
+                    previous_ambient,
+                    previous_cluster_config,
+                });
         } else if !use_profile && let Some(applied) = applied {
             if let Some(previous_ambient) = applied.previous_ambient.clone() {
                 commands.entity(entity).insert(previous_ambient);
             } else {
                 commands.entity(entity).remove::<AmbientLight>();
+            }
+            if let Some(previous_cluster_config) = applied.previous_cluster_config {
+                commands.entity(entity).insert(previous_cluster_config);
+            } else {
+                commands.entity(entity).remove::<ClusterConfig>();
             }
             commands
                 .entity(entity)
@@ -454,10 +496,84 @@ fn apply_map_s03b_lighting_profile(
     }
 }
 
+fn sync_map_s03b_candle_visuals(
+    current_level: Res<CurrentLevel>,
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut candle_mesh: Local<Option<Handle<Mesh>>>,
+    point_lights: Query<
+        (
+            Entity,
+            &PointLight,
+            &MapS03BPointLightTuningApplied,
+            Option<&MapS03BCandleVisualSpawned>,
+        ),
+        With<ImportedZevyLight>,
+    >,
+) {
+    let use_profile = current_level
+        .0
+        .as_ref()
+        .is_some_and(|level| matches!(level, LevelId::Asset(path) if is_map_s03b_asset(path)));
+
+    for (entity, light, tuning, visual) in &point_lights {
+        if use_profile && visual.is_none() {
+            let mesh = candle_mesh
+                .get_or_insert_with(|| meshes.add(Sphere::new(0.10).mesh().ico(2).unwrap()))
+                .clone();
+            let base_emissive = LinearRgba::from(light.color) * MAP_S03B_CANDLE_EMISSIVE_STRENGTH;
+            let material = materials.add(StandardMaterial {
+                base_color: light.color,
+                emissive: base_emissive,
+                emissive_exposure_weight: 0.0,
+                perceptual_roughness: 1.0,
+                unlit: true,
+                ..default()
+            });
+            let base_scale = Vec3::new(0.8, 1.35, 0.8);
+            let child = commands
+                .spawn((
+                    Name::new("MapS03BCandleGlow"),
+                    Mesh3d(mesh),
+                    MeshMaterial3d(material.clone()),
+                    MapS03BCandleGlow {
+                        material,
+                        base_emissive,
+                        base_scale,
+                        flicker_phase: tuning.flicker_phase,
+                    },
+                    NotShadowCaster,
+                    NotShadowReceiver,
+                    Transform::from_scale(base_scale),
+                    ChildOf(entity),
+                ))
+                .id();
+            commands
+                .entity(entity)
+                .insert(MapS03BCandleVisualSpawned { child });
+        } else if !use_profile && let Some(visual) = visual {
+            commands.entity(visual.child).despawn();
+            commands
+                .entity(entity)
+                .remove::<MapS03BCandleVisualSpawned>();
+        }
+    }
+}
+
 fn animate_map_s03b_candle_lights(
     current_level: Res<CurrentLevel>,
     time: Res<Time>,
-    mut point_lights: Query<(&mut PointLight, &MapS03BPointLightTuningApplied)>,
+    mut point_lights: Query<
+        (
+            &mut PointLight,
+            &mut Transform,
+            &MapS03BPointLightTuningApplied,
+        ),
+        Without<MapS03BCandleGlow>,
+    >,
+    mut candle_glows: Query<(&mut Transform, &MapS03BCandleGlow), Without<PointLight>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
     let use_profile = current_level
         .0
@@ -468,11 +584,23 @@ fn animate_map_s03b_candle_lights(
     }
 
     let seconds = time.elapsed_secs();
-    for (mut light, tuning) in &mut point_lights {
+    for (mut light, mut transform, tuning) in &mut point_lights {
         let intensity_multiplier = candle_flicker_multiplier(seconds, tuning.flicker_phase);
         let range_multiplier = 1.0 + (intensity_multiplier - 1.0) * 0.28;
         light.intensity = tuning.base_intensity * intensity_multiplier;
         light.range = tuning.base_range * range_multiplier;
+        transform.translation =
+            tuning.previous_translation + candle_light_offset(seconds, tuning.flicker_phase);
+    }
+
+    for (mut transform, glow) in &mut candle_glows {
+        let intensity_multiplier = candle_flicker_multiplier(seconds, glow.flicker_phase);
+        let normalized = ((intensity_multiplier - 0.55) / (1.40 - 0.55)).clamp(0.0, 1.0);
+        let visual_scale = 0.86 + normalized * 0.28;
+        transform.scale = glow.base_scale * visual_scale;
+        if let Some(material) = materials.get_mut(&glow.material) {
+            material.emissive = glow.base_emissive * intensity_multiplier;
+        }
     }
 }
 
@@ -483,6 +611,19 @@ fn candle_flicker_multiplier(seconds: f32, phase: f32) -> f32 {
     let occasional_dip = (seconds * 3.3 + phase * 0.71).sin().max(0.0).powi(10) * 0.26;
     let brief_flare = (seconds * 9.7 + phase * 1.91).sin().max(0.0).powi(14) * 0.14;
     (1.0 + slow + medium + fast - occasional_dip + brief_flare).clamp(0.55, 1.40)
+}
+
+fn candle_light_offset(seconds: f32, phase: f32) -> Vec3 {
+    let x = ((seconds * 2.1 + phase).sin() * 0.68 + (seconds * 8.3 + phase * 1.73).sin() * 0.32)
+        * MAP_S03B_CANDLE_HORIZONTAL_SWAY_M;
+    let z = ((seconds * 2.7 + phase * 1.21).sin() * 0.64
+        + (seconds * 9.1 + phase * 2.07).sin() * 0.36)
+        * MAP_S03B_CANDLE_HORIZONTAL_SWAY_M;
+    let y = ((seconds * 3.4 + phase * 0.83).sin() * 0.72
+        + (seconds * 11.7 + phase * 1.49).sin() * 0.28)
+        * MAP_S03B_CANDLE_VERTICAL_SWAY_M;
+
+    Vec3::new(x, y, z)
 }
 
 fn map_s03b_player_start(asset_path: &str) -> Option<Vec3> {
@@ -636,5 +777,80 @@ mod tests {
             candle_flicker_multiplier(1.25, 0.25),
             candle_flicker_multiplier(1.25, 2.25),
         );
+    }
+
+    #[test]
+    fn candle_light_sway_is_visible_bounded_and_smooth() {
+        let samples = (0..600)
+            .map(|sample| candle_light_offset(sample as f32 / 60.0, 0.75))
+            .collect::<Vec<_>>();
+        let maximum_abs = samples
+            .iter()
+            .copied()
+            .map(Vec3::abs)
+            .fold(Vec3::ZERO, Vec3::max);
+        let maximum_step = samples
+            .windows(2)
+            .map(|pair| pair[0].distance(pair[1]))
+            .fold(0.0, f32::max);
+        let maximum_distance = samples
+            .iter()
+            .copied()
+            .map(Vec3::length)
+            .fold(0.0, f32::max);
+
+        assert!(maximum_abs.x <= MAP_S03B_CANDLE_HORIZONTAL_SWAY_M + 0.000_01);
+        assert!(maximum_abs.z <= MAP_S03B_CANDLE_HORIZONTAL_SWAY_M + 0.000_01);
+        assert!(maximum_abs.y <= MAP_S03B_CANDLE_VERTICAL_SWAY_M + 0.000_01);
+        assert!(maximum_distance > 0.07);
+        assert!(maximum_step < 0.02);
+        assert_ne!(
+            candle_light_offset(1.25, 0.25),
+            candle_light_offset(1.25, 2.25),
+        );
+    }
+
+    #[test]
+    fn candle_animation_system_accepts_disjoint_transform_queries() {
+        let mut app = App::new();
+        app.insert_resource(CurrentLevel(Some(LevelId::asset(MAP_S03B_ASSET_PATH))))
+            .init_resource::<Time>()
+            .init_resource::<Assets<StandardMaterial>>()
+            .add_systems(Update, animate_map_s03b_candle_lights);
+
+        let glow_material = app
+            .world_mut()
+            .resource_mut::<Assets<StandardMaterial>>()
+            .add(StandardMaterial::default());
+        let base_translation = Vec3::new(1.0, 2.0, 3.0);
+        let point_light = app
+            .world_mut()
+            .spawn((
+                PointLight::default(),
+                Transform::from_translation(base_translation),
+                MapS03BPointLightTuningApplied {
+                    previous_intensity: 1.0,
+                    previous_range: 1.0,
+                    previous_translation: base_translation,
+                    base_intensity: 100.0,
+                    base_range: 6.0,
+                    flicker_phase: 0.75,
+                },
+            ))
+            .id();
+        app.world_mut().spawn((
+            Transform::default(),
+            MapS03BCandleGlow {
+                material: glow_material,
+                base_emissive: LinearRgba::WHITE,
+                base_scale: Vec3::ONE,
+                flicker_phase: 0.75,
+            },
+        ));
+
+        app.update();
+
+        let transform = app.world().entity(point_light).get::<Transform>().unwrap();
+        assert_ne!(transform.translation, base_translation);
     }
 }

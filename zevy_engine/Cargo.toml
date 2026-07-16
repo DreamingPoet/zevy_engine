@@ -46,6 +46,7 @@ openxr = "0.19"
 
 [patch.crates-io]
 bevy_mod_openxr = { path = "third_party/crates/bevy_mod_openxr-0.3.0" }
+bevy_mod_xr = { path = "third_party/crates/bevy_mod_xr-0.3.0" }
 
 [profile.release]
 opt-level = 3
