@@ -92,7 +92,7 @@ pub(super) struct LevelEntity;
 pub struct MirrorCamera;
 
 const MAP_S03B_ASSET_PATH: &str = "levels/Map_S03B/Map_S03B.zevy-level.json";
-const MAP_S03B_PLAYER_START_UE_CM: Vec3 = Vec3::new(12_370.0, -250.0, -2_000.0);
+const MAP_S03B_PLAYER_START_UE_CM: Vec3 = Vec3::new(12_370.0, -250.0, -1_800.0);
 const MAP_S03B_POINT_LIGHT_INTENSITY_SCALE: f32 = 1_000.0;
 const MAP_S03B_POINT_LIGHT_RANGE_SCALE: f32 = 4.0;
 const MAP_S03B_AMBIENT_BRIGHTNESS: f32 = 20.0;
@@ -252,7 +252,7 @@ fn spawn_level(
                     ));
                     if let Some(start) = configured_start {
                         commands.entity(camera).insert(
-                            Transform::from_translation(start).looking_to(Vec3::X, Vec3::Y),
+                            Transform::from_translation(start).looking_to(Vec3::new(-90_f32, 0_f32, 0_f32), Vec3::Y),
                         );
                     }
                 }
