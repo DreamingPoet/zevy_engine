@@ -1,4 +1,5 @@
 mod app;
+mod config;
 mod input;
 mod platform;
 #[cfg(feature = "render_debug")]
@@ -7,6 +8,7 @@ mod scene;
 mod xr;
 
 pub use app::{main, run};
+pub use config::RenderQualityConfig;
 pub use scene::{
     ImportedZevyEntity, ImportedZevyLevel, ImportedZevyLight, ZevyBevyLightParameters,
     ZevyLevelAsset, ZevyLevelAssetLoader, ZevyLevelEntityDefinition, ZevyLevelPlugin,

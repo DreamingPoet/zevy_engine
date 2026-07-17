@@ -345,6 +345,10 @@ pub struct OxrSessionConfig {
     pub formats: Option<Vec<wgpu::TextureFormat>>,
     /// List of resolutions that the openxr swapchain can use. If [None] pick the first available resolution.
     pub resolutions: Option<Vec<UVec2>>,
+    /// Scale applied to the runtime's recommended per-view resolution when
+    /// `resolutions` is [None]. Values are clamped to 0.25..=2.0 and to the
+    /// runtime's maximum supported resolution.
+    pub resolution_scale: Option<f32>,
 }
 impl Default for OxrSessionConfig {
     fn default() -> Self {
@@ -352,6 +356,7 @@ impl Default for OxrSessionConfig {
             blend_modes: Some(vec![openxr::EnvironmentBlendMode::OPAQUE]),
             formats: Some(vec![wgpu::TextureFormat::Rgba8UnormSrgb]),
             resolutions: default(),
+            resolution_scale: default(),
         }
     }
 }

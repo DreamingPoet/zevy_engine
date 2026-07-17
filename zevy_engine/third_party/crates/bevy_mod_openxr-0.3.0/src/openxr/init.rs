@@ -338,6 +338,7 @@ fn init_xr_session(
         blend_modes,
         formats,
         resolutions,
+        resolution_scale,
     }: OxrSessionConfig,
     graphics_info: SessionGraphicsCreateInfo,
 ) -> OxrResult<(
@@ -388,17 +389,34 @@ fn init_xr_session(
 
         preferred
     } else {
+        let scale = resolution_scale
+            .filter(|scale| scale.is_finite())
+            .unwrap_or(1.0)
+            .clamp(0.25, 2.0);
         view_configuration_views.first().map(|config| {
             (
                 UVec2::new(
-                    config.recommended_image_rect_width,
-                    config.recommended_image_rect_height,
+                    scaled_swapchain_dimension(
+                        config.recommended_image_rect_width,
+                        config.max_image_rect_width,
+                        scale,
+                    ),
+                    scaled_swapchain_dimension(
+                        config.recommended_image_rect_height,
+                        config.max_image_rect_height,
+                        scale,
+                    ),
                 ),
                 *config,
             )
         })
     }
     .ok_or(OxrError::NoAvailableViewConfiguration)?;
+
+    info!(
+        "OpenXR swapchain resolution selected: {}x{} (configured scale {:?})",
+        resolution.x, resolution.y, resolution_scale
+    );
 
     let available_formats = session.enumerate_swapchain_formats()?;
     info!("OpenXR swapchain formats reported by runtime: {available_formats:?}");
@@ -474,6 +492,10 @@ fn init_xr_session(
         images,
         graphics_info,
     ))
+}
+
+fn scaled_swapchain_dimension(recommended: u32, maximum: u32, scale: f32) -> u32 {
+    ((recommended as f32 * scale).round() as u32).clamp(1, maximum.max(1))
 }
 
 pub fn create_xr_session(world: &mut World) {

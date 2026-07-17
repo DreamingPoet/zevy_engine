@@ -21,6 +21,7 @@ use bevy_xr_utils::{
 #[cfg(feature = "render_debug")]
 use crate::render_debug::RenderDebugPlugin;
 use crate::{
+    config::{RenderQualityConfig, apply_render_quality_to_cameras, log_render_quality_config},
     input,
     input::EngineInputPlugin,
     platform,
@@ -36,6 +37,7 @@ pub fn run() {
     let launch_mode = LaunchMode::from_args();
     let screenshot_path = screenshot_path_from_args();
     let screenshot_delay = screenshot_delay_from_args();
+    let render_quality = RenderQualityConfig::default();
     eprintln!("Starting zevy_engine in {} mode", launch_mode.label());
     platform::log_android_context("run");
 
@@ -112,14 +114,17 @@ pub fn run() {
                         TextureFormat::Rgba8Unorm,
                         TextureFormat::Bgra8Unorm,
                     ]),
+                    resolution_scale: Some(render_quality.resolved_xr_render_scale()),
                     ..default()
                 });
         }
     }
 
     app.insert_resource(StartupMode(launch_mode))
+        .insert_resource(render_quality)
         .insert_resource(ClearColor(Color::srgb(0.02, 0.02, 0.03)))
-        .add_systems(Startup, log_launch_mode)
+        .add_systems(Startup, (log_launch_mode, log_render_quality_config))
+        .add_systems(PostUpdate, apply_render_quality_to_cameras)
         .add_plugins(EngineInputPlugin)
         .add_plugins(ScenePlugin);
 

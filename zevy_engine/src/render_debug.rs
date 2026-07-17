@@ -18,15 +18,17 @@ use bevy::{
         diagnostic::RenderDiagnosticsPlugin,
         render_resource::{PrimitiveTopology, WgpuFeatures},
         settings::{RenderCreation, WgpuSettings},
-        view::ViewVisibility,
+        view::{Msaa, ViewVisibility},
     },
     ui::UiTargetCamera,
 };
+use bevy_mod_openxr::resources::OxrCurrentSessionConfig;
 use bevy_mod_xr::camera::XrCamera;
 use bevy_xr_utils::xr_utils_actions::XRUtilsActionState;
 
 use crate::{
     app::{LaunchMode, StartupMode},
+    config::RenderQualityConfig,
     input::{XrDebugHudPageAction, XrDebugHudToggleAction},
     scene::MirrorCamera,
 };
@@ -182,6 +184,15 @@ struct GpuDiagnosticSupport {
     pipeline_statistics: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct RenderTargetStats {
+    resolution_per_view: Option<UVec2>,
+    view_count: u32,
+    total_target_pixels: u64,
+    actual_msaa_samples: u32,
+    xr_active: bool,
+}
+
 #[derive(Component)]
 struct RenderDebugHudRoot {
     target_camera: Entity,
@@ -326,6 +337,9 @@ fn update_debug_snapshot(
     state: Res<RenderDebugState>,
     diagnostics: Res<DiagnosticsStore>,
     support: Res<GpuDiagnosticSupport>,
+    quality: Res<RenderQualityConfig>,
+    xr_session_config: Option<Res<OxrCurrentSessionConfig>>,
+    camera_views: Query<(&Camera, &Msaa, Option<&XrCamera>), With<Camera3d>>,
     meshes: Res<Assets<Mesh>>,
     materials: Res<Assets<StandardMaterial>>,
     images: Res<Assets<Image>>,
@@ -384,6 +398,11 @@ fn update_debug_snapshot(
     let gpu_primitives = collect_render_metric_total(&diagnostics, "clipper_primitives_out", fps);
     let fragment_invocations =
         collect_render_metric_total(&diagnostics, "fragment_shader_invocations", fps);
+    let target_stats = collect_render_target_stats(
+        &camera_views,
+        xr_session_config.as_deref(),
+        quality.resolved_msaa().samples(),
+    );
 
     let top_pass = pass_rows.first();
     let using_gpu_timestamps = pass_metric == "elapsed_gpu";
@@ -395,7 +414,7 @@ fn update_debug_snapshot(
         using_gpu_timestamps,
     );
 
-    let mut overview = String::with_capacity(1_500);
+    let mut overview = String::with_capacity(1_800);
     let _ = writeln!(
         overview,
         "ZEVY RENDER DEBUG  |  {}",
@@ -421,6 +440,39 @@ fn update_debug_snapshot(
         let _ = write!(overview, "    Process RAM {:>7.2} GiB", memory);
     }
     let _ = writeln!(overview);
+    let _ = writeln!(
+        overview,
+        "XR scale config       {:>8.2}",
+        quality.resolved_xr_render_scale()
+    );
+    if let Some(resolution) = target_stats.resolution_per_view {
+        let resolution_label = if target_stats.xr_active {
+            "Per-eye resolution"
+        } else {
+            "View resolution"
+        };
+        let _ = writeln!(
+            overview,
+            "{resolution_label:<20}{:>5} x {:<5}",
+            resolution.x, resolution.y
+        );
+        let _ = writeln!(
+            overview,
+            "Views / actual MSAA {:>7} / {}x",
+            target_stats.view_count, target_stats.actual_msaa_samples
+        );
+        let _ = writeln!(
+            overview,
+            "Target pixels/frame {:>10}",
+            format_count(target_stats.total_target_pixels)
+        );
+    } else {
+        let _ = writeln!(
+            overview,
+            "Actual MSAA          {:>9}x",
+            target_stats.actual_msaa_samples
+        );
+    }
     let _ = writeln!(
         overview,
         "Visible meshes      {:>10}",
@@ -460,6 +512,13 @@ fn update_debug_snapshot(
             "Fragment invocations{:>10}",
             format_count(fragments as u64)
         );
+        if target_stats.total_target_pixels > 0 {
+            let _ = writeln!(
+                overview,
+                "Fragment / target px{:>9.2}",
+                fragments / target_stats.total_target_pixels as f64
+            );
+        }
     }
     let _ = writeln!(
         overview,
@@ -653,6 +712,58 @@ fn update_debug_snapshot(
     snapshot.overview = overview;
     snapshot.passes = passes;
     snapshot.materials = material_page;
+}
+
+fn collect_render_target_stats(
+    cameras: &Query<(&Camera, &Msaa, Option<&XrCamera>), With<Camera3d>>,
+    xr_session_config: Option<&OxrCurrentSessionConfig>,
+    configured_msaa_samples: u32,
+) -> RenderTargetStats {
+    let mut xr_view_count = 0_u32;
+    let mut xr_msaa_samples = None;
+
+    for (camera, msaa, xr_camera) in cameras.iter() {
+        if camera.is_active && xr_camera.is_some() {
+            xr_view_count += 1;
+            xr_msaa_samples.get_or_insert(msaa.samples());
+        }
+    }
+
+    if xr_view_count > 0 {
+        let resolution = xr_session_config.map(|config| config.resolution);
+        return RenderTargetStats {
+            resolution_per_view: resolution,
+            view_count: xr_view_count,
+            total_target_pixels: total_target_pixels(resolution, xr_view_count),
+            actual_msaa_samples: xr_msaa_samples.unwrap_or(configured_msaa_samples),
+            xr_active: true,
+        };
+    }
+
+    let desktop_view = cameras
+        .iter()
+        .find(|(camera, _, _)| camera.is_active)
+        .map(|(camera, msaa, _)| (camera.physical_target_size(), msaa.samples()));
+
+    let (resolution, actual_msaa_samples, view_count) = desktop_view
+        .map(|(resolution, msaa)| (resolution, msaa, 1))
+        .unwrap_or((None, configured_msaa_samples, 0));
+
+    RenderTargetStats {
+        resolution_per_view: resolution,
+        view_count,
+        total_target_pixels: total_target_pixels(resolution, view_count),
+        actual_msaa_samples,
+        xr_active: false,
+    }
+}
+
+fn total_target_pixels(resolution: Option<UVec2>, view_count: u32) -> u64 {
+    resolution
+        .map(|resolution| {
+            u64::from(resolution.x) * u64::from(resolution.y) * u64::from(view_count)
+        })
+        .unwrap_or_default()
 }
 
 fn diagnostic_value(
