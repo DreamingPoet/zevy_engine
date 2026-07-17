@@ -1,4 +1,5 @@
 #include "ZevyLevelExporterModule.h"
+#include "ZevyTextureMipExporter.h"
 
 #include "Components/DirectionalLightComponent.h"
 #include "Components/InstancedStaticMeshComponent.h"
@@ -876,6 +877,8 @@ bool WriteSplitManifest(
     const TArray<AActor*>& RelevantActors,
     const TMap<const AActor*, FString>& ActorIds,
     const TMap<const AActor*, FString>& ActorAssetIds,
+    const FTextureMipExportOptions& TextureMipOptions,
+    int32 MipTextureCount,
     const FGLTFExportMessages& Messages)
 {
     TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
@@ -912,6 +915,12 @@ bool WriteSplitManifest(
     Export->SetBoolField(TEXT("lights_exported"), true);
     Export->SetBoolField(TEXT("actor_hierarchy_editable"), true);
     Export->SetBoolField(TEXT("local_transforms_editable"), true);
+    Export->SetStringField(
+        TEXT("texture_mipmaps"),
+        TextureMipOptions.bGenerateMipmaps ? TEXT("zevy-mips-v1") : TEXT("disabled"));
+    Export->SetBoolField(TEXT("texture_mipmaps_generated"), TextureMipOptions.bGenerateMipmaps);
+    Export->SetBoolField(TEXT("texture_mip_debug_numbers"), TextureMipOptions.bDebugMipNumbers);
+    Export->SetNumberField(TEXT("mip_texture_count"), MipTextureCount);
     Root->SetObjectField(TEXT("export"), Export);
 
     TArray<TSharedPtr<FJsonValue>> AssetValues;
@@ -1053,6 +1062,19 @@ bool ExportWorldSplit(
     const FString& RequestedManifestPath,
     FString& OutManifestPath)
 {
+    return ExportWorldSplit(
+        World,
+        RequestedManifestPath,
+        OutManifestPath,
+        FTextureMipExportOptions());
+}
+
+bool ExportWorldSplit(
+    UWorld* World,
+    const FString& RequestedManifestPath,
+    FString& OutManifestPath,
+    const FTextureMipExportOptions& TextureMipOptions)
+{
     if (!IsValid(World))
     {
         UE_LOG(LogZevyLevelExporter, Error, TEXT("No valid editor World is available to export"));
@@ -1190,6 +1212,12 @@ bool ExportWorldSplit(
         }
     }
 
+    int32 MipTextureCount = 0;
+    if (!GenerateTextureMipSidecars(ExportDirectory, TextureMipOptions, MipTextureCount))
+    {
+        return false;
+    }
+
     const FContentSummary Summary = CollectContentSummary(World);
     if (!WriteSplitManifest(
             World,
@@ -1200,6 +1228,8 @@ bool ExportWorldSplit(
             RelevantActors,
             ActorIds,
             ActorAssetIds,
+            TextureMipOptions,
+            MipTextureCount,
             CombinedMessages))
     {
         return false;

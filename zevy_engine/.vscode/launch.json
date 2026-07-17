@@ -1,0 +1,29 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug Zevy Engine - Map_S03B",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--bin=zevy_engine",
+                    "--package=zevy_engine"
+                ],
+                "filter": {
+                    "name": "zevy_engine",
+                    "kind": "bin"
+                }
+            },
+            "args": [
+                "--level=levels/Map_S03B/Map_S03B.zevy-level.json"
+            ],
+            "cwd": "${workspaceFolder}",
+            "terminal": "integrated",
+            "sourceLanguages": [
+                "rust"
+            ]
+        }
+    ]
+}

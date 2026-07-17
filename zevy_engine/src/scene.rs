@@ -1,5 +1,6 @@
 mod desktop_player;
 mod levels;
+mod mip_texture;
 mod zevy_level;
 
 use std::env;
@@ -27,7 +28,7 @@ pub struct ScenePlugin;
 
 impl Plugin for ScenePlugin {
     fn build(&self, app: &mut App) {
-        app.add_plugins(ZevyLevelPlugin)
+        app.add_plugins((ZevyLevelPlugin, mip_texture::ZevyMipTexturePlugin))
             .insert_resource(DefaultLevel(startup_level_from_args()))
             .insert_resource(CurrentLevel(None))
             .insert_resource(ActiveLevelFog(None))

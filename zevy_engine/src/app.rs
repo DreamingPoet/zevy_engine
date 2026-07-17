@@ -1,4 +1,8 @@
-use std::{env, path::PathBuf, time::Instant};
+use std::{
+    env,
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
 use bevy::{
     prelude::*,
@@ -29,6 +33,7 @@ pub fn main() {
 pub fn run() {
     let launch_mode = LaunchMode::from_args();
     let screenshot_path = screenshot_path_from_args();
+    let screenshot_delay = screenshot_delay_from_args();
     eprintln!("Starting zevy_engine in {} mode", launch_mode.label());
     platform::log_android_context("run");
 
@@ -126,6 +131,7 @@ pub fn run() {
             captured: false,
             frames_after_framing: 0,
             started_at: Instant::now(),
+            capture_after: screenshot_delay,
         })
         .add_systems(
             Update,
@@ -143,6 +149,7 @@ struct LevelScreenshotRequest {
     captured: bool,
     frames_after_framing: u16,
     started_at: Instant,
+    capture_after: Duration,
 }
 
 fn screenshot_path_from_args() -> Option<PathBuf> {
@@ -161,6 +168,23 @@ fn screenshot_path_from_args() -> Option<PathBuf> {
     None
 }
 
+fn screenshot_delay_from_args() -> Duration {
+    let mut args = env::args().skip(1);
+    while let Some(arg) = args.next() {
+        let value = if let Some(value) = arg.strip_prefix("--screenshot-delay=") {
+            Some(value.to_owned())
+        } else if arg == "--screenshot-delay" {
+            args.next()
+        } else {
+            None
+        };
+        if let Some(seconds) = value.and_then(|value| value.parse::<u64>().ok()) {
+            return Duration::from_secs(seconds.min(240));
+        }
+    }
+    Duration::ZERO
+}
+
 fn capture_level_screenshot(
     mut commands: Commands,
     framed_cameras: Query<(), With<ImportedLevelCameraFramed>>,
@@ -171,7 +195,7 @@ fn capture_level_screenshot(
     }
 
     request.frames_after_framing += 1;
-    if request.frames_after_framing < 30 {
+    if request.frames_after_framing < 30 || request.started_at.elapsed() < request.capture_after {
         return;
     }
 

@@ -156,9 +156,17 @@ int32 UZevyLevelExportCommandlet::Main(const FString& Params)
 
     FString ManifestPath;
     const bool bMonolithicGlb = OutputPath.EndsWith(TEXT(".glb"), ESearchCase::IgnoreCase);
+    ZevyLevelExporter::FTextureMipExportOptions TextureMipOptions;
+    TextureMipOptions.bDebugMipNumbers = FParse::Param(*Params, TEXT("DebugMipNumbers"));
+    TextureMipOptions.bGenerateMipmaps =
+        TextureMipOptions.bDebugMipNumbers || !FParse::Param(*Params, TEXT("NoTextureMipmaps"));
     const bool bExported = bMonolithicGlb
         ? ZevyLevelExporter::ExportWorld(World, OutputPath, ManifestPath)
-        : ZevyLevelExporter::ExportWorldSplit(World, OutputPath, ManifestPath);
+        : ZevyLevelExporter::ExportWorldSplit(
+              World,
+              OutputPath,
+              ManifestPath,
+              TextureMipOptions);
     if (!bExported)
     {
         return 1;

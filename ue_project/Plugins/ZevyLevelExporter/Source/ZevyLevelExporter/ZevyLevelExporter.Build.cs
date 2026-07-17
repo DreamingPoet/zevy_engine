@@ -17,6 +17,7 @@ public class ZevyLevelExporter : ModuleRules
                 "SlateCore",
                 "ToolMenus",
                 "DesktopPlatform",
+                "ImageCore",
                 "Json",
                 "GLTFExporter"
             }

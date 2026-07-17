@@ -12,3 +12,5 @@ ue_project/Plugins/*/Binaries/
 ue_project/Plugins/*/Intermediate/
 ue_project/Content/
 zevy_engine/assets/
+ue_project/Build/
+ue_project/Android_ASTC/
