@@ -533,6 +533,96 @@ Zevy 可以采用更保守的混合版本：
 
 这能把创新风险隔离在 overflow 路径，不破坏普通场景的确定性。
 
+### 9.5 UE5 MegaLights：借鉴目标，而不是移植实现
+
+Epic 当前 MegaLights 是一条统一的随机直接光照路径：它对重要灯光做 importance sampling，每个像素只使用固定数量的样本/可见性射线，并用 denoiser 从带噪结果重建最终照明。传统 Deferred 的灯数增加会增加 GPU 成本；MegaLights 则更接近固定成本，但同一像素上竞争的重要灯越多，噪声、模糊和 ghosting 风险越高。[Epic MegaLights 技术文档](https://dev.epicgames.com/documentation/en-us/unreal-engine/megalights-in-unreal-engine)
+
+它从另一个方向验证了本章的核心判断：真正可扩展的多灯光系统应限制“每个 shading point 实际评估多少灯”，而不是只限制场景灯光总数。
+
+#### 9.5.1 不能直接移植的原因
+
+Epic 明确说明当前 MegaLights：
+
+- 面向本世代主机和支持 Ray Tracing 的 PC；
+- 不支持 mobile；
+- 与 UE Forward Renderer 不兼容；
+- 默认用共享 Ray Tracing Scene/BVH 评估阴影，也可选择逐灯生成 Virtual Shadow Map；
+- 依赖随机采样、screen-space trace、ray guiding 和 denoising 的完整链路。
+
+Zevy 的公共路径是移动 VR、Forward+、双眼、tile-based GPU，且不能假定存在可持续的硬件光追。因此不能照搬“Deferred + 每像素 ray + 重型 denoiser”，但可以吸收其预算模型、importance guiding、统一调试和 GPU-driven 灯光管理。
+
+#### 9.5.2 有价值的对应关系
+
+| MegaLights 思路 | Zevy 移动 VR 适配 |
+|---|---|
+| 固定 samples/rays per pixel | 固定 Hero 灯数 + 每 tile/froxel 固定长尾样本数。 |
+| Ray-guided importance sampling | 亮度、投影面积、BRDF 上界、粗可见性和剧情权重共同决定采样概率。 |
+| 统一直接光照 pass | Forward+ 主 pass 统一读取 cluster 候选、shadow visibility 和 PBR 数据。 |
+| 一个 BVH 服务所有灯光阴影 | 持久化 shadow atlas + static cache + dynamic overlay；高端设备再增加可选 ray query。 |
+| 简化 Nanite RT scene / Far Field HLOD | Shadow LOD、室内 PVS、简化 occluder 与 HLOD shadow caster。 |
+| 每灯可退出 MegaLights | Hero/Directional/交互灯使用确定性路径，只有长尾进入随机路径。 |
+| 下采样倍率和 samples-per-pixel 控制质量 | tile 大小、Hero 数、长尾 K、shadow term 分辨率和短历史长度组成质量档。 |
+| Light Complexity / ray visualization | 显示候选灯、权重、可见性、采样概率、cluster overflow 和左右眼一致性。 |
+
+#### 9.5.3 有效灯光数量
+
+MegaLights 的质量取决于同一像素上“有多少盏权重接近的重要灯”，而不是场景总灯数。可把归一化重要度记为：
+
+\[
+p_i=\frac{w_i}{\sum_jw_j}
+\]
+
+定义有效灯光数量：
+
+\[
+N_{effective}=\frac{1}{\sum_i p_i^2}
+\]
+
+- 一盏灯占绝对主导时，\(N_{effective}\approx1\)；
+- 十盏权重相等的灯同时竞争时，\(N_{effective}=10\)；
+- 场景可以有上千盏灯，只要每个 cluster 的 \(N_{effective}\) 很低，采样仍可能稳定；
+- 如果 \(K\ll N_{effective}\)，则需要增加样本、扩大 Hero set、合并小灯或接受噪声。
+
+建议将 `effective lights/cluster`、sample variance 和 Hero/Tail 比例加入 Zevy 调试面板。它们比单纯的 `Visible lights` 更能预测随机灯光质量。
+
+#### 9.5.4 灯光 Bounds 仍然重要
+
+固定采样预算并不代表灯光可以无限扩大。MegaLights 仍要求收紧 attenuation range、spot cone、rect-light barn door，并避免把灯放进永远不可见的几何内部；否则被遮挡或无意义的强灯会持续占用样本。
+
+这也再次说明：
+
+- `light.range` 应表达物理影响范围，不能用来解决 emitter 的远距离可见性；
+- 发光火焰/灯泡 mesh 的相机可见距离应独立管理；
+- 多个密集小灯在视觉允许时可合成 Area Light，减少 \(N_{effective}\)；
+- UE 导出格式长期可增加 `importance`、`criticality`、`source_shape`、`shadow_policy`、`update_rate` 和 `sampling_group` 等工程元数据。
+
+#### 9.5.5 阴影成本的关键差异
+
+MegaLights 使用一次构建的共享 BVH 为很多灯提供 visibility，因此 shadowed 与 unshadowed light 的边际成本可以接近。若选择 VSM，它仍需逐灯准备 shadow depth，Epic 也明确指出这会增加 CPU、内存和 GPU 成本。
+
+Zevy 若仍为所有 sampled PointLight 每帧生成六面 cubemap，那么即使最终每像素只抽样两盏灯，也不会得到 MegaLights 式的固定成本。Zevy 的随机长尾必须与以下策略绑定：
+
+1. Hero 灯使用高质量、按需更新的 shadow map。
+2. Tail 灯使用持久化低分辨率 cache、无阴影或便宜 visibility proxy。
+3. 只为本帧真正需要且缓存失效的灯消耗 shadow update budget。
+4. 未来只在高端移动 GPU 上实验少量 ray-query visibility，不能成为公共路径。
+
+#### 9.5.6 VR 特有修正
+
+Epic 文档没有把移动双眼作为 MegaLights 的目标平台。对 Zevy 必须额外要求：
+
+- 左右眼共享 candidate light、reservoir、sample ID 和随机序列；
+- Hero 灯完全确定性；
+- 每眼只独立计算 view-dependent BRDF、位置和 shadow coordinate；
+- 限制长时间 temporal accumulation，优先避免 binocular mismatch 和转头 ghosting；
+- 必要时增加 K 或扩大 Hero set，不以重型 denoiser 强行掩盖左右眼不稳定。
+
+因此，最适合 Zevy 的组合不是复制 MegaLights，而是：
+
+> **MegaLights 的固定样本预算与 ray guiding 思想 + Stochastic Tile-Based Lighting 的移动 tile 结构 + Zevy 的 Cyclopean 双眼共享 + 持久化缓存阴影。**
+
+当前 Map_S03B 约七盏灯时，完全确定性的 Clustered Forward 更简单、更稳定；MegaLights 风格的随机长尾只应在几十到几百盏灯、或 cluster overflow 的压力场景中启动。
+
 ---
 
 ## 10. 动态阴影系统：数量不是核心，更新预算才是核心
@@ -1144,6 +1234,7 @@ OpenXR 新规范中已有厂商 performance metrics 与 frame synthesis 扩展�
 - [Android Thermal API](https://developer.android.com/games/optimize/adpf/thermal)
 - [Arm Vulkan API Best Practices](https://developer.arm.com/mobile-graphics-and-gaming/vulkan-api-best-practices-on-arm-gpus)
 - [AMD FSR2](https://gpuopen.com/fidelityfx-superresolution-2/)
+- [Epic MegaLights 技术文档](https://dev.epicgames.com/documentation/en-us/unreal-engine/megalights-in-unreal-engine)
 
 ### 研究与前沿
 
