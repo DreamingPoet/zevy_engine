@@ -80,6 +80,14 @@ pub struct XrMoveAction;
 #[derive(Component)]
 pub struct XrTriggerAction;
 
+#[cfg(feature = "render_debug")]
+#[derive(Component)]
+pub struct XrDebugHudToggleAction;
+
+#[cfg(feature = "render_debug")]
+#[derive(Component)]
+pub struct XrDebugHudPageAction;
+
 pub struct EngineInputPlugin;
 
 #[derive(SystemSet, Debug, Clone, Copy, Eq, PartialEq, Hash)]
@@ -185,6 +193,55 @@ pub fn setup_xr_actions(mut commands: Commands) {
         commands.entity(trigger_action).add_child(binding_entity);
     }
     commands.entity(input_set).add_child(trigger_action);
+
+    #[cfg(feature = "render_debug")]
+    {
+        let debug_toggle_action = commands
+            .spawn((
+                XRUtilsAction {
+                    action_name: "debug_hud_toggle".into(),
+                    localized_name: "Toggle Render Debug HUD".into(),
+                    action_type: bevy_mod_xr::actions::ActionType::Bool,
+                },
+                XrDebugHudToggleAction,
+            ))
+            .id();
+
+        for binding in XR_CONTROLLER_PROFILES {
+            let binding_entity = commands
+                .spawn(XRUtilsBinding {
+                    profile: (*binding).into(),
+                    binding: "/user/hand/right/input/a/click".into(),
+                })
+                .id();
+            commands
+                .entity(debug_toggle_action)
+                .add_child(binding_entity);
+        }
+        commands.entity(input_set).add_child(debug_toggle_action);
+
+        let debug_page_action = commands
+            .spawn((
+                XRUtilsAction {
+                    action_name: "debug_hud_page".into(),
+                    localized_name: "Cycle Render Debug HUD Page".into(),
+                    action_type: bevy_mod_xr::actions::ActionType::Bool,
+                },
+                XrDebugHudPageAction,
+            ))
+            .id();
+
+        for binding in XR_CONTROLLER_PROFILES {
+            let binding_entity = commands
+                .spawn(XRUtilsBinding {
+                    profile: (*binding).into(),
+                    binding: "/user/hand/right/input/b/click".into(),
+                })
+                .id();
+            commands.entity(debug_page_action).add_child(binding_entity);
+        }
+        commands.entity(input_set).add_child(debug_page_action);
+    }
 }
 
 fn reset_frame_input_state(mut state: ResMut<EngineInputState>) {
@@ -306,7 +363,10 @@ fn collect_xr_controller_input(
             button: InputButton::PrimaryAction,
             pressed: button_state.current_state,
         });
-        info!("XR controller trigger click: {}", button_state.current_state);
+        info!(
+            "XR controller trigger click: {}",
+            button_state.current_state
+        );
     }
 }
 

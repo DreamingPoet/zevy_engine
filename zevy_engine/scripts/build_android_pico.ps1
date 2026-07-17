@@ -1,6 +1,7 @@
 param(
     [ValidateSet("release", "debug")]
-    [string]$Profile = "release"
+    [string]$Profile = "release",
+    [switch]$RenderDebug
 )
 
 $ErrorActionPreference = "Stop"
@@ -26,10 +27,20 @@ Remove-Item Env:ANDROID_SDK_ROOT -ErrorAction SilentlyContinue
 Push-Location $ProjectRoot
 try {
     if ($Profile -eq "release") {
-        cargo apk build --lib --release
+        if ($RenderDebug) {
+            cargo apk build --lib --release
+        }
+        else {
+            cargo apk build --lib --release --no-default-features
+        }
     }
     else {
-        cargo apk build --lib
+        if ($RenderDebug) {
+            cargo apk build --lib
+        }
+        else {
+            cargo apk build --lib --no-default-features
+        }
     }
 
     $Apk = Join-Path $ProjectRoot "target\$Profile\apk\zevy_engine.apk"

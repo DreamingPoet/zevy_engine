@@ -18,6 +18,8 @@ use bevy_xr_utils::{
     tracking_utils::suggest_action_bindings, xr_utils_actions::XRUtilsActionSystemSet,
 };
 
+#[cfg(feature = "render_debug")]
+use crate::render_debug::RenderDebugPlugin;
 use crate::{
     input,
     input::EngineInputPlugin,
@@ -42,15 +44,21 @@ pub fn run() {
     match launch_mode {
         LaunchMode::Desktop => {
             if screenshot_path.is_some() {
-                app.add_plugins(DefaultPlugins.set(WindowPlugin {
+                let plugins = DefaultPlugins.set(WindowPlugin {
                     primary_window: Some(Window {
                         title: "Zevy Level Preview".to_owned(),
                         resolution: (1600.0, 900.0).into(),
                         ..default()
                     }),
                     ..default()
-                }));
+                });
+                #[cfg(feature = "render_debug")]
+                let plugins = plugins.set(crate::render_debug::desktop_render_plugin());
+                app.add_plugins(plugins);
             } else {
+                #[cfg(feature = "render_debug")]
+                app.add_plugins(DefaultPlugins.set(crate::render_debug::desktop_render_plugin()));
+                #[cfg(not(feature = "render_debug"))]
                 app.add_plugins(DefaultPlugins);
             }
         }
@@ -114,6 +122,9 @@ pub fn run() {
         .add_systems(Startup, log_launch_mode)
         .add_plugins(EngineInputPlugin)
         .add_plugins(ScenePlugin);
+
+    #[cfg(feature = "render_debug")]
+    app.add_plugins(RenderDebugPlugin);
 
     if let Some(path) = screenshot_path {
         if let Some(parent) = path.parent()

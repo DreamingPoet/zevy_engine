@@ -191,6 +191,12 @@ This is equivalent to:
 .\scripts\build_android_pico.ps1 -Profile release
 ```
 
+The release helper excludes the render debug HUD by default. Build a release-optimized profiling APK with the HUD enabled using:
+
+```powershell
+.\scripts\build_android_pico.ps1 -Profile release -RenderDebug
+```
+
 The release APK is written to:
 
 ```text

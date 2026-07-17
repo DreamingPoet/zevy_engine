@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2024"
 default-run = "zevy_engine"
 
+[features]
+default = ["render_debug"]
+render_debug = ["bevy/bevy_ui", "bevy/sysinfo_plugin"]
+
 [lib]
 name = "zevy_engine"
 path = "src/lib.rs"

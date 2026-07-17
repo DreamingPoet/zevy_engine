@@ -1,6 +1,8 @@
 mod app;
 mod input;
 mod platform;
+#[cfg(feature = "render_debug")]
+mod render_debug;
 mod scene;
 mod xr;
 
