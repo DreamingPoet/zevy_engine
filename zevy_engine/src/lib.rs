@@ -4,7 +4,9 @@ mod input;
 mod platform;
 #[cfg(feature = "render_debug")]
 mod render_debug;
+mod scalable_lighting;
 mod scene;
+mod shadow_cache;
 mod xr;
 
 pub use app::{main, run};

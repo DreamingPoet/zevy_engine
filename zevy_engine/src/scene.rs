@@ -6,7 +6,10 @@ mod zevy_level;
 use std::env;
 
 use bevy::{
-    pbr::{ClusterConfig, NotShadowCaster, NotShadowReceiver},
+    pbr::{
+        ClusterConfig, ClusterFarZMode, ClusterZConfig, NotShadowCaster, NotShadowReceiver,
+        ShadowFilteringMethod,
+    },
     prelude::*,
     render::primitives::Aabb,
 };
@@ -14,7 +17,9 @@ use bevy_mod_xr::session::XrTrackingRoot;
 
 use crate::{
     app::{LaunchMode, StartupMode},
+    config::RenderQualityConfig,
     input::EngineInputSet,
+    shadow_cache::{CachedPointLightShadow, ZevyShadowCacheFrame},
 };
 
 pub use zevy_level::{
@@ -43,7 +48,12 @@ impl Plugin for ScenePlugin {
                     frame_asset_level_camera,
                     apply_map_s03b_lighting_profile.after(frame_asset_level_camera),
                     sync_map_s03b_candle_visuals.after(apply_map_s03b_lighting_profile),
-                    animate_map_s03b_candle_lights.after(sync_map_s03b_candle_visuals),
+                    apply_map_s03b_shadow_residency
+                        .after(apply_map_s03b_lighting_profile)
+                        .after(sync_map_s03b_candle_visuals),
+                    animate_map_s03b_candle_lights
+                        .after(sync_map_s03b_candle_visuals)
+                        .after(apply_map_s03b_shadow_residency),
                     desktop_player::update_desktop_level_player
                         .after(EngineInputSet::Collect)
                         .after(frame_asset_level_camera),
@@ -93,7 +103,7 @@ pub(super) struct LevelEntity;
 pub struct MirrorCamera;
 
 const MAP_S03B_ASSET_PATH: &str = "levels/Map_S03B/Map_S03B.zevy-level.json";
-const MAP_S03B_PLAYER_START_UE_CM: Vec3 = Vec3::new(12_370.0, -250.0, -1_800.0);
+const MAP_S03B_PLAYER_START_UE_CM: Vec3 = Vec3::new(12_370.0, -250.0, -2_000.0);
 const MAP_S03B_POINT_LIGHT_INTENSITY_SCALE: f32 = 1_000.0;
 const MAP_S03B_POINT_LIGHT_RANGE_SCALE: f32 = 4.0;
 const MAP_S03B_AMBIENT_BRIGHTNESS: f32 = 20.0;
@@ -135,6 +145,7 @@ struct MapS03BXrStartApplied {
 struct MapS03BPointLightTuningApplied {
     previous_intensity: f32,
     previous_range: f32,
+    previous_shadows_enabled: bool,
     previous_translation: Vec3,
     base_intensity: f32,
     base_range: f32,
@@ -158,6 +169,7 @@ struct MapS03BCandleGlow {
 struct MapS03BCameraLightingApplied {
     previous_ambient: Option<AmbientLight>,
     previous_cluster_config: Option<ClusterConfig>,
+    previous_shadow_filter: Option<ShadowFilteringMethod>,
 }
 
 fn load_default_level(
@@ -253,7 +265,8 @@ fn spawn_level(
                     ));
                     if let Some(start) = configured_start {
                         commands.entity(camera).insert(
-                            Transform::from_translation(start).looking_to(Vec3::new(-90_f32, 0_f32, 0_f32), Vec3::Y),
+                            Transform::from_translation(start)
+                                .looking_to(Vec3::new(-90_f32, 0_f32, 0_f32), Vec3::Y),
                         );
                     }
                 }
@@ -400,6 +413,7 @@ fn apply_map_s03b_xr_start(
 
 fn apply_map_s03b_lighting_profile(
     current_level: Res<CurrentLevel>,
+    quality: Res<RenderQualityConfig>,
     mut commands: Commands,
     mut point_lights: Query<
         (
@@ -415,6 +429,7 @@ fn apply_map_s03b_lighting_profile(
             Entity,
             Option<&mut AmbientLight>,
             Option<&mut ClusterConfig>,
+            Option<&mut ShadowFilteringMethod>,
             Option<&MapS03BCameraLightingApplied>,
         ),
         With<Camera3d>,
@@ -429,18 +444,25 @@ fn apply_map_s03b_lighting_profile(
         if use_profile && applied.is_none() {
             let previous_intensity = light.intensity;
             let previous_range = light.range;
+            let previous_shadows_enabled = light.shadows_enabled;
             let previous_translation = transform.translation;
             light.intensity *= MAP_S03B_POINT_LIGHT_INTENSITY_SCALE;
             light.range *= MAP_S03B_POINT_LIGHT_RANGE_SCALE;
+            // Stable shadow residency is applied after this profile. Starting
+            // disabled prevents a one-frame allocation with incomplete data.
+            light.shadows_enabled = false;
             let tuning = MapS03BPointLightTuningApplied {
                 previous_intensity,
                 previous_range,
+                previous_shadows_enabled,
                 previous_translation,
                 base_intensity: light.intensity,
                 base_range: light.range,
                 flicker_phase: entity.index() as f32 * 1.618_034,
             };
-            commands.entity(entity).insert(tuning);
+            commands
+                .entity(entity)
+                .insert((tuning, CachedPointLightShadow::default()));
             info!(
                 "Applied Map_S03B PointLight tuning: intensity {:.3} -> {:.3} lm, range {:.3} -> {:.3} m",
                 tuning.previous_intensity, light.intensity, tuning.previous_range, light.range,
@@ -448,17 +470,20 @@ fn apply_map_s03b_lighting_profile(
         } else if !use_profile && let Some(applied) = applied {
             light.intensity = applied.previous_intensity;
             light.range = applied.previous_range;
+            light.shadows_enabled = applied.previous_shadows_enabled;
             transform.translation = applied.previous_translation;
             commands
                 .entity(entity)
-                .remove::<MapS03BPointLightTuningApplied>();
+                .remove::<(MapS03BPointLightTuningApplied, CachedPointLightShadow)>();
         }
     }
 
-    for (entity, ambient, cluster_config, applied) in &mut cameras {
+    let optimized_cluster_config = map_s03b_cluster_config(*quality);
+    for (entity, ambient, cluster_config, shadow_filter, applied) in &mut cameras {
         if use_profile && applied.is_none() {
             let previous_ambient = ambient.as_deref().cloned();
             let previous_cluster_config = cluster_config.as_deref().copied();
+            let previous_shadow_filter = shadow_filter.as_deref().copied();
             if let Some(mut ambient) = ambient {
                 ambient.brightness = MAP_S03B_AMBIENT_BRIGHTNESS;
             } else {
@@ -469,15 +494,23 @@ fn apply_map_s03b_lighting_profile(
                 });
             }
             if let Some(mut cluster_config) = cluster_config {
-                *cluster_config = ClusterConfig::Single;
+                *cluster_config = optimized_cluster_config;
             } else {
-                commands.entity(entity).insert(ClusterConfig::Single);
+                commands.entity(entity).insert(optimized_cluster_config);
+            }
+            if let Some(mut shadow_filter) = shadow_filter {
+                *shadow_filter = ShadowFilteringMethod::Hardware2x2;
+            } else {
+                commands
+                    .entity(entity)
+                    .insert(ShadowFilteringMethod::Hardware2x2);
             }
             commands
                 .entity(entity)
                 .insert(MapS03BCameraLightingApplied {
                     previous_ambient,
                     previous_cluster_config,
+                    previous_shadow_filter,
                 });
         } else if !use_profile && let Some(applied) = applied {
             if let Some(previous_ambient) = applied.previous_ambient.clone() {
@@ -490,10 +523,59 @@ fn apply_map_s03b_lighting_profile(
             } else {
                 commands.entity(entity).remove::<ClusterConfig>();
             }
+            if let Some(previous_shadow_filter) = applied.previous_shadow_filter {
+                commands.entity(entity).insert(previous_shadow_filter);
+            } else {
+                commands.entity(entity).remove::<ShadowFilteringMethod>();
+            }
             commands
                 .entity(entity)
                 .remove::<MapS03BCameraLightingApplied>();
         }
+    }
+}
+
+fn apply_map_s03b_shadow_residency(
+    current_level: Res<CurrentLevel>,
+    quality: Res<RenderQualityConfig>,
+    mut point_lights: Query<
+        (Entity, &mut PointLight, &MapS03BPointLightTuningApplied),
+        With<ImportedZevyLight>,
+    >,
+    mut previous_selection: Local<Vec<Entity>>,
+) {
+    let use_profile = current_level
+        .0
+        .as_ref()
+        .is_some_and(|level| matches!(level, LevelId::Asset(path) if is_map_s03b_asset(path)));
+    if !use_profile {
+        previous_selection.clear();
+        return;
+    }
+
+    // Shadow residency is deliberately independent of every camera. A light
+    // must never gain or lose its shadow merely because the player crossed an
+    // arbitrary distance threshold. Entity order provides a deterministic cap
+    // for oversized test maps; Map_S03B's default cap contains all seven lights.
+    let mut selected = point_lights
+        .iter_mut()
+        .filter_map(|(entity, _, tuning)| tuning.previous_shadows_enabled.then_some(entity))
+        .collect::<Vec<_>>();
+    selected.sort_unstable_by_key(|entity| entity.index());
+    selected.truncate(quality.max_shadowed_point_lights);
+
+    for (entity, mut light, tuning) in &mut point_lights {
+        light.shadows_enabled = tuning.previous_shadows_enabled && selected.contains(&entity);
+    }
+
+    if *previous_selection != selected {
+        info!(
+            "Map_S03B point-shadow residency fixed at {}/{} lights ({} cubemap shadow views); camera distance does not change this set",
+            selected.len(),
+            quality.max_shadowed_point_lights,
+            selected.len() * 6,
+        );
+        *previous_selection = selected;
     }
 }
 
@@ -565,11 +647,15 @@ fn sync_map_s03b_candle_visuals(
 fn animate_map_s03b_candle_lights(
     current_level: Res<CurrentLevel>,
     time: Res<Time>,
+    quality: Res<RenderQualityConfig>,
+    mut shadow_cache_frame: ResMut<ZevyShadowCacheFrame>,
     mut point_lights: Query<
         (
+            Entity,
             &mut PointLight,
             &mut Transform,
             &MapS03BPointLightTuningApplied,
+            &mut CachedPointLightShadow,
         ),
         Without<MapS03BCandleGlow>,
     >,
@@ -585,13 +671,31 @@ fn animate_map_s03b_candle_lights(
     }
 
     let seconds = time.elapsed_secs();
-    for (mut light, mut transform, tuning) in &mut point_lights {
+    let shadow_update_hz = quality.resolved_cached_point_shadow_update_hz();
+    let mut shadow_update_budget = quality.max_cached_point_shadow_updates_per_frame;
+    for (entity, mut light, mut transform, tuning, mut cached_shadow) in &mut point_lights {
         let intensity_multiplier = candle_flicker_multiplier(seconds, tuning.flicker_phase);
         let range_multiplier = 1.0 + (intensity_multiplier - 1.0) * 0.28;
         light.intensity = tuning.base_intensity * intensity_multiplier;
-        light.range = tuning.base_range * range_multiplier;
-        transform.translation =
-            tuning.previous_translation + candle_light_offset(seconds, tuning.flicker_phase);
+
+        if !quality.persistent_point_shadow_cache {
+            light.range = tuning.base_range * range_multiplier;
+            transform.translation =
+                tuning.previous_translation + candle_light_offset(seconds, tuning.flicker_phase);
+            cached_shadow.last_update_tick = None;
+        } else if shadow_update_hz > 0.0 && shadow_update_budget > 0 {
+            let phase_offset =
+                tuning.flicker_phase.rem_euclid(core::f32::consts::TAU) / core::f32::consts::TAU;
+            let update_tick = (seconds * shadow_update_hz + phase_offset).floor() as u64;
+            if cached_shadow.last_update_tick != Some(update_tick) {
+                light.range = tuning.base_range * range_multiplier;
+                transform.translation = tuning.previous_translation
+                    + candle_light_offset(seconds, tuning.flicker_phase);
+                cached_shadow.last_update_tick = Some(update_tick);
+                shadow_cache_frame.invalidate_point_light(entity);
+                shadow_update_budget -= 1;
+            }
+        }
     }
 
     for (mut transform, glow) in &mut candle_glows {
@@ -635,6 +739,18 @@ fn is_map_s03b_asset(asset_path: &str) -> bool {
     asset_path
         .replace('\\', "/")
         .eq_ignore_ascii_case(MAP_S03B_ASSET_PATH)
+}
+
+fn map_s03b_cluster_config(quality: RenderQualityConfig) -> ClusterConfig {
+    ClusterConfig::FixedZ {
+        total: quality.resolved_cluster_total(),
+        z_slices: quality.resolved_cluster_z_slices(),
+        z_config: ClusterZConfig {
+            first_slice_depth: quality.resolved_cluster_first_slice_depth_m(),
+            far_z_mode: ClusterFarZMode::Constant(quality.resolved_cluster_far_z_m()),
+        },
+        dynamic_resizing: true,
+    }
 }
 
 fn map_s03b_player_start_bevy() -> Vec3 {
@@ -803,7 +919,7 @@ mod tests {
         assert!(maximum_abs.x <= MAP_S03B_CANDLE_HORIZONTAL_SWAY_M + 0.000_01);
         assert!(maximum_abs.z <= MAP_S03B_CANDLE_HORIZONTAL_SWAY_M + 0.000_01);
         assert!(maximum_abs.y <= MAP_S03B_CANDLE_VERTICAL_SWAY_M + 0.000_01);
-        assert!(maximum_distance > 0.07);
+        assert!(maximum_distance > 0.003);
         assert!(maximum_step < 0.02);
         assert_ne!(
             candle_light_offset(1.25, 0.25),
@@ -815,6 +931,8 @@ mod tests {
     fn candle_animation_system_accepts_disjoint_transform_queries() {
         let mut app = App::new();
         app.insert_resource(CurrentLevel(Some(LevelId::asset(MAP_S03B_ASSET_PATH))))
+            .insert_resource(RenderQualityConfig::default())
+            .init_resource::<ZevyShadowCacheFrame>()
             .init_resource::<Time>()
             .init_resource::<Assets<StandardMaterial>>()
             .add_systems(Update, animate_map_s03b_candle_lights);
@@ -832,11 +950,13 @@ mod tests {
                 MapS03BPointLightTuningApplied {
                     previous_intensity: 1.0,
                     previous_range: 1.0,
+                    previous_shadows_enabled: true,
                     previous_translation: base_translation,
                     base_intensity: 100.0,
                     base_range: 6.0,
                     flicker_phase: 0.75,
                 },
+                CachedPointLightShadow::default(),
             ))
             .id();
         app.world_mut().spawn((

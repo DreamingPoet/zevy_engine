@@ -5,6 +5,7 @@ use std::{
 };
 
 use bevy::{
+    pbr::PointLightShadowMap,
     prelude::*,
     render::{
         render_resource::TextureFormat,
@@ -25,7 +26,9 @@ use crate::{
     input,
     input::EngineInputPlugin,
     platform,
+    scalable_lighting::ScalableLightingPlugin,
     scene::{ImportedLevelCameraFramed, ScenePlugin},
+    shadow_cache::ShadowCachePlugin,
     xr,
 };
 
@@ -122,9 +125,14 @@ pub fn run() {
 
     app.insert_resource(StartupMode(launch_mode))
         .insert_resource(render_quality)
+        .insert_resource(PointLightShadowMap {
+            size: render_quality.resolved_point_shadow_map_size(),
+        })
         .insert_resource(ClearColor(Color::srgb(0.02, 0.02, 0.03)))
         .add_systems(Startup, (log_launch_mode, log_render_quality_config))
         .add_systems(PostUpdate, apply_render_quality_to_cameras)
+        .add_plugins(ScalableLightingPlugin)
+        .add_plugins(ShadowCachePlugin)
         .add_plugins(EngineInputPlugin)
         .add_plugins(ScenePlugin);
 

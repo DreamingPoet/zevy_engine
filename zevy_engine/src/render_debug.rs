@@ -31,6 +31,7 @@ use crate::{
     config::RenderQualityConfig,
     input::{XrDebugHudPageAction, XrDebugHudToggleAction},
     scene::MirrorCamera,
+    shadow_cache::ZevyShadowCacheFrame,
 };
 
 const HUD_UPDATE_INTERVAL_SECONDS: f32 = 0.25;
@@ -338,6 +339,7 @@ fn update_debug_snapshot(
     diagnostics: Res<DiagnosticsStore>,
     support: Res<GpuDiagnosticSupport>,
     quality: Res<RenderQualityConfig>,
+    shadow_cache_frame: Res<ZevyShadowCacheFrame>,
     xr_session_config: Option<Res<OxrCurrentSessionConfig>>,
     camera_views: Query<(&Camera, &Msaa, Option<&XrCamera>), With<Camera3d>>,
     meshes: Res<Assets<Mesh>>,
@@ -403,6 +405,7 @@ fn update_debug_snapshot(
         xr_session_config.as_deref(),
         quality.resolved_msaa().samples(),
     );
+    let shadow_cache = shadow_cache_frame.telemetry();
 
     let top_pass = pass_rows.first();
     let using_gpu_timestamps = pass_metric == "elapsed_gpu";
@@ -420,10 +423,7 @@ fn update_debug_snapshot(
         "ZEVY RENDER DEBUG  |  {}",
         RenderDebugPage::Overview.label()
     );
-    let _ = writeln!(
-        overview,
-        "F3 / Right A: hide    F4 / Right B: page"
-    );
+    let _ = writeln!(overview, "F3 / Right A: hide    F4 / Right B: page");
     let _ = writeln!(
         overview,
         "------------------------------------------------------------"
@@ -444,6 +444,46 @@ fn update_debug_snapshot(
         overview,
         "XR scale config       {:>8.2}",
         quality.resolved_xr_render_scale()
+    );
+    let _ = writeln!(
+        overview,
+        "Clusters          {:>4} / {:>2}z / {:>4.0}m",
+        quality.resolved_cluster_total(),
+        quality.resolved_cluster_z_slices(),
+        quality.resolved_cluster_far_z_m(),
+    );
+    let _ = writeln!(
+        overview,
+        "Point shadows     {:>4} resident / {:>4}px",
+        quality.max_shadowed_point_lights,
+        quality.resolved_point_shadow_map_size(),
+    );
+    let _ = writeln!(
+        overview,
+        "Shadow cache      {:>4} / draw {:>2} reuse {:>2}",
+        if quality.persistent_point_shadow_cache {
+            "ON"
+        } else {
+            "OFF"
+        },
+        shadow_cache.rendered_views,
+        shadow_cache.reused_views,
+    );
+    let _ = writeln!(
+        overview,
+        "Scalable lights   {:>4} / {:>1}H+{:>1}T / {}",
+        if quality.scalable_point_lighting {
+            "ON"
+        } else {
+            "OFF"
+        },
+        quality.resolved_point_light_hero_samples(),
+        quality.resolved_point_light_tail_samples(),
+        if quality.temporal_point_light_sampling {
+            format!("{}f", quality.resolved_light_sample_period_frames())
+        } else {
+            "stable".to_owned()
+        },
     );
     if let Some(resolution) = target_stats.resolution_per_view {
         let resolution_label = if target_stats.xr_active {
@@ -698,6 +738,79 @@ fn update_debug_snapshot(
     );
     let _ = writeln!(
         material_page,
+        "Point shadow resident cap   {} lights",
+        quality.max_shadowed_point_lights
+    );
+    let _ = writeln!(
+        material_page,
+        "Point shadow face           {} x {} px",
+        quality.resolved_point_shadow_map_size(),
+        quality.resolved_point_shadow_map_size(),
+    );
+    let _ = writeln!(
+        material_page,
+        "Persistent shadow cache     {}",
+        if quality.persistent_point_shadow_cache {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+    let _ = writeln!(
+        material_page,
+        "Shadow views redraw/reuse   {} / {} of {}",
+        shadow_cache.rendered_views, shadow_cache.reused_views, shadow_cache.resident_views,
+    );
+    let _ = writeln!(
+        material_page,
+        "Invalidated lights/frame    {}",
+        shadow_cache.invalidated_lights,
+    );
+    let _ = writeln!(
+        material_page,
+        "Cached projection schedule  {:.1} Hz, <= {} light/frame",
+        quality.resolved_cached_point_shadow_update_hz(),
+        quality.max_cached_point_shadow_updates_per_frame,
+    );
+    let _ = writeln!(
+        material_page,
+        "Cluster grid budget         {} / {} z-slices",
+        quality.resolved_cluster_total(),
+        quality.resolved_cluster_z_slices(),
+    );
+    let _ = writeln!(
+        material_page,
+        "Scalable PointLight path    {}",
+        if quality.scalable_point_lighting {
+            "Hero + stochastic tail"
+        } else {
+            "Bevy deterministic"
+        }
+    );
+    if quality.scalable_point_lighting {
+        let hero_lights = quality.resolved_point_light_hero_samples() as usize;
+        let tail_samples = quality.resolved_point_light_tail_samples() as usize;
+        let bounded_evaluations = hero_lights.saturating_add(tail_samples);
+        let _ = writeln!(
+            material_page,
+            "Point BRDF budget/pixel    <= {} ({} Hero + {} tail)",
+            bounded_evaluations, hero_lights, tail_samples,
+        );
+        let _ = writeln!(
+            material_page,
+            "Tail sample mode           {}",
+            if quality.temporal_point_light_sampling {
+                format!(
+                    "rotate every {} frames",
+                    quality.resolved_light_sample_period_frames()
+                )
+            } else {
+                "world-space stable".to_owned()
+            },
+        );
+    }
+    let _ = writeln!(
+        material_page,
         "------------------------------------------------------------"
     );
     let _ = writeln!(
@@ -760,9 +873,7 @@ fn collect_render_target_stats(
 
 fn total_target_pixels(resolution: Option<UVec2>, view_count: u32) -> u64 {
     resolution
-        .map(|resolution| {
-            u64::from(resolution.x) * u64::from(resolution.y) * u64::from(view_count)
-        })
+        .map(|resolution| u64::from(resolution.x) * u64::from(resolution.y) * u64::from(view_count))
         .unwrap_or_default()
 }
 

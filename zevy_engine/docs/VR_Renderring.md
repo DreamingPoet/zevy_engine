@@ -86,13 +86,13 @@ OpenXR 1.1 的四视图配置由两个外围 view 和两个 foveated inset view 
 | GPU-driven | XR 相机带有 `NoIndirectDrawing` | 当前关闭 Bevy GPU transform/culling/indirect 路径，CPU 和 draw 扩展性受到限制。 |
 | XR 分辨率 | `RenderQualityConfig.xr_render_scale = 0.8` | 每眼宽高 0.8，理论像素为推荐分辨率的 64%。 |
 | MSAA | `msaa_samples = 2` | 是移动 VR 的合理起点，仍须实测带宽和边缘质量。 |
-| 灯光分簇 | Map_S03B 特殊配置使用 `ClusterConfig::Single` | 所有灯落入一个 cluster；将来 PBR 多灯光时会使每个像素遍历过多灯，不适合作为通用方案。 |
+| 灯光分簇 | Map_S03B 已从 `ClusterConfig::Single` 迁移到可配置 Clustered Forward，并叠加固定预算 Scalable Point Lighting 原型 | 当前每个 shading point 默认完整计算 2 个 Hero + 2 个 Tail；下一步应把候选 PDF 上移到双眼共享 tile/froxel。 |
 | 当前 Map_S03B 材质 | glTF 使用 `KHR_materials_unlit` | PointLight 不会影响这些表面；当前性能测试不能代表 PBR 多灯光成本。 |
-| 阴影 | Level 格式能导出 `shadows_enabled`，Bevy 支持点/聚光/方向光阴影 | 尚无持久化 atlas、静动态分离和按预算更新策略。 |
+| 阴影 | Map_S03B 七盏 PointLight 已接入持久化 cubemap-array atlas 与跨帧静态缓存 | 稳定帧可从 42 面全量重绘降到 6 面重绘/36 面复用；尚未完成 static/dynamic overlay 和 GPU 毫秒预算调度。 |
 | 纹理 | 已有 mip chain、trilinear 和 anisotropic sampler | 方向正确；下一阶段是 ASTC/KTX2、分辨率分级和纹理带宽统计。 |
 | 调试 | HUD 已显示 triangles、draw 估算、fragment、pass 和材质信息 | 应继续加入每 cluster 灯数、阴影 texel 更新量、热状态和双眼实际 GPU 时间。 |
 
-当前 OpenXR 双相机循环可见于 [`render.rs`](../third_party/crates/bevy_mod_openxr-0.3.0/src/openxr/render.rs)，质量配置可见于 [`config.rs`](../src/config.rs)，Map_S03B 的单 cluster 配置可见于 [`scene.rs`](../src/scene.rs)。
+当前 OpenXR 双相机循环可见于 [`render.rs`](../third_party/crates/bevy_mod_openxr-0.3.0/src/openxr/render.rs)，质量配置可见于 [`config.rs`](../src/config.rs)，Map_S03B 的分簇、灯光和阴影更新策略可见于 [`scene.rs`](../src/scene.rs)，持久化缓存节点可见于 [`shadow_cache.rs`](../src/shadow_cache.rs)。
 
 ### 3.1 对当前测试结果的正确解释
 
@@ -621,7 +621,31 @@ Epic 文档没有把移动双眼作为 MegaLights 的目标平台。对 Zevy 必
 
 > **MegaLights 的固定样本预算与 ray guiding 思想 + Stochastic Tile-Based Lighting 的移动 tile 结构 + Zevy 的 Cyclopean 双眼共享 + 持久化缓存阴影。**
 
-当前 Map_S03B 约七盏灯时，完全确定性的 Clustered Forward 更简单、更稳定；MegaLights 风格的随机长尾只应在几十到几百盏灯、或 cluster overflow 的压力场景中启动。
+### 9.6 Map_S03B 的 Zevy Scalable Lighting 实验（2026-07-17）
+
+Map_S03B 的七灯 Android VR 实测已经说明，“灯数不多”并不等于确定性遍历足够便宜：双眼、高 fragment 数、完整 PBR BRDF 与 cubemap shadow 会把七盏灯放大成明显瓶颈。因此工程上提前拉取阶段 5 的一部分，在小场景直接验证固定预算模型，而不再把随机长尾限定到几十盏灯之后。
+
+当前实验路径直接替换 Bevy 0.16.1 的 `pbr_functions.wgsl` PointLight 循环：
+
+- 保留正常 Clustered Forward 作为候选灯生成器，不再使用 `ClusterConfig::Single`；
+- 阴影驻留与相机距离完全解耦；Map_S03B 七盏灯的 cubemap shadow 始终启用，不再在玩家靠近时突然出现；
+- 每个 shading point 按亮度、距离和 Bevy range attenuation 选择贡献最大的 2 盏灯作为稳定 Hero；
+- 其余 PointLight 作为 Tail，不论它是否投射阴影，都进入相同的重要性 PDF；
+- 每个 shading point 只完整执行固定 K 次 Tail shadow + BRDF，当前默认 K=2；
+- 使用系统分层采样和 `1/(K*p_l)` 权重，保持 Tail 直接光与阴影贡献的估计无偏；
+- 当 cluster 候选总数不超过 Hero + Tail 预算时自动回到完全确定性求和，不引入噪声；
+- 随机种子使用 12.5 cm 量化世界坐标，同一表面的左右眼尽量选择相同灯；默认关闭时间轮换，使同一表面的 Tail 选择不随帧闪烁；
+- 当前七盏 PointLight 阴影全部常驻、cubemap 面为 128²，而完整 PointLight shadow + BRDF 上限从 7 降为 4（2 Hero + 2 Tail）。
+
+这个实验不是完整 STB Lighting，也没有 denoiser/reservoir history。它主动接受以下 trade-off：
+
+- 多盏相似强度 Tail 同时影响同一表面时，可能出现空间分块、低频闪烁或高光方差；
+- 世界坐标相关只能提高双眼相关性，不能保证左右眼 cluster 候选列表在 frustum 边缘完全一致；
+- 每像素仍需扫描候选灯来构造 PDF；下一步应把 coarse PDF 和候选采样上移到 Cyclopean tile/froxel，供双眼共享；
+- 七盏 PointLight 仍有 42 个常驻 cubemap shadow view；持久化缓存已经消除了稳定面每帧重复的 depth clear/raster，但 Bevy 当前仍会为这些 view 准备 visibility/render phase，CPU 侧还可继续下钻；
+- 不允许再次用“相机靠近才打开阴影”作为性能降级策略。低优先级阴影只能降分辨率、降低更新频率并复用缓存，不能在可见画面中突然从无到有。
+
+配置入口为 `RenderQualityConfig.scalable_point_lighting`、`point_light_hero_samples`、`point_light_tail_samples`、`temporal_point_light_sampling` 和 `light_sample_period_frames`。`max_shadowed_point_lights` 现在是与相机无关的稳定驻留上限；Map_S03B 默认为 7。VR 默认关闭 temporal sampling，只有显式实验时才按帧轮换 Tail。关闭 scalable lighting 总开关后完整回退到 Bevy 原始确定性 PBR shader，便于 Android A/B。阴影缓存相关入口为 `persistent_point_shadow_cache`、`point_shadow_cache_warmup_frames`、`cached_point_shadow_update_hz` 和 `max_cached_point_shadow_updates_per_frame`。
 
 ---
 
@@ -639,6 +663,35 @@ Epic 文档没有把移动双眼作为 MegaLights 的目标平台。对 Zevy 必
 - 4096² D16 atlas 为 32 MiB，2048² D16 为 8 MiB，不含额外临时缓冲。
 
 2025 STB Lighting 公开方案同样使用持久化 16bpp atlas、按相机距离调整 shadow map、静态/动态 shadow 分类和跨帧优先队列更新。[STB Shadow Map Atlas](https://advances.realtimerendering.com/s2025/content/s2025_stb_lighting_v1.1_notes.pdf)
+
+#### 10.1.1 Zevy 第一阶段实现（2026-07-17）
+
+Bevy 0.16.1 的 PointLight 阴影不是打包到普通 2D atlas，而是使用持久化的 cubemap array：每盏 PointLight 固定占 6 个 array layer。Bevy 的 `TextureCache` 本来就会跨帧复用这块 GPU 深度纹理，但默认 `EarlyShadowPass` 每帧仍进入所有 layer 的 render pass，并在首次使用时清除后重画，因此“纹理对象复用”本身并不等于“阴影内容缓存”。
+
+Zevy 当前用自定义 `EarlyShadowPass` 节点实现了真正的内容缓存：
+
+- cache key 为稳定的 `(PointLight main entity, cubemap face)`，atlas 灯光布局或 face 分辨率变化时整体失效；
+- 新 layer 默认连续预热 3 帧，避免异步 pipeline/mesh 尚未就绪时把不完整结果长期缓存；
+- 静态 layer 有效时完全跳过该 depth render pass，因此既不 clear，也不提交该面的 shadow draw，原深度内容继续留在 cube-array atlas 中；
+- 导入 Actor 的全局变换、可见性、Mesh handle 或 shadow-caster 数量变化时使静态缓存失效；PointLight 自身的位移、range 或 shadow near-z 变化只使该灯的 6 个面失效；
+- SpotLight、DirectionalLight 和未标记为 cacheable 的灯仍走 Bevy 原始逐帧阴影路径，不会被错误缓存；
+- 缓存与相机距离无关。七盏灯始终保留 42 个阴影面，不会因玩家跨过距离阈值而突然出现或消失阴影。
+
+Map_S03B PC 运行验证中，稳定帧 HUD 为 `6 redraw / 36 reuse / 42 resident`。当前每帧最多允许一盏蜡烛灯更新位置，所以只重绘它的 6 面。以 128² face 计，全量更新为
+
+\[
+42\times128^2=688{,}128\ \text{depth texels/frame}
+\]
+
+单灯更新为
+
+\[
+6\times128^2=98{,}304\ \text{depth texels/frame}
+\]
+
+即 shadow depth raster 的 view/texel 更新量降低约 85.7%；没有灯位移的帧可以复用全部 42 面。这个比例不能直接等同于整帧 GPU 提速，因为当前 Bevy 仍会准备 shadow visibility 和 render phase；Android 上的实际 GPU ms、功耗和热稳定收益仍必须用设备计数器验证。
+
+这一阶段针对 Map_S03B 的“静态建筑 + 静态灯/低频微动灯”成立。它尚未把动态 caster 拆成独立 overlay：若建筑或任意已跟踪静态 caster 发生变化，当前策略会保守地使整套 point cache 失效。下一阶段应实现 `StaticShadow × DynamicShadow`，并把更新单位从“每帧最多 N 盏灯”升级为真实 GPU 毫秒/预测 caster 成本预算。
 
 ### 10.2 静态与动态 caster 分离
 
@@ -719,7 +772,7 @@ R_l=2^{round\left(\log_2\left(clamp(k\sqrt{A_{screen,l}},R_{min},R_{max})\right)
 改变灯光 intensity/color 不需要重画 shadow map；改变 position/direction 才会让阴影失效。因此：
 
 - 高频火光变化主要驱动 intensity、color、emissive；
-- 阴影投影的轻微摇动用平滑低频噪声，15～30 Hz 或按预算更新；
+- 阴影投影的轻微摇动用平滑低频噪声并按预算更新；Map_S03B 当前默认 8 Hz、每帧最多更新 1 盏灯；
 - 不要每帧随机移动 PointLight 后重画六面 cubemap；
 - 可以用 light cookie、normal perturbation 或低分辨率 shadow mask 模拟投影跳动。
 
@@ -1108,7 +1161,7 @@ OpenXR 新规范中已有厂商 performance metrics 与 frame synthesis 扩展�
 
 ### 阶段 2：Mobile PBR + 正常 Clustered Forward
 
-- 从 `ClusterConfig::Single` 迁移到可调 froxel。
+- [已完成原型] 从 `ClusterConfig::Single` 迁移到可调 froxel。
 - 建立 material tier 和简单 GGX。
 - 正确分离 light physical range 与 emitter visibility。
 - cluster overflow 可视化。
@@ -1117,7 +1170,8 @@ OpenXR 新规范中已有厂商 performance metrics 与 frame synthesis 扩展�
 
 ### 阶段 3：持久化阴影系统
 
-- Shadow atlas、静态 cache、dynamic overlay。
+- [已完成第一阶段] PointLight cubemap-array atlas 内容跨帧保留、静态 cache、按灯局部失效与 HUD telemetry。
+- static/dynamic caster 分离与 dynamic overlay。
 - 按 GPU 毫秒预算调度。
 - Point/Spot authoring 策略。
 - 独立 shadow LOD 和 resolution tier。
@@ -1136,8 +1190,8 @@ OpenXR 新规范中已有厂商 performance metrics 与 frame synthesis 扩展�
 ### 阶段 5：突破性多灯光路径
 
 - Cyclopean/shared cluster。
-- Hero deterministic + sampled tail。
-- 双眼共享 reservoir/noise。
+- [已完成每像素原型] Hero deterministic + importance-sampled tail。
+- [已完成第一步] 世界空间相关的双眼采样；下一步升级为共享 tile reservoir。
 - 解耦 2×2 shadow term。
 - 不依赖长历史的 VR 稳定策略。
 
