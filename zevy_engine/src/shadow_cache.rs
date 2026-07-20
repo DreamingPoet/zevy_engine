@@ -1,11 +1,11 @@
 use std::{
     any::type_name,
     collections::{HashMap, HashSet},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
-    },
+    sync::atomic::{AtomicBool, Ordering},
 };
+
+#[cfg(feature = "render_debug")]
+use std::sync::{Arc, atomic::AtomicU64};
 
 use bevy::{
     core_pipeline::core_3d::graph::Core3d,
@@ -38,14 +38,21 @@ pub(crate) struct CachedPointLightShadow {
 
 #[derive(Clone, Default)]
 struct ShadowCacheTelemetry {
+    #[cfg(feature = "render_debug")]
     rendered_views: Arc<AtomicU64>,
+    #[cfg(feature = "render_debug")]
     reused_views: Arc<AtomicU64>,
+    #[cfg(feature = "render_debug")]
     resident_views: Arc<AtomicU64>,
+    #[cfg(feature = "render_debug")]
     invalidated_lights: Arc<AtomicU64>,
+    #[cfg(feature = "render_debug")]
     dynamic_views_rendered: Arc<AtomicU64>,
+    #[cfg(feature = "render_debug")]
     dynamic_casters: Arc<AtomicU64>,
 }
 
+#[cfg(feature = "render_debug")]
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct ShadowCacheTelemetrySnapshot {
     pub(crate) rendered_views: u64,
@@ -58,15 +65,21 @@ pub(crate) struct ShadowCacheTelemetrySnapshot {
 
 impl ShadowCacheTelemetry {
     fn store(&self, rendered: usize, reused: usize, resident: usize, invalidated: usize) {
-        self.rendered_views
-            .store(rendered as u64, Ordering::Relaxed);
-        self.reused_views.store(reused as u64, Ordering::Relaxed);
-        self.resident_views
-            .store(resident as u64, Ordering::Relaxed);
-        self.invalidated_lights
-            .store(invalidated as u64, Ordering::Relaxed);
+        #[cfg(feature = "render_debug")]
+        {
+            self.rendered_views
+                .store(rendered as u64, Ordering::Relaxed);
+            self.reused_views.store(reused as u64, Ordering::Relaxed);
+            self.resident_views
+                .store(resident as u64, Ordering::Relaxed);
+            self.invalidated_lights
+                .store(invalidated as u64, Ordering::Relaxed);
+        }
+        #[cfg(not(feature = "render_debug"))]
+        let _ = (rendered, reused, resident, invalidated);
     }
 
+    #[cfg(feature = "render_debug")]
     fn snapshot(&self) -> ShadowCacheTelemetrySnapshot {
         ShadowCacheTelemetrySnapshot {
             rendered_views: self.rendered_views.load(Ordering::Relaxed),
@@ -79,10 +92,15 @@ impl ShadowCacheTelemetry {
     }
 
     fn store_dynamic(&self, rendered_views: usize, caster_count: usize) {
-        self.dynamic_views_rendered
-            .store(rendered_views as u64, Ordering::Relaxed);
-        self.dynamic_casters
-            .store(caster_count as u64, Ordering::Relaxed);
+        #[cfg(feature = "render_debug")]
+        {
+            self.dynamic_views_rendered
+                .store(rendered_views as u64, Ordering::Relaxed);
+            self.dynamic_casters
+                .store(caster_count as u64, Ordering::Relaxed);
+        }
+        #[cfg(not(feature = "render_debug"))]
+        let _ = (rendered_views, caster_count);
     }
 }
 
@@ -109,7 +127,8 @@ impl FromWorld for ZevyShadowCacheFrame {
             enabled: quality.persistent_point_shadow_cache,
             warmup_frames: quality.resolved_point_shadow_cache_warmup_frames(),
             point_shadow_map_size: quality.resolved_point_shadow_map_size(),
-            dynamic_overlay_enabled: quality.persistent_point_shadow_cache
+            dynamic_overlay_enabled: quality.point_light_shadows
+                && quality.persistent_point_shadow_cache
                 && quality.scalable_point_lighting
                 && quality.dynamic_shadow_caster_overlay,
             cacheable_point_lights: Vec::new(),
@@ -128,6 +147,7 @@ impl ZevyShadowCacheFrame {
         }
     }
 
+    #[cfg(feature = "render_debug")]
     pub(crate) fn telemetry(&self) -> ShadowCacheTelemetrySnapshot {
         self.telemetry.snapshot()
     }
@@ -189,7 +209,8 @@ fn begin_shadow_cache_frame(
     frame.enabled = quality.persistent_point_shadow_cache;
     frame.warmup_frames = quality.resolved_point_shadow_cache_warmup_frames();
     frame.point_shadow_map_size = quality.resolved_point_shadow_map_size();
-    frame.dynamic_overlay_enabled = quality.persistent_point_shadow_cache
+    frame.dynamic_overlay_enabled = quality.point_light_shadows
+        && quality.persistent_point_shadow_cache
         && quality.scalable_point_lighting
         && quality.dynamic_shadow_caster_overlay;
     frame.cacheable_point_lights.clear();
@@ -294,7 +315,7 @@ fn has_dynamic_shadow_marker(
     false
 }
 
-fn is_dynamic_shadow_caster(
+pub(crate) fn is_dynamic_shadow_caster(
     entity: Entity,
     dynamic_markers: &Query<(), With<DynamicShadowCaster>>,
     imported_entities: &Query<(), With<ImportedZevyEntity>>,

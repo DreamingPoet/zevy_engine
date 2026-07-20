@@ -1278,6 +1278,93 @@ OpenXR 新规范中已有厂商 performance metrics 与 frame synthesis 扩展�
 
 优先把 Android GPU Inspector/厂商 profiler 的 GPU capture 与 Zevy HUD 对齐。P0 的完成标准不是“多了更多数字”，而是能指出 50 ms 中最大的两个模块，并预测关闭其中一个后帧时间应该下降多少。
 
+#### 20.2.1 Wave A 已实现的 HUD 与固定 A/B 开关
+
+调试 HUD 现在按 `Overview → Full-frame Workload → GPU/Render Passes → Materials/Lights` 四页循环。`Full-frame Workload` 不再让 96 个 PointLight face 淹没主结论，而是把 Bevy/wgpu 的诊断 span 汇总为：
+
+- Main 3D；
+- Depth/visibility；
+- Static shadow；
+- Dynamic shadow；
+- Post-process；
+- UI/debug；
+- Other/compute。
+
+在设备支持 Vulkan/DX12 timestamp 与 pipeline-statistics query 时，每类显示 GPU ms、vertex shader invocations、clipper primitives out 和 fragment shader invocations，所有数值均包含本帧全部 view/双眼。设备不支持时，时间明确标成 CPU command-recording fallback，GPU counter 显示 `N/A`，禁止把不支持误判成零成本。HUD 还显示最近 10 秒 frame P50/P95/P99、静态/动态 caster 的实体和三角形、redraw/reuse face、更新 shadow texel、主视图 opaque/transparent draw 估算以及 batch savings。
+
+其中 `Loaded caster tris × updated faces` 只是 face-frustum culling 之前的保守上界；真实 shadow primitives 以分类后的 GPU counter 或 AGI capture 为准。`Main fragment / primitive` 是屏幕覆盖率/微三角形压力代理，不等同于精确的 `<1 px` 三角形直方图。
+
+`RenderQualityConfig` 新增两个固定、双眼共享且与相机距离无关的开关：
+
+| `point_light_direct_lighting` | `point_light_shadows` | 实验意义 |
+|---:|---:|---|
+| `true` | `true` | Full：完整 16 灯直接光、shadow submission 与 shadow sampling。 |
+| `true` | `false` | Direct only：直接光/选灯/PBR，阴影完全关闭。 |
+| `false` | `true` | Shadow submission only：仍生成阴影，但 WGSL 编译期移除 PointLight 扫描、BRDF 和 shadow lookup。 |
+| `false` | `false` | Geometry/post floor：主几何、材质基础、后处理和 XR 提交下限。 |
+
+关闭 direct 不是把 intensity 设为零：当 `scalable_point_lighting=true` 时，shader 常量会让编译器消除整个 PointLight 片元循环，因此才能隔离真实成本。每组配置修改后重新构建并重启；不要在同一运行中动态切换 shader profile。
+
+推荐先跑以下最小矩阵，并在同一真机、刷新率、起点和相机路径记录 10 秒稳定窗口：
+
+1. `false/false` 得到 geometry/post floor；
+2. `true/false` 与第 1 组之差近似 direct shading 成本；
+3. `false/true` 与第 1 组之差近似 shadow submission/cache 管理成本；
+4. `true/true` 检查 direct 与 shadow sampling 的耦合成本；
+5. 在第 4 组中把 `max_cached_point_shadow_updates_per_frame` 依次设为 `0/1/2/4`，测量每更新一盏灯（六个 face）的边际成本；
+6. 测 cache-hot 下限时使用 persistent cache、`cached_point_shadow_update_hz=0`、更新预算 `0`，等待 warmup 完成；测全量重画参考时关闭 persistent cache。
+
+调试构建默认启用 `render_debug` feature。Shipping 应使用不含该 feature 的构建，去掉 UI、系统信息采集、timestamp/pipeline query 和字符串格式化成本；性能验收仍需分别记录“带诊断”和“Shipping + 外部 profiler”两条基线。
+
+#### 20.2.2 PICO 实测分解与第一次逐片元选灯突破（2026-07-20）
+
+设备 `PA9410MGJA190227G`、Map_S03B 默认起点、release + `render_debug`、每组预热 30 秒并采集约 12 秒 PICO `PxrMetric`。下表是修改选灯算法之前的固定四档基线；GPU 列是 runtime 的整帧 `FrmGpu`，不是 Bevy 内部 span 之和：
+
+| 档位 | FPS avg | CPU avg | GPU avg | GPU P95 | 相对 geometry floor 的结论 |
+|---|---:|---:|---:|---:|---|
+| Geometry/post floor（direct off, shadow off） | 88.25 | 4.60 ms | 8.54 ms | 8.86 ms | XR、几何、基础材质和提交下限。 |
+| Direct only（direct on, shadow off） | 30.00 | 5.03 ms | 26.26 ms | 27.58 ms | 直接光/选灯约增加 17.72 ms，是最大单项。 |
+| Shadow submission only（direct off, shadow on） | 67.83 | 7.53 ms | 9.82 ms | 10.07 ms | 阴影生成 GPU 约增加 1.28 ms，但 CPU 约增加 2.93 ms。 |
+| Full（direct on, shadow on） | 29.38 | 8.17 ms | 30.79 ms | 33.37 ms | 相对 Direct only 再增加 4.53 ms，包含生成、shadow lookup 与耦合成本。 |
+
+因此这一相机位置的第一瓶颈不是 128² shadow raster，而是逐片元候选灯遍历和直接光计算。Workload 页同时观察到主视图约 2.04M fragment invocation；static shadow 虽提交约 3.79M vertex invocation，但固定 A/B 表明它当前不是最大的 GPU 增量。两个证据必须同时保留，不能仅凭“shadow 三角形很多”就裁决。
+
+原始默认 `2 Hero + 2 Tail` 为 Hero 扫描 (N)、Tail 求和 (N)、两个 Tail 各自查找 (2N)，约执行 (4N) 次 importance。第一次尝试把 Tail ID/PDF 放进局部数组并一次遍历求解，理论上降为 (2N)，但 PICO Full 反而从 30.79 ms 升至 40.04 ms，FPS 从 29.38 降至 22.58。该实现已删除。失败原因推断为 Adreno 上局部数组、动态索引和循环造成寄存器压力、occupancy 下降；今后不得仅凭 ALU 次数减少就接受移动 shader。
+
+胜出的实现使用编译期 `K=1/K=2` 标量特化：
+
+- Hero 扫描同时累计全部 importance，Tail 总和由减去 Hero 得到，不再单独扫描；
+- K=2 的两个有序系统采样阈值在一次 Tail 遍历中用标量 ID/importance 同时求解；
+- K=1 也使用无动态循环的独立标量路径；
+- 不创建局部数组、不动态索引，Hero 集合、PDF、系统采样阈值和无偏权重保持不变；
+- 默认 K=2 的 importance 次数由约 (4N) 降到 (2N)。
+
+同一台设备上，Direct only 从 26.26 ms 降到 19.88 ms（-24.3%，FPS 30.00→48.58）；Full 从 30.79 ms 降到 26.24 ms（-14.8%，FPS 29.38→34.58）。截图结构一致，但运动中的灯光方差、阴影稳定性和双眼舒适度仍必须由佩戴测试裁决。
+
+第二台设备 `PA9410MGJ9260457G` 用于同频 Hero/Tail 斜率实验。运行时 DVFS 会使同一 shader 在 490/599 MHz 间产生假结论，所以只比较 GPU 已稳定在 599 MHz 的样本：
+
+| Direct-only 档位 | FPS avg | GPU avg | GPU P95 | GPU 时钟 |
+|---|---:|---:|---:|---:|
+| 2H + 0T | 45.00 | 16.99 ms | 17.19 ms | 599 MHz |
+| 2H + 1T（标量） | 44.25 | 20.74 ms | 22.08 ms | 599 MHz |
+| 2H + 2T（标量） | 41.18 | 22.20 ms | 22.75 ms | 599 MHz |
+| Full 2H + 2T | 30.00 | 28.10 ms | 28.89 ms | 599 MHz |
+
+在“两个 Tail 共用一次查找扫描、每个 Tail 再做一次直接光”的近似下：
+
+\[
+C_{tail\ scan}\approx(C_{1T}-C_{0T})-(C_{2T}-C_{1T})
+=3.75-1.46=2.29\text{ ms}
+\]
+
+\[
+C_{tail\ shade}\approx C_{2T}-C_{1T}=1.46\text{ ms/sample}
+\]
+
+这说明继续把 K 从 2 调到 1 只是画质 trade-off；结构性下一步仍是把约 2.29 ms 的逐片元 Tail 查找和 Hero 候选遍历一起搬到双眼共享 tile/froxel。上述窗口较短、不是 20～30 分钟 thermal soak，不能替代最终热稳定验收。
+
+移动 Vulkan 的另一个关键结论是：Bevy `elapsed_gpu` 只覆盖被其诊断 span 包围的命令，不等于移动 tile renderer 的整帧 GPU 时间。最终 Full 截图中 HUD 顶部 pass 仅约 0.57 ms，而 PICO runtime 同时报告约 28.10 ms；因此 Android HUD 已改成 `GPU spans (partial)`，覆盖率不足时不再声称 CPU/streaming bottleneck。整帧裁决使用 PICO runtime、AGI 或厂商 profiler；内部 timestamp 仍可用于同一被测 span 的相对 A/B。
+
 ### 20.3 P1：先消灭阴影阶梯，而不是增加 42 个 face/frame
 
 为蜡烛类小幅运动引入三档 `ShadowMotionMode`：
@@ -1290,13 +1377,13 @@ OpenXR 新规范中已有厂商 performance metrics 与 frame synthesis 扩展�
 
 ### 20.4 P2：把每片元 \(O(N)\) 选灯搬到双眼共享 tile
 
-当前 Hero/Tail 虽将昂贵的 BRDF + shadow 次数限制为 \(H+K=4\)，但每个片元仍执行 Hero 扫描、Tail 求和，以及每个 Tail 样本的线性查找：
+当前 Hero/Tail 已将昂贵的 BRDF + shadow 次数限制为 \(H+K=4\)，并把默认 K=2 从约四次候选遍历优化为 Hero 与 Tail 各一次，但每个片元仍执行两个 \(O(N)\) 扫描：
 
 \[
-C_{current}\approx P\left[(K+2)N\,c_{importance}+(H+K)c_{shade}\right]
+C_{current,K=2}\approx P\left[2N\,c_{importance}+(H+K)c_{shade}\right]
 \]
 
-在 4,000,000 fragment、16 灯、\(K=2\) 时，轻量 importance 循环也可能被放大到数亿次量级。下一步建立 Cyclopean compute pass：
+在 4,000,000 fragment、16 灯、\(K=2\) 时，即使已经减半，importance 仍可能达到约 1.28 亿次/帧；PICO 同频实验估计 Tail 扫描本身约 2.29 ms。下一步建立 Cyclopean compute pass：
 
 - 用双眼 union frustum 构建一次 tile/froxel light list；
 - 每 tile 选择稳定 Hero，并为 Tail 构建 reservoir、CDF 或 alias table；

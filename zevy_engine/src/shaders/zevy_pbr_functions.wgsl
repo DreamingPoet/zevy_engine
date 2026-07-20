@@ -72,6 +72,7 @@ const ZEVY_POINT_LIGHT_TAIL_SAMPLES: u32 = 2u;
 const ZEVY_TEMPORAL_LIGHT_SAMPLING: bool = false;
 const ZEVY_LIGHT_SAMPLE_PERIOD_FRAMES: u32 = 4u;
 const ZEVY_DYNAMIC_SHADOW_OVERLAY: bool = true;
+const ZEVY_POINT_LIGHT_DIRECT_LIGHTING: bool = true;
 
 fn zevy_hash_u32(value: u32) -> u32 {
     var hash = value;
@@ -555,16 +556,21 @@ fn apply_pbr_lighting(
     var clusterable_object_index_ranges =
         clustering::unpack_clusterable_object_index_ranges(cluster_index);
 
-    // Zevy scalable point lights. Shadow maps remain resident independently of
-    // the camera. At each shading point, the strongest lights become stable
-    // Heroes and the rest receive a fixed systematic importance-sampling
-    // budget. This bounds both full BRDF and shadow-map lookups without turning
-    // a light's shadow on only when the player approaches it.
-    let first_point_light = clusterable_object_index_ranges.first_point_light_index_offset;
-    let point_light_end = clusterable_object_index_ranges.first_spot_light_index_offset;
-    let point_light_count = point_light_end - first_point_light;
-    let full_evaluation_budget =
-        ZEVY_POINT_LIGHT_HERO_SAMPLES + ZEVY_POINT_LIGHT_TAIL_SAMPLES;
+    // The fixed direct-lighting switch exists for reproducible A/B captures.
+    // Because it is injected as a shader constant, disabling it removes the
+    // PointLight scan, BRDF and shadow lookups instead of merely setting light
+    // intensity to zero. It must never become a camera-distance heuristic.
+    if (ZEVY_POINT_LIGHT_DIRECT_LIGHTING) {
+        // Zevy scalable point lights. Shadow maps remain resident independently of
+        // the camera. At each shading point, the strongest lights become stable
+        // Heroes and the rest receive a fixed systematic importance-sampling
+        // budget. This bounds both full BRDF and shadow-map lookups without turning
+        // a light's shadow on only when the player approaches it.
+        let first_point_light = clusterable_object_index_ranges.first_point_light_index_offset;
+        let point_light_end = clusterable_object_index_ranges.first_spot_light_index_offset;
+        let point_light_count = point_light_end - first_point_light;
+        let full_evaluation_budget =
+            ZEVY_POINT_LIGHT_HERO_SAMPLES + ZEVY_POINT_LIGHT_TAIL_SAMPLES;
 
     if (point_light_count <= full_evaluation_budget) {
         // Exact fast path: small local light lists never receive stochastic noise.
@@ -589,9 +595,11 @@ fn apply_pbr_lighting(
         var hero_light_1 = 0xffffffffu;
         var hero_importance_0 = -1.0;
         var hero_importance_1 = -1.0;
+        var all_importance_sum = 0.0;
         for (var i = first_point_light; i < point_light_end; i = i + 1u) {
             let light_id = clustering::get_clusterable_object_id(i);
             let importance = zevy_point_light_importance(light_id, lighting_input.P);
+            all_importance_sum = all_importance_sum + importance;
             if (importance > hero_importance_0) {
                 if (ZEVY_POINT_LIGHT_HERO_SAMPLES > 1u) {
                     hero_light_1 = hero_light_0;
@@ -630,16 +638,19 @@ fn apply_pbr_lighting(
             }
         }
 
-        var tail_light_count = 0u;
-        var tail_importance_sum = 0.0;
-        for (var i = first_point_light; i < point_light_end; i = i + 1u) {
-            let light_id = clustering::get_clusterable_object_id(i);
-            if (light_id != hero_light_0 && light_id != hero_light_1) {
-                tail_light_count = tail_light_count + 1u;
-                tail_importance_sum = tail_importance_sum +
-                    zevy_point_light_importance(light_id, lighting_input.P);
-            }
+        // The Hero scan already saw every candidate, so derive the tail total
+        // by subtraction instead of scanning the cluster a second time.
+        var tail_light_count = point_light_count;
+        var tail_importance_sum = all_importance_sum;
+        if (hero_light_0 != 0xffffffffu) {
+            tail_light_count = tail_light_count - 1u;
+            tail_importance_sum = tail_importance_sum - hero_importance_0;
         }
+        if (hero_light_1 != 0xffffffffu) {
+            tail_light_count = tail_light_count - 1u;
+            tail_importance_sum = tail_importance_sum - hero_importance_1;
+        }
+        tail_importance_sum = max(tail_importance_sum, 0.0);
 
         let tail_sample_count = min(ZEVY_POINT_LIGHT_TAIL_SAMPLES, tail_light_count);
         if (tail_light_count <= ZEVY_POINT_LIGHT_TAIL_SAMPLES) {
@@ -665,16 +676,15 @@ fn apply_pbr_lighting(
             let jitter = zevy_light_sample_jitter(lighting_input.P);
             let inverse_sample_count = 1.0 / f32(tail_sample_count);
 
-            // One random offset shared by all strata gives systematic sampling:
-            // fixed K, good coverage, and an unbiased estimate of the tail sum.
-            for (var sample_index = 0u;
-                    sample_index < tail_sample_count;
-                    sample_index = sample_index + 1u) {
-                let target_importance =
-                    (f32(sample_index) + jitter) * inverse_sample_count * tail_importance_sum;
-                var accumulated_importance = 0.0;
+            if (ZEVY_POINT_LIGHT_TAIL_SAMPLES == 1u) {
+                // Single-sample scalar specialization. Keeping this separate
+                // from the generic loop matters on Adreno: even a one-trip
+                // dynamic loop retained enough control/register pressure to
+                // measure slower than the fixed K=2 scalar path.
+                let target_importance = jitter * tail_importance_sum;
                 var sampled_light_id = 0xffffffffu;
                 var sampled_importance = 0.0;
+                var accumulated_importance = 0.0;
 
                 for (var i = first_point_light; i < point_light_end; i = i + 1u) {
                     let light_id = clustering::get_clusterable_object_id(i);
@@ -698,8 +708,7 @@ fn apply_pbr_lighting(
                     let enable_diffuse = true;
 #endif  // LIGHTMAP
                     let probability = sampled_importance / tail_importance_sum;
-                    let estimator_weight =
-                        1.0 / max(probability * f32(tail_sample_count), 0.000001);
+                    let estimator_weight = 1.0 / max(probability, 0.000001);
                     let shadow = zevy_point_light_shadow(
                         sampled_light_id, in.flags, in.world_position, in.world_normal
                     );
@@ -708,6 +717,114 @@ fn apply_pbr_lighting(
                         &lighting_input,
                         enable_diffuse
                     ) * (shadow * estimator_weight);
+                }
+            } else if (ZEVY_POINT_LIGHT_TAIL_SAMPLES == 2u) {
+                // Mobile-specialized scalar path. Two ordered systematic
+                // thresholds are resolved in one tail walk with no local array,
+                // dynamic indexing, or nested loop. This preserves the K=2
+                // estimator while avoiding the Adreno occupancy regression of
+                // the generic array implementation.
+                let target_importance_0 =
+                    jitter * inverse_sample_count * tail_importance_sum;
+                let target_importance_1 =
+                    (1.0 + jitter) * inverse_sample_count * tail_importance_sum;
+                var sampled_light_id_0 = 0xffffffffu;
+                var sampled_light_id_1 = 0xffffffffu;
+                var sampled_importance_0 = 0.0;
+                var sampled_importance_1 = 0.0;
+                var accumulated_importance = 0.0;
+
+                for (var i = first_point_light; i < point_light_end; i = i + 1u) {
+                    let light_id = clustering::get_clusterable_object_id(i);
+                    if (light_id != hero_light_0 && light_id != hero_light_1) {
+                        let importance = zevy_point_light_importance(light_id, lighting_input.P);
+                        accumulated_importance = accumulated_importance + importance;
+                        if (sampled_light_id_0 == 0xffffffffu &&
+                                target_importance_0 <= accumulated_importance) {
+                            sampled_light_id_0 = light_id;
+                            sampled_importance_0 = importance;
+                        }
+                        if (sampled_light_id_1 == 0xffffffffu &&
+                                target_importance_1 <= accumulated_importance) {
+                            sampled_light_id_1 = light_id;
+                            sampled_importance_1 = importance;
+                        }
+                    }
+                }
+
+                for (var sample_index = 0u; sample_index < 2u; sample_index = sample_index + 1u) {
+                    var sampled_light_id = sampled_light_id_0;
+                    var sampled_importance = sampled_importance_0;
+                    if (sample_index == 1u) {
+                        sampled_light_id = sampled_light_id_1;
+                        sampled_importance = sampled_importance_1;
+                    }
+                    if (sampled_light_id != 0xffffffffu) {
+#ifdef LIGHTMAP
+                        let enable_diffuse =
+                            (view_bindings::clusterable_objects.data[sampled_light_id].flags &
+                                mesh_view_types::POINT_LIGHT_FLAGS_AFFECTS_LIGHTMAPPED_MESH_DIFFUSE_BIT) != 0u;
+#else   // LIGHTMAP
+                        let enable_diffuse = true;
+#endif  // LIGHTMAP
+                        let probability = sampled_importance / tail_importance_sum;
+                        let estimator_weight =
+                            1.0 / max(probability * 2.0, 0.000001);
+                        let shadow = zevy_point_light_shadow(
+                            sampled_light_id, in.flags, in.world_position, in.world_normal
+                        );
+                        direct_light += lighting::point_light(
+                            sampled_light_id,
+                            &lighting_input,
+                            enable_diffuse
+                        ) * (shadow * estimator_weight);
+                    }
+                }
+            } else {
+                // Generic reference path for non-default K values.
+                for (var sample_index = 0u;
+                        sample_index < tail_sample_count;
+                        sample_index = sample_index + 1u) {
+                    let target_importance =
+                        (f32(sample_index) + jitter) * inverse_sample_count * tail_importance_sum;
+                    var accumulated_importance = 0.0;
+                    var sampled_light_id = 0xffffffffu;
+                    var sampled_importance = 0.0;
+
+                    for (var i = first_point_light; i < point_light_end; i = i + 1u) {
+                        let light_id = clustering::get_clusterable_object_id(i);
+                        if (light_id != hero_light_0 && light_id != hero_light_1) {
+                            let importance =
+                                zevy_point_light_importance(light_id, lighting_input.P);
+                            accumulated_importance = accumulated_importance + importance;
+                            if (sampled_light_id == 0xffffffffu &&
+                                    target_importance <= accumulated_importance) {
+                                sampled_light_id = light_id;
+                                sampled_importance = importance;
+                            }
+                        }
+                    }
+
+                    if (sampled_light_id != 0xffffffffu) {
+#ifdef LIGHTMAP
+                        let enable_diffuse =
+                            (view_bindings::clusterable_objects.data[sampled_light_id].flags &
+                                mesh_view_types::POINT_LIGHT_FLAGS_AFFECTS_LIGHTMAPPED_MESH_DIFFUSE_BIT) != 0u;
+#else   // LIGHTMAP
+                        let enable_diffuse = true;
+#endif  // LIGHTMAP
+                        let probability = sampled_importance / tail_importance_sum;
+                        let estimator_weight =
+                            1.0 / max(probability * f32(tail_sample_count), 0.000001);
+                        let shadow = zevy_point_light_shadow(
+                            sampled_light_id, in.flags, in.world_position, in.world_normal
+                        );
+                        direct_light += lighting::point_light(
+                            sampled_light_id,
+                            &lighting_input,
+                            enable_diffuse
+                        ) * (shadow * estimator_weight);
+                    }
                 }
             }
         }
@@ -742,6 +859,7 @@ fn apply_pbr_lighting(
         ) * transmitted_shadow;
     }
 #endif
+    }
 
     // Spot lights (direct)
     for (var i: u32 = clusterable_object_index_ranges.first_spot_light_index_offset;

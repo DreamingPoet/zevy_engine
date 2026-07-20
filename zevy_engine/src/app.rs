@@ -41,6 +41,13 @@ pub fn run() {
     let launch_mode = LaunchMode::from_args();
     let screenshot_path = screenshot_path_from_args();
     let screenshot_delay = screenshot_delay_from_args();
+    #[cfg(all(target_os = "android", feature = "render_debug"))]
+    let render_quality = {
+        let mut config = RenderQualityConfig::default();
+        crate::render_debug::apply_android_render_quality_overrides(&mut config);
+        config
+    };
+    #[cfg(not(all(target_os = "android", feature = "render_debug")))]
     let render_quality = RenderQualityConfig::default();
     eprintln!("Starting zevy_engine in {} mode", launch_mode.label());
     platform::log_android_context("run");

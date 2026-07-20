@@ -557,7 +557,8 @@ fn apply_map_s03b_shadow_residency(
     // Shadow residency is deliberately independent of every camera. A light
     // must never gain or lose its shadow merely because the player crossed an
     // arbitrary distance threshold. Entity order provides a deterministic cap
-    // for oversized test maps; Map_S03B's default cap contains all seven lights.
+    // for oversized test maps; the default policy contains every light that
+    // had shadows enabled in the exported level.
     let mut selected = point_lights
         .iter_mut()
         .filter_map(|(entity, _, tuning)| tuning.previous_shadows_enabled.then_some(entity))
@@ -571,7 +572,9 @@ fn apply_map_s03b_shadow_residency(
     }
 
     if *previous_selection != selected {
-        let policy = if quality.max_shadowed_point_lights == 0 {
+        let policy = if !quality.point_light_shadows {
+            "fixed A/B profile: shadows off".to_owned()
+        } else if quality.max_shadowed_point_lights == 0 {
             "all level-enabled lights".to_owned()
         } else {
             format!("explicit cap {}", quality.max_shadowed_point_lights)

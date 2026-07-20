@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashSet, VecDeque},
     env,
     fmt::Write as _,
     time::Duration,
@@ -10,6 +10,7 @@ use bevy::{
         DiagnosticsStore, EntityCountDiagnosticsPlugin, FrameTimeDiagnosticsPlugin,
         SystemInformationDiagnosticsPlugin,
     },
+    ecs::system::SystemParam,
     pbr::NotShadowCaster,
     prelude::*,
     render::{
@@ -30,17 +31,19 @@ use crate::{
     app::{LaunchMode, StartupMode},
     config::RenderQualityConfig,
     input::{XrDebugHudPageAction, XrDebugHudToggleAction},
-    scene::MirrorCamera,
-    shadow_cache::ZevyShadowCacheFrame,
+    scene::{ImportedZevyEntity, MirrorCamera},
+    shadow_cache::{ZevyShadowCacheFrame, is_dynamic_shadow_caster},
+    shadow_overlay::DynamicShadowCaster,
 };
 
 const HUD_UPDATE_INTERVAL_SECONDS: f32 = 0.25;
 const PASS_SAMPLE_WINDOW: Duration = Duration::from_millis(750);
 const MAX_PASS_ROWS: usize = 12;
-const HUD_PANEL_WIDTH: f32 = 280.0;
+const HUD_PANEL_WIDTH: f32 = 320.0;
 const HUD_PANEL_PADDING: f32 = 2.2;
-const HUD_FONT_SIZE: f32 = 7.0;
+const HUD_FONT_SIZE: f32 = 11.0;
 const HUD_TEXT_SHADOW_OFFSET: f32 = 0.1;
+const FRAME_HISTORY_SECONDS: f64 = 10.0;
 
 pub(crate) fn desktop_render_plugin() -> RenderPlugin {
     let mut settings = WgpuSettings::default();
@@ -111,6 +114,7 @@ impl Plugin for RenderDebugPlugin {
 enum RenderDebugPage {
     #[default]
     Overview,
+    Workload,
     Passes,
     Materials,
 }
@@ -118,7 +122,8 @@ enum RenderDebugPage {
 impl RenderDebugPage {
     fn next(self) -> Self {
         match self {
-            Self::Overview => Self::Passes,
+            Self::Overview => Self::Workload,
+            Self::Workload => Self::Passes,
             Self::Passes => Self::Materials,
             Self::Materials => Self::Overview,
         }
@@ -127,6 +132,7 @@ impl RenderDebugPage {
     fn label(self) -> &'static str {
         match self {
             Self::Overview => "OVERVIEW",
+            Self::Workload => "FULL-FRAME WORKLOAD",
             Self::Passes => "GPU / RENDER PASSES",
             Self::Materials => "MATERIALS / LIGHTS",
         }
@@ -148,28 +154,146 @@ impl RenderDebugState {
             match argument.as_str() {
                 "--debug-hud" | "--debug-hud=on" => visible = true,
                 "--no-debug-hud" | "--debug-hud=off" => visible = false,
-                "--debug-hud-page=passes" => page = RenderDebugPage::Passes,
-                "--debug-hud-page=materials" => page = RenderDebugPage::Materials,
+                value if value.starts_with("--debug-hud-page=") => {
+                    if let Some(selected) =
+                        debug_page_from_label(value.trim_start_matches("--debug-hud-page="))
+                    {
+                        page = selected;
+                    }
+                }
                 _ => {}
             }
+        }
+
+        // Android NativeActivity does not expose ordinary desktop argv. This
+        // debug-only system property gives automated ADB captures the same page
+        // selection without synthesizing controller input or changing the
+        // renderer. Example: `adb shell setprop debug.zevy.hud_page workload`.
+        #[cfg(target_os = "android")]
+        if let Some(selected) = android_debug_hud_page_override() {
+            page = selected;
         }
 
         Self { visible, page }
     }
 }
 
+fn debug_page_from_label(label: &str) -> Option<RenderDebugPage> {
+    match label.trim().to_ascii_lowercase().as_str() {
+        "overview" => Some(RenderDebugPage::Overview),
+        "workload" => Some(RenderDebugPage::Workload),
+        "passes" => Some(RenderDebugPage::Passes),
+        "materials" => Some(RenderDebugPage::Materials),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "android")]
+fn android_debug_hud_page_override() -> Option<RenderDebugPage> {
+    android_system_property("debug.zevy.hud_page")
+        .as_deref()
+        .and_then(debug_page_from_label)
+}
+
+#[cfg(target_os = "android")]
+pub(crate) fn apply_android_render_quality_overrides(config: &mut RenderQualityConfig) {
+    if let Some(value) = android_system_property("debug.zevy.point_direct")
+        .as_deref()
+        .and_then(parse_debug_bool)
+    {
+        config.point_light_direct_lighting = value;
+    }
+    if let Some(value) = android_system_property("debug.zevy.point_shadows")
+        .as_deref()
+        .and_then(parse_debug_bool)
+    {
+        config.point_light_shadows = value;
+    }
+    if let Some(value) = android_system_property("debug.zevy.dynamic_overlay")
+        .as_deref()
+        .and_then(parse_debug_bool)
+    {
+        config.dynamic_shadow_caster_overlay = value;
+    }
+    if let Some(value) = android_system_property("debug.zevy.shadow_updates")
+        .as_deref()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+    {
+        config.max_cached_point_shadow_updates_per_frame = value.min(64);
+    }
+    if let Some(value) = android_system_property("debug.zevy.shadow_hz")
+        .as_deref()
+        .and_then(|value| value.trim().parse::<f32>().ok())
+        .filter(|value| value.is_finite())
+    {
+        config.cached_point_shadow_update_hz = value;
+    }
+    if let Some(value) = android_system_property("debug.zevy.hero_samples")
+        .as_deref()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+    {
+        config.point_light_hero_samples = value.clamp(1, 2);
+    }
+    if let Some(value) = android_system_property("debug.zevy.tail_samples")
+        .as_deref()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+    {
+        config.point_light_tail_samples = value.min(8);
+    }
+}
+
+#[cfg(any(target_os = "android", test))]
+fn parse_debug_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "on" | "yes" => Some(true),
+        "0" | "false" | "off" | "no" => Some(false),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "android")]
+fn android_system_property(name: &str) -> Option<String> {
+    use std::{
+        ffi::{CStr, CString},
+        os::raw::c_char,
+    };
+
+    const PROPERTY_VALUE_MAX: usize = 92;
+    unsafe extern "C" {
+        fn __system_property_get(name: *const c_char, value: *mut c_char) -> i32;
+    }
+
+    let name = CString::new(name).ok()?;
+    let mut value = [0 as c_char; PROPERTY_VALUE_MAX];
+    // SAFETY: `name` is NUL-terminated and `value` is the Bionic-documented
+    // PROPERTY_VALUE_MAX-sized writable output buffer.
+    let length = unsafe { __system_property_get(name.as_ptr(), value.as_mut_ptr()) };
+    if length <= 0 {
+        return None;
+    }
+    // SAFETY: a successful __system_property_get call NUL-terminates `value`.
+    Some(
+        unsafe { CStr::from_ptr(value.as_ptr()) }
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
+
 #[derive(Resource, Default)]
 struct RenderDebugSnapshot {
     overview: String,
+    workload: String,
     passes: String,
     materials: String,
     elapsed_since_update: f32,
+    frame_history: VecDeque<FrameTimeSample>,
 }
 
 impl RenderDebugSnapshot {
     fn page_text(&self, page: RenderDebugPage) -> &str {
         match page {
             RenderDebugPage::Overview => &self.overview,
+            RenderDebugPage::Workload => &self.workload,
             RenderDebugPage::Passes => &self.passes,
             RenderDebugPage::Materials => &self.materials,
         }
@@ -192,6 +316,45 @@ struct RenderTargetStats {
     total_target_pixels: u64,
     actual_msaa_samples: u32,
     xr_active: bool,
+}
+
+#[derive(SystemParam)]
+struct RenderDebugSceneData<'w, 's> {
+    meshes: Res<'w, Assets<Mesh>>,
+    materials: Res<'w, Assets<StandardMaterial>>,
+    images: Res<'w, Assets<Image>>,
+    renderables: Query<
+        'w,
+        's,
+        (
+            Entity,
+            &'static Mesh3d,
+            &'static MeshMaterial3d<StandardMaterial>,
+            &'static ViewVisibility,
+            Option<&'static NotShadowCaster>,
+        ),
+    >,
+    dynamic_shadow_markers: Query<'w, 's, (), With<DynamicShadowCaster>>,
+    imported_entities: Query<'w, 's, (), With<ImportedZevyEntity>>,
+    parents: Query<'w, 's, &'static ChildOf>,
+    point_lights: Query<'w, 's, &'static PointLight>,
+    spot_lights: Query<'w, 's, &'static SpotLight>,
+    directional_lights: Query<'w, 's, &'static DirectionalLight>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FrameTimeSample {
+    timestamp_seconds: f64,
+    frame_ms: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FrameTimePercentiles {
+    p50_ms: f64,
+    p95_ms: f64,
+    p99_ms: f64,
+    sample_count: usize,
+    window_seconds: f64,
 }
 
 #[derive(Component)]
@@ -342,20 +505,14 @@ fn update_debug_snapshot(
     shadow_cache_frame: Res<ZevyShadowCacheFrame>,
     xr_session_config: Option<Res<OxrCurrentSessionConfig>>,
     camera_views: Query<(&Camera, &Msaa, Option<&XrCamera>), With<Camera3d>>,
-    meshes: Res<Assets<Mesh>>,
-    materials: Res<Assets<StandardMaterial>>,
-    images: Res<Assets<Image>>,
-    renderables: Query<(
-        &Mesh3d,
-        &MeshMaterial3d<StandardMaterial>,
-        &ViewVisibility,
-        Option<&NotShadowCaster>,
-    )>,
-    point_lights: Query<&PointLight>,
-    spot_lights: Query<&SpotLight>,
-    directional_lights: Query<&DirectionalLight>,
+    scene_data: RenderDebugSceneData,
     mut snapshot: ResMut<RenderDebugSnapshot>,
 ) {
+    record_frame_time_sample(
+        &mut snapshot.frame_history,
+        time.elapsed().as_secs_f64(),
+        time.delta().as_secs_f64() * 1_000.0,
+    );
     snapshot.elapsed_since_update += time.delta_secs();
     if !state.visible && !snapshot.overview.is_empty() {
         return;
@@ -369,6 +526,7 @@ fn update_debug_snapshot(
     let fps = diagnostic_value(&diagnostics, &FrameTimeDiagnosticsPlugin::FPS).unwrap_or(0.0);
     let frame_ms = diagnostic_value(&diagnostics, &FrameTimeDiagnosticsPlugin::FRAME_TIME)
         .unwrap_or_else(|| if fps > 0.0 { 1_000.0 / fps } else { 0.0 });
+    let frame_percentiles = frame_time_percentiles(&snapshot.frame_history);
     let entity_count = diagnostic_value(&diagnostics, &EntityCountDiagnosticsPlugin::ENTITY_COUNT)
         .unwrap_or(0.0) as u64;
     let process_cpu = diagnostic_value(
@@ -381,13 +539,16 @@ fn update_debug_snapshot(
     );
 
     let scene = collect_scene_stats(
-        &meshes,
-        &materials,
-        &images,
-        &renderables,
-        &point_lights,
-        &spot_lights,
-        &directional_lights,
+        &scene_data.meshes,
+        &scene_data.materials,
+        &scene_data.images,
+        &scene_data.renderables,
+        &scene_data.dynamic_shadow_markers,
+        &scene_data.imported_entities,
+        &scene_data.parents,
+        &scene_data.point_lights,
+        &scene_data.spot_lights,
+        &scene_data.directional_lights,
     );
 
     let pass_metric = if support.timestamp_query && support.timestamp_inside_passes {
@@ -397,6 +558,7 @@ fn update_debug_snapshot(
     };
     let pass_rows = collect_render_metric_rows(&diagnostics, pass_metric, fps);
     let total_pass_ms = pass_rows.iter().map(|row| row.value_per_frame).sum::<f64>();
+    let workload = collect_render_workload(&diagnostics, pass_metric, fps);
     let gpu_primitives = collect_render_metric_total(&diagnostics, "clipper_primitives_out", fps);
     let fragment_invocations =
         collect_render_metric_total(&diagnostics, "fragment_shader_invocations", fps);
@@ -406,10 +568,13 @@ fn update_debug_snapshot(
         quality.resolved_msaa().samples(),
     );
     let shadow_cache = shadow_cache_frame.telemetry();
-    let dynamic_overlay_enabled = quality.persistent_point_shadow_cache
+    let dynamic_overlay_enabled = quality.point_light_shadows
+        && quality.persistent_point_shadow_cache
         && quality.scalable_point_lighting
         && quality.dynamic_shadow_caster_overlay;
-    let point_shadow_policy = if quality.max_shadowed_point_lights == 0 {
+    let point_shadow_policy = if !quality.point_light_shadows {
+        "disabled by fixed A/B profile".to_owned()
+    } else if quality.max_shadowed_point_lights == 0 {
         "all level-enabled lights".to_owned()
     } else {
         format!("cap {} lights", quality.max_shadowed_point_lights)
@@ -420,9 +585,11 @@ fn update_debug_snapshot(
     let bottleneck = bottleneck_hint(
         frame_ms,
         &scene,
+        &workload,
         top_pass,
         total_pass_ms,
         using_gpu_timestamps,
+        cfg!(target_os = "android"),
     );
 
     let mut overview = String::with_capacity(1_800);
@@ -441,6 +608,17 @@ fn update_debug_snapshot(
         "FPS {:>6.1}    Frame {:>6.2} ms    Entities {}",
         fps, frame_ms, entity_count
     );
+    if let Some(percentiles) = frame_percentiles {
+        let _ = writeln!(
+            overview,
+            "Frame P50/P95/P99  {:>5.1} / {:>5.1} / {:>5.1} ms  ({}f/{:.0}s)",
+            percentiles.p50_ms,
+            percentiles.p95_ms,
+            percentiles.p99_ms,
+            percentiles.sample_count,
+            percentiles.window_seconds,
+        );
+    }
     if let Some(cpu) = process_cpu {
         let _ = write!(overview, "Process CPU {:>5.1}%", cpu);
     }
@@ -455,6 +633,11 @@ fn update_debug_snapshot(
     );
     let _ = writeln!(
         overview,
+        "PointLight A/B    {}",
+        quality.point_light_ab_profile_label()
+    );
+    let _ = writeln!(
+        overview,
         "Clusters          {:>4} / {:>2}z / {:>4.0}m",
         quality.resolved_cluster_total(),
         quality.resolved_cluster_z_slices(),
@@ -462,20 +645,23 @@ fn update_debug_snapshot(
     );
     let _ = writeln!(
         overview,
-        "Point shadows     {:>4} resident / {:>4}px",
+        "Shadow-enabled    {:>4} @ {:>4}px",
         scene.shadowed_point_lights,
         quality.resolved_point_shadow_map_size(),
     );
     let _ = writeln!(
         overview,
-        "Shadow cache      {:>4} / draw {:>2} reuse {:>2}",
+        "Cache faces R/D/U {:>4} / {:>2} / {:>2}",
+        shadow_cache.resident_views, shadow_cache.rendered_views, shadow_cache.reused_views,
+    );
+    let _ = writeln!(
+        overview,
+        "Shadow cache mode {:>4}",
         if quality.persistent_point_shadow_cache {
             "ON"
         } else {
             "OFF"
         },
-        shadow_cache.rendered_views,
-        shadow_cache.reused_views,
     );
     let _ = writeln!(
         overview,
@@ -546,6 +732,11 @@ fn update_debug_snapshot(
     );
     let _ = writeln!(
         overview,
+        "Batch savings est    {:>10}",
+        format_count(scene.estimated_instance_savings)
+    );
+    let _ = writeln!(
+        overview,
         "Materials visible   {:>10}",
         scene.unique_materials
     );
@@ -553,6 +744,12 @@ fn update_debug_snapshot(
         overview,
         "Shadow views est    {:>10}",
         scene.estimated_shadow_views
+    );
+    let _ = writeln!(
+        overview,
+        "Caster tris S / D   {:>9} / {}",
+        format_count(scene.static_shadow_caster_triangles),
+        format_count(scene.dynamic_shadow_caster_triangles),
     );
     if let Some(primitives) = gpu_primitives {
         let _ = writeln!(
@@ -592,15 +789,187 @@ fn update_debug_snapshot(
             row.label, row.value_per_frame, percentage
         );
     }
+    if let Some((class, class_stats)) = workload.top_timing() {
+        let percentage = if workload.total_timing_ms > 0.0 {
+            class_stats.timing_ms / workload.total_timing_ms * 100.0
+        } else {
+            0.0
+        };
+        let _ = writeln!(
+            overview,
+            "Top workload: {}  {:.2} ms ({:.0}%)",
+            class.label(),
+            class_stats.timing_ms,
+            percentage,
+        );
+    }
     let _ = writeln!(
         overview,
         "Pass timing source: {}",
         if pass_metric == "elapsed_gpu" {
-            "GPU timestamps"
+            if cfg!(target_os = "android") {
+                "GPU timestamps (instrumented spans only)"
+            } else {
+                "GPU timestamps"
+            }
         } else {
             "CPU command recording fallback"
         }
     );
+
+    let mut workload_page = String::with_capacity(3_200);
+    let _ = writeln!(
+        workload_page,
+        "ZEVY RENDER DEBUG  |  {}",
+        RenderDebugPage::Workload.label()
+    );
+    let _ = writeln!(
+        workload_page,
+        "A/B: {}",
+        quality.point_light_ab_profile_label()
+    );
+    let _ = writeln!(
+        workload_page,
+        "Timing: {}    Counters: {}",
+        if using_gpu_timestamps {
+            if cfg!(target_os = "android") {
+                "GPU spans (partial)"
+            } else {
+                "GPU"
+            }
+        } else {
+            "CPU fallback"
+        },
+        if support.pipeline_statistics {
+            "GPU pipeline"
+        } else {
+            "N/A on this adapter"
+        },
+    );
+    let _ = writeln!(
+        workload_page,
+        "------------------------------------------------------------"
+    );
+    let _ = writeln!(
+        workload_page,
+        "Category              ms     %       VS       Prim      Frag"
+    );
+    for class in RenderWorkloadClass::ALL {
+        let stats = workload.stats(class);
+        let percentage = if workload.total_timing_ms > 0.0 {
+            stats.timing_ms / workload.total_timing_ms * 100.0
+        } else {
+            0.0
+        };
+        let _ = writeln!(
+            workload_page,
+            "{:<18} {:>6.2} {:>5.1} {:>9} {:>9} {:>9}",
+            class.label(),
+            stats.timing_ms,
+            percentage,
+            format_optional_compact_count(stats.vertex_invocations),
+            format_optional_compact_count(stats.clipper_primitives_out),
+            format_optional_compact_count(stats.fragment_invocations),
+        );
+    }
+    let _ = writeln!(
+        workload_page,
+        "------------------------------------------------------------"
+    );
+    let main_workload = workload.stats(RenderWorkloadClass::Main3d);
+    if let Some(main_fragments) = main_workload.fragment_invocations
+        && target_stats.total_target_pixels > 0
+    {
+        let _ = writeln!(
+            workload_page,
+            "Main fragment / target px   {:>8.2}",
+            main_fragments / target_stats.total_target_pixels as f64,
+        );
+    }
+    if let (Some(main_fragments), Some(main_primitives)) = (
+        main_workload.fragment_invocations,
+        main_workload.clipper_primitives_out,
+    ) && main_primitives > 0.0
+    {
+        let _ = writeln!(
+            workload_page,
+            "Main fragment / primitive   {:>8.2}  (coverage proxy)",
+            main_fragments / main_primitives,
+        );
+    }
+    let static_triangle_upper_bound = scene
+        .static_shadow_caster_triangles
+        .saturating_mul(shadow_cache.rendered_views);
+    let dynamic_triangle_upper_bound = scene
+        .dynamic_shadow_caster_triangles
+        .saturating_mul(shadow_cache.dynamic_views_rendered);
+    let shadow_face_texels = (quality.resolved_point_shadow_map_size() as u64).saturating_pow(2);
+    let updated_shadow_texels = shadow_cache
+        .rendered_views
+        .saturating_add(shadow_cache.dynamic_views_rendered)
+        .saturating_mul(shadow_face_texels);
+    let _ = writeln!(
+        workload_page,
+        "Visible verts / tris       {:>9} / {}",
+        format_count(scene.visible_vertices),
+        format_count(scene.visible_triangles),
+    );
+    let _ = writeln!(
+        workload_page,
+        "Main entities O/T          {:>9} / {}",
+        scene.visible_opaque_entities, scene.visible_transparent_entities,
+    );
+    let _ = writeln!(
+        workload_page,
+        "Main draws O/T est         {:>9} / {}",
+        scene.estimated_opaque_draws, scene.estimated_transparent_draws,
+    );
+    let _ = writeln!(
+        workload_page,
+        "Batch savings est          {:>9}",
+        scene.estimated_instance_savings,
+    );
+    let _ = writeln!(
+        workload_page,
+        "Loaded casters S/D         {:>9} / {} entities",
+        scene.static_shadow_caster_entities, scene.dynamic_shadow_caster_entities,
+    );
+    let _ = writeln!(
+        workload_page,
+        "Loaded caster tris S/D     {:>9} / {}",
+        format_count(scene.static_shadow_caster_triangles),
+        format_count(scene.dynamic_shadow_caster_triangles),
+    );
+    let _ = writeln!(
+        workload_page,
+        "Updated faces static/dyn   {:>9} / {}",
+        shadow_cache.rendered_views, shadow_cache.dynamic_views_rendered,
+    );
+    let _ = writeln!(
+        workload_page,
+        "Caster tri upper bound S/D {:>9} / {}",
+        format_count(static_triangle_upper_bound),
+        format_count(dynamic_triangle_upper_bound),
+    );
+    let _ = writeln!(
+        workload_page,
+        "Updated shadow texels      {:>9}",
+        format_count(updated_shadow_texels),
+    );
+    let _ = writeln!(
+        workload_page,
+        "------------------------------------------------------------"
+    );
+    let _ = writeln!(
+        workload_page,
+        "GPU rows include all eyes. Caster upper bound is before face frustum culling."
+    );
+    if !support.pipeline_statistics {
+        let _ = writeln!(
+            workload_page,
+            "Use AGI/vendor capture for exact Android VS/primitive/fragment counters."
+        );
+    }
 
     let mut passes = String::with_capacity(2_500);
     let _ = writeln!(
@@ -623,7 +992,11 @@ fn update_debug_snapshot(
         passes,
         "Timing source: {}    Recorded total: {:.2} ms/frame",
         if pass_metric == "elapsed_gpu" {
-            "GPU"
+            if cfg!(target_os = "android") {
+                "GPU spans (partial; use runtime/AGI for frame total)"
+            } else {
+                "GPU"
+            }
         } else {
             "CPU fallback"
         },
@@ -758,6 +1131,20 @@ fn update_debug_snapshot(
     );
     let _ = writeln!(
         material_page,
+        "Point direct / shadows      {} / {}",
+        if quality.point_light_direct_lighting {
+            "ON"
+        } else {
+            "OFF (compiled)"
+        },
+        if quality.point_light_shadows {
+            "ON"
+        } else {
+            "OFF (fixed A/B)"
+        },
+    );
+    let _ = writeln!(
+        material_page,
         "Point shadow face           {} x {} px",
         quality.resolved_point_shadow_map_size(),
         quality.resolved_point_shadow_map_size(),
@@ -810,13 +1197,15 @@ fn update_debug_snapshot(
     let _ = writeln!(
         material_page,
         "Scalable PointLight path    {}",
-        if quality.scalable_point_lighting {
+        if !quality.point_light_direct_lighting && quality.scalable_point_lighting {
+            "compiled out for fixed A/B"
+        } else if quality.scalable_point_lighting {
             "Hero + stochastic tail"
         } else {
             "Bevy deterministic"
         }
     );
-    if quality.scalable_point_lighting {
+    if quality.scalable_point_lighting && quality.point_light_direct_lighting {
         let hero_lights = quality.resolved_point_light_hero_samples() as usize;
         let tail_samples = quality.resolved_point_light_tail_samples() as usize;
         let bounded_evaluations = hero_lights.saturating_add(tail_samples);
@@ -852,6 +1241,7 @@ fn update_debug_snapshot(
     );
 
     snapshot.overview = overview;
+    snapshot.workload = workload_page;
     snapshot.passes = passes;
     snapshot.materials = material_page;
 }
@@ -915,12 +1305,80 @@ fn diagnostic_value(
         .and_then(|diagnostic| diagnostic.smoothed())
 }
 
+fn record_frame_time_sample(
+    history: &mut VecDeque<FrameTimeSample>,
+    timestamp_seconds: f64,
+    frame_ms: f64,
+) {
+    if !timestamp_seconds.is_finite() || !frame_ms.is_finite() || frame_ms <= 0.0 {
+        return;
+    }
+    if history
+        .back()
+        .is_some_and(|sample| sample.timestamp_seconds > timestamp_seconds)
+    {
+        history.clear();
+    }
+    history.push_back(FrameTimeSample {
+        timestamp_seconds,
+        frame_ms,
+    });
+    let oldest_allowed = timestamp_seconds - FRAME_HISTORY_SECONDS;
+    while history
+        .front()
+        .is_some_and(|sample| sample.timestamp_seconds < oldest_allowed)
+    {
+        history.pop_front();
+    }
+}
+
+fn frame_time_percentiles(history: &VecDeque<FrameTimeSample>) -> Option<FrameTimePercentiles> {
+    if history.is_empty() {
+        return None;
+    }
+    let mut values = history
+        .iter()
+        .map(|sample| sample.frame_ms)
+        .collect::<Vec<_>>();
+    values.sort_by(f64::total_cmp);
+    let first_timestamp = history.front()?.timestamp_seconds;
+    let last_timestamp = history.back()?.timestamp_seconds;
+    Some(FrameTimePercentiles {
+        p50_ms: percentile_sorted(&values, 0.50),
+        p95_ms: percentile_sorted(&values, 0.95),
+        p99_ms: percentile_sorted(&values, 0.99),
+        sample_count: values.len(),
+        window_seconds: (last_timestamp - first_timestamp).max(0.0),
+    })
+}
+
+fn percentile_sorted(values: &[f64], quantile: f64) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let position = quantile.clamp(0.0, 1.0) * (values.len() - 1) as f64;
+    let lower = position.floor() as usize;
+    let upper = position.ceil() as usize;
+    let fraction = position - lower as f64;
+    values[lower] + (values[upper] - values[lower]) * fraction
+}
+
 #[derive(Default)]
 struct SceneRenderStats {
     visible_mesh_entities: u64,
+    visible_opaque_entities: u64,
+    visible_transparent_entities: u64,
     unique_meshes: usize,
+    visible_vertices: u64,
     visible_triangles: u64,
+    estimated_opaque_draws: u64,
+    estimated_transparent_draws: u64,
     estimated_main_draws: u64,
+    estimated_instance_savings: u64,
+    static_shadow_caster_entities: u64,
+    dynamic_shadow_caster_entities: u64,
+    static_shadow_caster_triangles: u64,
+    dynamic_shadow_caster_triangles: u64,
     unique_materials: usize,
     material_texture_slots: u64,
     average_texture_slots: f64,
@@ -945,11 +1403,15 @@ fn collect_scene_stats(
     materials: &Assets<StandardMaterial>,
     images: &Assets<Image>,
     renderables: &Query<(
+        Entity,
         &Mesh3d,
         &MeshMaterial3d<StandardMaterial>,
         &ViewVisibility,
         Option<&NotShadowCaster>,
     )>,
+    dynamic_shadow_markers: &Query<(), With<DynamicShadowCaster>>,
+    imported_entities: &Query<(), With<ImportedZevyEntity>>,
+    parents: &Query<&ChildOf>,
     point_lights: &Query<&PointLight>,
     spot_lights: &Query<&SpotLight>,
     directional_lights: &Query<&DirectionalLight>,
@@ -959,9 +1421,23 @@ fn collect_scene_stats(
     let mut unique_materials = HashSet::new();
     let mut opaque_draw_keys = HashSet::new();
     let mut transparent_draws = 0_u64;
-    let mut material_usage = HashMap::new();
 
-    for (mesh_handle, material_handle, view_visibility, _not_shadow_caster) in renderables.iter() {
+    for (entity, mesh_handle, material_handle, view_visibility, not_shadow_caster) in
+        renderables.iter()
+    {
+        let mesh = meshes.get(mesh_handle.0.id());
+        let mesh_triangles = mesh.map(mesh_triangle_count).unwrap_or_default();
+        if not_shadow_caster.is_none() {
+            if is_dynamic_shadow_caster(entity, dynamic_shadow_markers, imported_entities, parents)
+            {
+                stats.dynamic_shadow_caster_entities += 1;
+                stats.dynamic_shadow_caster_triangles += mesh_triangles;
+            } else {
+                stats.static_shadow_caster_entities += 1;
+                stats.static_shadow_caster_triangles += mesh_triangles;
+            }
+        }
+
         if !view_visibility.get() {
             continue;
         }
@@ -971,10 +1447,10 @@ fn collect_scene_stats(
         let material_id = material_handle.0.id();
         unique_meshes.insert(mesh_id);
         unique_materials.insert(material_id);
-        *material_usage.entry(material_id).or_insert(0_u64) += 1;
 
-        if let Some(mesh) = meshes.get(mesh_id) {
-            stats.visible_triangles += mesh_triangle_count(mesh);
+        if let Some(mesh) = mesh {
+            stats.visible_vertices += mesh.count_vertices() as u64;
+            stats.visible_triangles += mesh_triangles;
         }
 
         let is_blended = materials.get(material_id).is_some_and(|material| {
@@ -984,15 +1460,22 @@ fn collect_scene_stats(
             )
         });
         if is_blended {
+            stats.visible_transparent_entities += 1;
             transparent_draws += 1;
         } else {
+            stats.visible_opaque_entities += 1;
             opaque_draw_keys.insert((mesh_id, material_id));
         }
     }
 
     stats.unique_meshes = unique_meshes.len();
     stats.unique_materials = unique_materials.len();
-    stats.estimated_main_draws = opaque_draw_keys.len() as u64 + transparent_draws;
+    stats.estimated_opaque_draws = opaque_draw_keys.len() as u64;
+    stats.estimated_transparent_draws = transparent_draws;
+    stats.estimated_main_draws = stats.estimated_opaque_draws + stats.estimated_transparent_draws;
+    stats.estimated_instance_savings = stats
+        .visible_mesh_entities
+        .saturating_sub(stats.estimated_main_draws);
 
     for material_id in unique_materials {
         let Some(material) = materials.get(material_id) else {
@@ -1080,6 +1563,168 @@ struct RenderMetricRow {
     value_per_frame: f64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(usize)]
+enum RenderWorkloadClass {
+    Main3d = 0,
+    Visibility = 1,
+    StaticShadow = 2,
+    DynamicShadow = 3,
+    PostProcess = 4,
+    Ui = 5,
+    Other = 6,
+}
+
+impl RenderWorkloadClass {
+    const ALL: [Self; 7] = [
+        Self::Main3d,
+        Self::Visibility,
+        Self::StaticShadow,
+        Self::DynamicShadow,
+        Self::PostProcess,
+        Self::Ui,
+        Self::Other,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Main3d => "Main 3D",
+            Self::Visibility => "Depth / visibility",
+            Self::StaticShadow => "Static shadow",
+            Self::DynamicShadow => "Dynamic shadow",
+            Self::PostProcess => "Post-process",
+            Self::Ui => "UI / debug",
+            Self::Other => "Other / compute",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct RenderWorkloadClassStats {
+    timing_ms: f64,
+    vertex_invocations: Option<f64>,
+    clipper_invocations: Option<f64>,
+    clipper_primitives_out: Option<f64>,
+    fragment_invocations: Option<f64>,
+    compute_invocations: Option<f64>,
+}
+
+#[derive(Debug, Default)]
+struct RenderWorkloadBreakdown {
+    classes: [RenderWorkloadClassStats; 7],
+    total_timing_ms: f64,
+}
+
+impl RenderWorkloadBreakdown {
+    fn stats(&self, class: RenderWorkloadClass) -> &RenderWorkloadClassStats {
+        &self.classes[class as usize]
+    }
+
+    fn stats_mut(&mut self, class: RenderWorkloadClass) -> &mut RenderWorkloadClassStats {
+        &mut self.classes[class as usize]
+    }
+
+    fn top_timing(&self) -> Option<(RenderWorkloadClass, &RenderWorkloadClassStats)> {
+        RenderWorkloadClass::ALL
+            .into_iter()
+            .map(|class| (class, self.stats(class)))
+            .filter(|(_, stats)| stats.timing_ms > 0.0)
+            .max_by(|(_, left), (_, right)| left.timing_ms.total_cmp(&right.timing_ms))
+    }
+}
+
+#[derive(Clone, Copy)]
+enum RenderCounterKind {
+    Vertex,
+    Clipper,
+    Primitive,
+    Fragment,
+    Compute,
+}
+
+fn collect_render_workload(
+    diagnostics: &DiagnosticsStore,
+    timing_metric: &str,
+    fps: f64,
+) -> RenderWorkloadBreakdown {
+    let mut breakdown = RenderWorkloadBreakdown::default();
+    for row in collect_render_metric_rows(diagnostics, timing_metric, fps) {
+        let stats = breakdown.stats_mut(classify_render_pass(&row.label));
+        stats.timing_ms += row.value_per_frame;
+        breakdown.total_timing_ms += row.value_per_frame;
+    }
+
+    for (metric, kind) in [
+        ("vertex_shader_invocations", RenderCounterKind::Vertex),
+        ("clipper_invocations", RenderCounterKind::Clipper),
+        ("clipper_primitives_out", RenderCounterKind::Primitive),
+        ("fragment_shader_invocations", RenderCounterKind::Fragment),
+        ("compute_shader_invocations", RenderCounterKind::Compute),
+    ] {
+        for row in collect_render_metric_rows(diagnostics, metric, fps) {
+            let stats = breakdown.stats_mut(classify_render_pass(&row.label));
+            let destination = match kind {
+                RenderCounterKind::Vertex => &mut stats.vertex_invocations,
+                RenderCounterKind::Clipper => &mut stats.clipper_invocations,
+                RenderCounterKind::Primitive => &mut stats.clipper_primitives_out,
+                RenderCounterKind::Fragment => &mut stats.fragment_invocations,
+                RenderCounterKind::Compute => &mut stats.compute_invocations,
+            };
+            *destination = Some(destination.unwrap_or_default() + row.value_per_frame);
+        }
+    }
+
+    breakdown
+}
+
+fn classify_render_pass(label: &str) -> RenderWorkloadClass {
+    let label = label.to_ascii_lowercase();
+    if label.contains("dynamic point shadow") || label.contains("dynamic shadow") {
+        return RenderWorkloadClass::DynamicShadow;
+    }
+    if label.contains("shadow") {
+        return RenderWorkloadClass::StaticShadow;
+    }
+    if label.contains("prepass")
+        || label.contains("depth pre")
+        || label.contains("visibility buffer")
+        || label.contains("occlusion")
+        || label.contains("meshlet")
+    {
+        return RenderWorkloadClass::Visibility;
+    }
+    if label.contains("main_opaque")
+        || label.contains("main transparent")
+        || label.contains("main_transparent")
+        || label.contains("opaque_pass_3d")
+        || label.contains("transparent_pass_3d")
+        || label.contains("transmissive")
+        || label.contains("deferred")
+    {
+        return RenderWorkloadClass::Main3d;
+    }
+    if label.contains("ui") || label.contains("egui") || label.contains("gizmo") {
+        return RenderWorkloadClass::Ui;
+    }
+    if label.contains("bloom")
+        || label.contains("tonemap")
+        || label.contains("upscal")
+        || label.contains("fxaa")
+        || label.contains("smaa")
+        || label.contains("taa")
+        || label.contains("motion blur")
+        || label.contains("motion_blur")
+        || label.contains("depth of field")
+        || label.contains("depth_of_field")
+        || label.contains("chromatic")
+        || label.contains("ssao")
+        || label.contains("screen space")
+    {
+        return RenderWorkloadClass::PostProcess;
+    }
+    RenderWorkloadClass::Other
+}
+
 fn collect_render_metric_rows(
     diagnostics: &DiagnosticsStore,
     metric: &str,
@@ -1153,15 +1798,44 @@ fn clean_render_path(path: &str, suffix: &str) -> String {
 fn bottleneck_hint(
     frame_ms: f64,
     scene: &SceneRenderStats,
+    workload: &RenderWorkloadBreakdown,
     top_pass: Option<&RenderMetricRow>,
     total_pass_ms: f64,
     using_gpu_timestamps: bool,
+    timestamps_may_be_partial: bool,
 ) -> &'static str {
     if frame_ms <= 0.0 {
         return "collecting samples";
     }
     if using_gpu_timestamps && total_pass_ms > 0.0 && total_pass_ms < frame_ms * 0.55 {
+        if timestamps_may_be_partial {
+            return "external/runtime GPU timing required; mobile pass timestamps are partial";
+        }
         return "CPU, asset streaming or frame pacing; measured GPU passes are below frame time";
+    }
+    if let Some((class, stats)) = workload.top_timing() {
+        let share = if workload.total_timing_ms > 0.0 {
+            stats.timing_ms / workload.total_timing_ms
+        } else {
+            0.0
+        };
+        if share >= 0.30
+            && matches!(
+                class,
+                RenderWorkloadClass::StaticShadow | RenderWorkloadClass::DynamicShadow
+            )
+        {
+            return "shadow projection/update; inspect updated faces, caster geometry and cache reuse";
+        }
+        if share >= 0.40 && class == RenderWorkloadClass::Main3d {
+            return "main 3D shading; compare direct-only vs geometry floor and fragment/primitive";
+        }
+        if share >= 0.35 && class == RenderWorkloadClass::Visibility {
+            return "visibility/depth geometry; inspect duplicated views and submitted caster/main meshes";
+        }
+        if share >= 0.35 && class == RenderWorkloadClass::PostProcess {
+            return "post-processing / render-target bandwidth; compare scale and MSAA tiers";
+        }
     }
     if let Some(top_pass) = top_pass {
         let share = if total_pass_ms > 0.0 {
@@ -1171,7 +1845,7 @@ fn bottleneck_hint(
         };
         let label = top_pass.label.to_ascii_lowercase();
         if share >= 0.35 && label.contains("shadow") {
-            return "GPU shadow rendering; reduce shadowed lights/range/casters";
+            return "shadow rendering; inspect updated faces, caster geometry and cache reuse";
         }
         if share >= 0.45 && (label.contains("opaque") || label.contains("transparent")) {
             return "main 3D pass; inspect fill-rate, materials and geometry";
@@ -1215,6 +1889,106 @@ fn format_count(value: u64) -> String {
     output
 }
 
+fn format_optional_compact_count(value: Option<f64>) -> String {
+    let Some(value) = value else {
+        return "N/A".to_owned();
+    };
+    let value = value.max(0.0);
+    if value >= 1_000_000_000.0 {
+        format!("{:.2}G", value / 1_000_000_000.0)
+    } else if value >= 1_000_000.0 {
+        format!("{:.2}M", value / 1_000_000.0)
+    } else if value >= 1_000.0 {
+        format!("{:.1}K", value / 1_000.0)
+    } else {
+        format!("{value:.0}")
+    }
+}
+
 fn yes_no(value: bool) -> &'static str {
     if value { "YES" } else { "NO" }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_pass_classifier_separates_main_and_shadow_layers() {
+        assert_eq!(
+            classify_render_pass("main_opaque_pass_3d"),
+            RenderWorkloadClass::Main3d
+        );
+        assert_eq!(
+            classify_render_pass("shadow pass point light 3 +x"),
+            RenderWorkloadClass::StaticShadow
+        );
+        assert_eq!(
+            classify_render_pass("dynamic point shadow 12v1 face 5"),
+            RenderWorkloadClass::DynamicShadow
+        );
+        assert_eq!(
+            classify_render_pass("prepass_3d"),
+            RenderWorkloadClass::Visibility
+        );
+        assert_eq!(
+            classify_render_pass("bloom_downsample"),
+            RenderWorkloadClass::PostProcess
+        );
+    }
+
+    #[test]
+    fn frame_history_reports_interpolated_percentiles_and_evicts_old_samples() {
+        let mut history = VecDeque::new();
+        for (timestamp, frame_ms) in [(0.0, 10.0), (1.0, 20.0), (2.0, 30.0), (3.0, 40.0)] {
+            record_frame_time_sample(&mut history, timestamp, frame_ms);
+        }
+        let percentiles = frame_time_percentiles(&history).unwrap();
+        assert!((percentiles.p50_ms - 25.0).abs() < 0.001);
+        assert!((percentiles.p95_ms - 38.5).abs() < 0.001);
+        assert!((percentiles.p99_ms - 39.7).abs() < 0.001);
+
+        record_frame_time_sample(&mut history, FRAME_HISTORY_SECONDS + 1.0, 50.0);
+        assert_eq!(history.front().unwrap().timestamp_seconds, 1.0);
+        assert_eq!(history.back().unwrap().frame_ms, 50.0);
+    }
+
+    #[test]
+    fn hud_page_cycle_includes_workload_breakdown() {
+        assert_eq!(RenderDebugPage::Overview.next(), RenderDebugPage::Workload);
+        assert_eq!(RenderDebugPage::Workload.next(), RenderDebugPage::Passes);
+        assert_eq!(RenderDebugPage::Passes.next(), RenderDebugPage::Materials);
+        assert_eq!(RenderDebugPage::Materials.next(), RenderDebugPage::Overview);
+    }
+
+    #[test]
+    fn debug_page_labels_support_argv_and_android_property_values() {
+        assert_eq!(
+            debug_page_from_label("workload"),
+            Some(RenderDebugPage::Workload)
+        );
+        assert_eq!(
+            debug_page_from_label(" PASSES "),
+            Some(RenderDebugPage::Passes)
+        );
+        assert_eq!(debug_page_from_label("invalid"), None);
+        assert_eq!(parse_debug_bool("ON"), Some(true));
+        assert_eq!(parse_debug_bool("0"), Some(false));
+        assert_eq!(parse_debug_bool("maybe"), None);
+    }
+
+    #[test]
+    fn partial_mobile_gpu_spans_do_not_claim_a_cpu_bottleneck() {
+        let scene = SceneRenderStats::default();
+        let workload = RenderWorkloadBreakdown::default();
+
+        assert_eq!(
+            bottleneck_hint(30.0, &scene, &workload, None, 1.0, true, true),
+            "external/runtime GPU timing required; mobile pass timestamps are partial"
+        );
+        assert_eq!(
+            bottleneck_hint(30.0, &scene, &workload, None, 1.0, true, false),
+            "CPU, asset streaming or frame pacing; measured GPU passes are below frame time"
+        );
+    }
 }

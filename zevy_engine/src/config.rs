@@ -31,6 +31,15 @@ pub struct RenderQualityConfig {
     /// Constant clustered-lighting far distance, in meters. This is separate
     /// from each light's physical illumination range.
     pub cluster_far_z_m: f32,
+    /// Fixed A/B switch for PointLight direct shading. With Zevy's scalable
+    /// shader this is compiled out, so `false` measures the geometry/post and
+    /// shadow-submission floor without paying the per-fragment PointLight loop.
+    /// It is never changed from camera distance or independently per eye.
+    pub point_light_direct_lighting: bool,
+    /// Fixed A/B and quality-tier switch for imported PointLight shadows.
+    /// `false` disables shadow residency for the Map_S03B test profile without
+    /// changing physical light ranges or making shadows camera dependent.
+    pub point_light_shadows: bool,
     /// Replaces Bevy's unbounded per-cluster PointLight BRDF loop with Zevy's
     /// fixed-budget Hero + importance-sampled tail path.
     pub scalable_point_lighting: bool,
@@ -38,7 +47,8 @@ pub struct RenderQualityConfig {
     /// at each shading point, independent of camera-to-light distance.
     pub point_light_hero_samples: u32,
     /// Maximum number of remaining PointLights whose full shadowed BRDF is
-    /// importance sampled per shading point.
+    /// importance sampled per shading point. `0` is an explicit A/B/quality
+    /// tier that evaluates only deterministic Hero lights.
     pub point_light_tail_samples: u32,
     /// Allows the stochastic tail selection to rotate over time. Disabled by
     /// default for VR so lighting and shadows remain anchored in world space.
@@ -75,6 +85,8 @@ impl Default for RenderQualityConfig {
             cluster_z_slices: 24,
             cluster_first_slice_depth_m: 4.0,
             cluster_far_z_m: 128.0,
+            point_light_direct_lighting: true,
+            point_light_shadows: true,
             scalable_point_lighting: true,
             point_light_hero_samples: 2,
             point_light_tail_samples: 2,
@@ -115,10 +127,21 @@ impl RenderQualityConfig {
     }
 
     pub(crate) fn resolved_point_shadow_resident_count(self, enabled_count: usize) -> usize {
-        if self.max_shadowed_point_lights == 0 {
+        if !self.point_light_shadows {
+            0
+        } else if self.max_shadowed_point_lights == 0 {
             enabled_count
         } else {
             enabled_count.min(self.max_shadowed_point_lights)
+        }
+    }
+
+    pub(crate) fn point_light_ab_profile_label(self) -> &'static str {
+        match (self.point_light_direct_lighting, self.point_light_shadows) {
+            (true, true) => "FULL: direct + shadows",
+            (true, false) => "DIRECT ONLY: shadows off",
+            (false, true) => "SHADOW SUBMISSION ONLY: direct shader off",
+            (false, false) => "GEOMETRY / POST FLOOR",
         }
     }
 
@@ -150,7 +173,7 @@ impl RenderQualityConfig {
     }
 
     pub(crate) fn resolved_point_light_tail_samples(self) -> u32 {
-        self.point_light_tail_samples.clamp(1, 8)
+        self.point_light_tail_samples.min(8)
     }
 
     pub(crate) fn resolved_point_light_hero_samples(self) -> u32 {
@@ -189,11 +212,17 @@ pub(crate) fn apply_render_quality_to_cameras(
 pub(crate) fn log_render_quality_config(config: Res<RenderQualityConfig>) {
     let resolved_scale = config.resolved_xr_render_scale();
     let resolved_msaa = config.resolved_msaa();
-    let point_shadow_policy = if config.max_shadowed_point_lights == 0 {
+    let point_shadow_policy = if !config.point_light_shadows {
+        "disabled by fixed A/B profile".to_owned()
+    } else if config.max_shadowed_point_lights == 0 {
         "all level-enabled lights".to_owned()
     } else {
         format!("up to {} lights", config.max_shadowed_point_lights)
     };
+    let dynamic_overlay_enabled = config.point_light_shadows
+        && config.persistent_point_shadow_cache
+        && config.scalable_point_lighting
+        && config.dynamic_shadow_caster_overlay;
 
     if config.msaa_samples != resolved_msaa.samples() {
         warn!(
@@ -208,11 +237,17 @@ pub(crate) fn log_render_quality_config(config: Res<RenderQualityConfig>) {
             config.xr_render_scale, resolved_scale
         );
     }
+    if !config.point_light_direct_lighting && !config.scalable_point_lighting {
+        warn!(
+            "RenderQualityConfig.point_light_direct_lighting=false only compiles out the PointLight fragment loop when scalable_point_lighting=true"
+        );
+    }
 
     info!(
-        "Render quality: XR scale {:.2}, MSAA {}x, point shadow residency {} at {}px, clusters {}/{}z to {:.1}m, scalable point lights {} ({} Hero + {} tail samples, {}), persistent shadow cache {} + dynamic overlay {} ({} Hz, {} light/frame)",
+        "Render quality: XR scale {:.2}, MSAA {}x, A/B {}, point shadow residency {} at {}px, clusters {}/{}z to {:.1}m, scalable point lights {} ({} Hero + {} tail samples, {}), persistent shadow cache {} + dynamic overlay {} ({} Hz, {} light/frame)",
         resolved_scale,
         resolved_msaa.samples(),
+        config.point_light_ab_profile_label(),
         point_shadow_policy,
         config.resolved_point_shadow_map_size(),
         config.resolved_cluster_total(),
@@ -238,11 +273,7 @@ pub(crate) fn log_render_quality_config(config: Res<RenderQualityConfig>) {
         } else {
             "off"
         },
-        if config.dynamic_shadow_caster_overlay {
-            "on"
-        } else {
-            "off"
-        },
+        if dynamic_overlay_enabled { "on" } else { "off" },
         config.resolved_cached_point_shadow_update_hz(),
         config.max_cached_point_shadow_updates_per_frame,
     );
@@ -257,6 +288,8 @@ mod tests {
         let quality = RenderQualityConfig::default();
         assert_eq!(quality.max_shadowed_point_lights, 0);
         assert_eq!(quality.resolved_point_shadow_resident_count(16), 16);
+        assert!(quality.point_light_direct_lighting);
+        assert!(quality.point_light_shadows);
         assert!(quality.dynamic_shadow_caster_overlay);
     }
 
@@ -268,5 +301,40 @@ mod tests {
         };
         assert_eq!(quality.resolved_point_shadow_resident_count(16), 7);
         assert_eq!(quality.resolved_point_shadow_resident_count(4), 4);
+    }
+
+    #[test]
+    fn point_light_ab_switches_form_a_stable_four_way_matrix() {
+        let full = RenderQualityConfig::default();
+        assert_eq!(
+            full.point_light_ab_profile_label(),
+            "FULL: direct + shadows"
+        );
+
+        let direct_only = RenderQualityConfig {
+            point_light_shadows: false,
+            ..full
+        };
+        assert_eq!(direct_only.resolved_point_shadow_resident_count(16), 0);
+        assert_eq!(
+            direct_only.point_light_ab_profile_label(),
+            "DIRECT ONLY: shadows off"
+        );
+
+        let floor = RenderQualityConfig {
+            point_light_direct_lighting: false,
+            point_light_shadows: false,
+            ..full
+        };
+        assert_eq!(
+            floor.point_light_ab_profile_label(),
+            "GEOMETRY / POST FLOOR"
+        );
+
+        let hero_only = RenderQualityConfig {
+            point_light_tail_samples: 0,
+            ..full
+        };
+        assert_eq!(hero_only.resolved_point_light_tail_samples(), 0);
     }
 }
