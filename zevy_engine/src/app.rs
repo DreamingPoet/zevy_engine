@@ -27,8 +27,9 @@ use crate::{
     input::EngineInputPlugin,
     platform,
     scalable_lighting::ScalableLightingPlugin,
-    scene::{ImportedLevelCameraFramed, ScenePlugin},
+    scene::{CurrentLevel, ImportedLevelCameraFramed, LevelId, ScenePlugin},
     shadow_cache::ShadowCachePlugin,
+    shadow_overlay::DynamicShadowOverlayPlugin,
     xr,
 };
 
@@ -132,6 +133,7 @@ pub fn run() {
         .add_systems(Startup, (log_launch_mode, log_render_quality_config))
         .add_systems(PostUpdate, apply_render_quality_to_cameras)
         .add_plugins(ScalableLightingPlugin)
+        .add_plugins(DynamicShadowOverlayPlugin)
         .add_plugins(ShadowCachePlugin)
         .add_plugins(EngineInputPlugin)
         .add_plugins(ScenePlugin);
@@ -212,9 +214,16 @@ fn screenshot_delay_from_args() -> Duration {
 fn capture_level_screenshot(
     mut commands: Commands,
     framed_cameras: Query<(), With<ImportedLevelCameraFramed>>,
+    cameras: Query<(), With<Camera3d>>,
+    current_level: Res<CurrentLevel>,
     mut request: ResMut<LevelScreenshotRequest>,
 ) {
-    if request.requested || request.captured || framed_cameras.is_empty() {
+    let camera_ready = match current_level.0.as_ref() {
+        Some(LevelId::Asset(_)) => !framed_cameras.is_empty(),
+        Some(_) => !cameras.is_empty(),
+        None => false,
+    };
+    if request.requested || request.captured || !camera_ready {
         return;
     }
 

@@ -3,7 +3,7 @@ use std::{
     collections::{HashMap, HashSet},
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
@@ -26,11 +26,14 @@ use bevy::{
     transform::TransformSystem,
 };
 
+use crate::shadow_overlay::{
+    DynamicPointShadowView, DynamicShadowCaster, DynamicShadowOverlayState,
+};
 use crate::{config::RenderQualityConfig, scene::ImportedZevyEntity};
 
 #[derive(Component, Debug, Default)]
 pub(crate) struct CachedPointLightShadow {
-    pub(crate) last_update_tick: Option<u64>,
+    pub(crate) last_update_seconds: Option<f32>,
 }
 
 #[derive(Clone, Default)]
@@ -39,6 +42,8 @@ struct ShadowCacheTelemetry {
     reused_views: Arc<AtomicU64>,
     resident_views: Arc<AtomicU64>,
     invalidated_lights: Arc<AtomicU64>,
+    dynamic_views_rendered: Arc<AtomicU64>,
+    dynamic_casters: Arc<AtomicU64>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -47,6 +52,8 @@ pub(crate) struct ShadowCacheTelemetrySnapshot {
     pub(crate) reused_views: u64,
     pub(crate) resident_views: u64,
     pub(crate) invalidated_lights: u64,
+    pub(crate) dynamic_views_rendered: u64,
+    pub(crate) dynamic_casters: u64,
 }
 
 impl ShadowCacheTelemetry {
@@ -66,7 +73,16 @@ impl ShadowCacheTelemetry {
             reused_views: self.reused_views.load(Ordering::Relaxed),
             resident_views: self.resident_views.load(Ordering::Relaxed),
             invalidated_lights: self.invalidated_lights.load(Ordering::Relaxed),
+            dynamic_views_rendered: self.dynamic_views_rendered.load(Ordering::Relaxed),
+            dynamic_casters: self.dynamic_casters.load(Ordering::Relaxed),
         }
+    }
+
+    fn store_dynamic(&self, rendered_views: usize, caster_count: usize) {
+        self.dynamic_views_rendered
+            .store(rendered_views as u64, Ordering::Relaxed);
+        self.dynamic_casters
+            .store(caster_count as u64, Ordering::Relaxed);
     }
 }
 
@@ -75,7 +91,9 @@ pub(crate) struct ZevyShadowCacheFrame {
     enabled: bool,
     warmup_frames: u8,
     point_shadow_map_size: usize,
+    dynamic_overlay_enabled: bool,
     cacheable_point_lights: Vec<Entity>,
+    dynamic_shadow_casters: Vec<Entity>,
     invalidated_point_lights: Vec<Entity>,
     invalidate_all: bool,
     telemetry: ShadowCacheTelemetry,
@@ -91,7 +109,11 @@ impl FromWorld for ZevyShadowCacheFrame {
             enabled: quality.persistent_point_shadow_cache,
             warmup_frames: quality.resolved_point_shadow_cache_warmup_frames(),
             point_shadow_map_size: quality.resolved_point_shadow_map_size(),
+            dynamic_overlay_enabled: quality.persistent_point_shadow_cache
+                && quality.scalable_point_lighting
+                && quality.dynamic_shadow_caster_overlay,
             cacheable_point_lights: Vec::new(),
+            dynamic_shadow_casters: Vec::new(),
             invalidated_point_lights: Vec::new(),
             invalidate_all: true,
             telemetry: ShadowCacheTelemetry::default(),
@@ -108,6 +130,27 @@ impl ZevyShadowCacheFrame {
 
     pub(crate) fn telemetry(&self) -> ShadowCacheTelemetrySnapshot {
         self.telemetry.snapshot()
+    }
+
+    pub(crate) fn dynamic_overlay_enabled(&self) -> bool {
+        self.enabled && self.dynamic_overlay_enabled
+    }
+
+    pub(crate) fn dynamic_overlay_active(&self) -> bool {
+        self.dynamic_overlay_enabled() && !self.dynamic_shadow_casters.is_empty()
+    }
+
+    pub(crate) fn point_shadow_map_size(&self) -> usize {
+        self.point_shadow_map_size
+    }
+
+    pub(crate) fn dynamic_shadow_casters(&self) -> &[Entity] {
+        &self.dynamic_shadow_casters
+    }
+
+    pub(crate) fn record_dynamic_overlay(&self, rendered_views: usize) {
+        self.telemetry
+            .store_dynamic(rendered_views, self.dynamic_shadow_casters.len());
     }
 }
 
@@ -146,23 +189,39 @@ fn begin_shadow_cache_frame(
     frame.enabled = quality.persistent_point_shadow_cache;
     frame.warmup_frames = quality.resolved_point_shadow_cache_warmup_frames();
     frame.point_shadow_map_size = quality.resolved_point_shadow_map_size();
+    frame.dynamic_overlay_enabled = quality.persistent_point_shadow_cache
+        && quality.scalable_point_lighting
+        && quality.dynamic_shadow_caster_overlay;
     frame.cacheable_point_lights.clear();
+    frame.dynamic_shadow_casters.clear();
     frame.invalidated_point_lights.clear();
     frame.invalidate_all = false;
 }
 
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn finalize_shadow_cache_frame(
     mut frame: ResMut<ZevyShadowCacheFrame>,
     cacheable_lights: Query<(Entity, &PointLight, &GlobalTransform), With<CachedPointLightShadow>>,
     imported_actor_changes: Query<
-        (),
+        Entity,
         (
             With<ImportedZevyEntity>,
             Or<(Changed<GlobalTransform>, Changed<Visibility>)>,
         ),
     >,
-    changed_meshes: Query<(), (With<Mesh3d>, Changed<Mesh3d>, Without<NotShadowCaster>)>,
+    changed_meshes: Query<Entity, (With<Mesh3d>, Changed<Mesh3d>, Without<NotShadowCaster>)>,
+    changed_caster_transforms: Query<
+        Entity,
+        (
+            With<Mesh3d>,
+            Changed<GlobalTransform>,
+            Without<NotShadowCaster>,
+        ),
+    >,
     shadow_casters: Query<Entity, (With<Mesh3d>, Without<NotShadowCaster>)>,
+    dynamic_markers: Query<(), With<DynamicShadowCaster>>,
+    imported_entities: Query<(), With<ImportedZevyEntity>>,
+    parents: Query<&ChildOf>,
     mut previous_shadow_caster_count: Local<Option<usize>>,
     mut previous_light_projection: Local<HashMap<Entity, PointShadowProjectionState>>,
 ) {
@@ -184,13 +243,76 @@ fn finalize_shadow_cache_frame(
         .cacheable_point_lights
         .sort_unstable_by_key(|entity| entity.index());
 
-    let caster_count = shadow_casters.iter().count();
+    let mut dynamic_casters = HashSet::new();
+    let mut static_caster_count = 0;
+    let separate_dynamic_overlay = frame.dynamic_overlay_enabled();
+    for entity in &shadow_casters {
+        if is_dynamic_shadow_caster(entity, &dynamic_markers, &imported_entities, &parents) {
+            dynamic_casters.insert(entity);
+            if !separate_dynamic_overlay {
+                static_caster_count += 1;
+            }
+        } else {
+            static_caster_count += 1;
+        }
+    }
+    frame.dynamic_shadow_casters.extend(dynamic_casters.iter());
+    frame
+        .dynamic_shadow_casters
+        .sort_unstable_by_key(|entity| entity.index());
+
     let caster_count_changed = previous_shadow_caster_count
-        .replace(caster_count)
-        .is_none_or(|previous| previous != caster_count);
-    if caster_count_changed || !imported_actor_changes.is_empty() || !changed_meshes.is_empty() {
+        .replace(static_caster_count)
+        .is_none_or(|previous| previous != static_caster_count);
+    let static_actor_changed = imported_actor_changes.iter().any(|entity| {
+        !separate_dynamic_overlay || !has_dynamic_shadow_marker(entity, &dynamic_markers, &parents)
+    });
+    let static_mesh_changed = changed_meshes
+        .iter()
+        .chain(changed_caster_transforms.iter())
+        .any(|entity| !separate_dynamic_overlay || !dynamic_casters.contains(&entity));
+    if caster_count_changed || static_actor_changed || static_mesh_changed {
         frame.invalidate_all = true;
     }
+}
+
+fn has_dynamic_shadow_marker(
+    entity: Entity,
+    dynamic_markers: &Query<(), With<DynamicShadowCaster>>,
+    parents: &Query<&ChildOf>,
+) -> bool {
+    let mut current = Some(entity);
+    for _ in 0..128 {
+        let Some(entity) = current else {
+            return false;
+        };
+        if dynamic_markers.contains(entity) {
+            return true;
+        }
+        current = parents.get(entity).ok().map(ChildOf::parent);
+    }
+    false
+}
+
+fn is_dynamic_shadow_caster(
+    entity: Entity,
+    dynamic_markers: &Query<(), With<DynamicShadowCaster>>,
+    imported_entities: &Query<(), With<ImportedZevyEntity>>,
+    parents: &Query<&ChildOf>,
+) -> bool {
+    let mut current = Some(entity);
+    let mut belongs_to_imported_level = false;
+    for _ in 0..128 {
+        let Some(entity) = current else {
+            break;
+        };
+        if dynamic_markers.contains(entity) {
+            return true;
+        }
+        belongs_to_imported_level |= imported_entities.contains(entity);
+        current = parents.get(entity).ok().map(ChildOf::parent);
+    }
+    !belongs_to_imported_level
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -216,9 +338,9 @@ impl PointShadowProjectionState {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-struct PointShadowCacheKey {
-    light: Entity,
-    face: usize,
+pub(crate) struct PointShadowCacheKey {
+    pub(crate) light: Entity,
+    pub(crate) face: usize,
 }
 
 struct ZevyCachedEarlyShadowPassNode {
@@ -231,7 +353,16 @@ struct ZevyCachedEarlyShadowPassNode {
         &'static LightEntity,
     )>,
     light_main_entity_query: QueryState<&'static MainEntity>,
+    dynamic_shadow_view_query: QueryState<(
+        Entity,
+        &'static DynamicPointShadowView,
+        &'static ExtractedView,
+    )>,
     render_view_entities: HashSet<Entity>,
+    point_key_by_view: HashMap<Entity, PointShadowCacheKey>,
+    point_render_claims: HashMap<PointShadowCacheKey, AtomicBool>,
+    dynamic_view_by_static: HashMap<Entity, Entity>,
+    render_dynamic_view_entities: HashSet<Entity>,
     cache_entries: HashMap<PointShadowCacheKey, u8>,
     atlas_light_layout: Vec<Entity>,
     atlas_size: usize,
@@ -243,7 +374,12 @@ impl FromWorld for ZevyCachedEarlyShadowPassNode {
             main_view_query: QueryState::new(world),
             shadow_view_query: QueryState::new(world),
             light_main_entity_query: QueryState::new(world),
+            dynamic_shadow_view_query: QueryState::new(world),
             render_view_entities: HashSet::new(),
+            point_key_by_view: HashMap::new(),
+            point_render_claims: HashMap::new(),
+            dynamic_view_by_static: HashMap::new(),
+            render_dynamic_view_entities: HashSet::new(),
             cache_entries: HashMap::new(),
             atlas_light_layout: Vec::new(),
             atlas_size: 0,
@@ -256,7 +392,25 @@ impl Node for ZevyCachedEarlyShadowPassNode {
         self.main_view_query.update_archetypes(world);
         self.shadow_view_query.update_archetypes(world);
         self.light_main_entity_query.update_archetypes(world);
+        self.dynamic_shadow_view_query.update_archetypes(world);
         self.render_view_entities.clear();
+        self.point_key_by_view.clear();
+        self.point_render_claims.clear();
+        self.dynamic_view_by_static.clear();
+        self.render_dynamic_view_entities.clear();
+
+        if let Some(overlay_state) = world.get_resource::<DynamicShadowOverlayState>() {
+            self.render_dynamic_view_entities
+                .extend(overlay_state.render_view_entities.iter().copied());
+        }
+        if let Some(overlay_state) = world.get_resource::<DynamicShadowOverlayState>() {
+            self.dynamic_view_by_static.extend(
+                overlay_state
+                    .dynamic_view_by_static
+                    .iter()
+                    .map(|(key, value)| (*key, *value)),
+            );
+        }
 
         let Some(frame) = world.get_resource::<ZevyShadowCacheFrame>() else {
             self.render_view_entities.extend(
@@ -308,6 +462,13 @@ impl Node for ZevyCachedEarlyShadowPassNode {
                 },
                 cacheable_lights.contains(&main_entity) && !occlusion_culling,
             ));
+            self.point_key_by_view.insert(
+                view_entity,
+                PointShadowCacheKey {
+                    light: main_entity,
+                    face: *face_index,
+                },
+            );
         }
 
         atlas_lights.sort_unstable_by_key(|entity| entity.index());
@@ -360,6 +521,9 @@ impl Node for ZevyCachedEarlyShadowPassNode {
         for (view_entity, key, cacheable) in point_views {
             if !cacheable || update_keys.contains(&key) {
                 self.render_view_entities.insert(view_entity);
+                self.point_render_claims
+                    .entry(key)
+                    .or_insert_with(|| AtomicBool::new(false));
             }
         }
 
@@ -384,42 +548,102 @@ impl Node for ZevyCachedEarlyShadowPassNode {
 
         if let Ok(view_lights) = self.main_view_query.get_manual(world, graph.view_entity()) {
             for view_light_entity in view_lights.lights.iter().copied() {
-                if !self.render_view_entities.contains(&view_light_entity) {
+                let static_view_claimed = self
+                    .point_key_by_view
+                    .get(&view_light_entity)
+                    .and_then(|key| self.point_render_claims.get(key))
+                    .is_none_or(|claim| !claim.swap(true, Ordering::AcqRel));
+                if self.render_view_entities.contains(&view_light_entity)
+                    && static_view_claimed
+                    && let Ok((_, view_light, extracted_light_view, _, _)) =
+                        self.shadow_view_query.get_manual(world, view_light_entity)
+                    && let Some(shadow_phase) =
+                        shadow_render_phases.get(&extracted_light_view.retained_view_entity)
+                {
+                    let depth_stencil_attachment =
+                        Some(view_light.depth_attachment.get_attachment(StoreOp::Store));
+                    let diagnostics = render_context.diagnostic_recorder();
+                    render_context.add_command_buffer_generation_task(move |render_device| {
+                        let mut command_encoder =
+                            render_device.create_command_encoder(&CommandEncoderDescriptor {
+                                label: Some("zevy_cached_shadow_pass_command_encoder"),
+                            });
+                        let render_pass =
+                            command_encoder.begin_render_pass(&RenderPassDescriptor {
+                                label: Some(&view_light.pass_name),
+                                color_attachments: &[],
+                                depth_stencil_attachment,
+                                timestamp_writes: None,
+                                occlusion_query_set: None,
+                            });
+                        let mut render_pass = TrackedRenderPass::new(&render_device, render_pass);
+                        let pass_span =
+                            diagnostics.pass_span(&mut render_pass, view_light.pass_name.clone());
+                        if let Err(error) =
+                            shadow_phase.render(&mut render_pass, world, view_light_entity)
+                        {
+                            error!(
+                                "Error encountered while rendering cached shadow phase: {error:?}"
+                            );
+                        }
+                        pass_span.end(&mut render_pass);
+                        drop(render_pass);
+                        command_encoder.finish()
+                    });
+                }
+
+                let Some(&dynamic_view_entity) =
+                    self.dynamic_view_by_static.get(&view_light_entity)
+                else {
+                    continue;
+                };
+                if !self
+                    .render_dynamic_view_entities
+                    .contains(&dynamic_view_entity)
+                {
                     continue;
                 }
-                let Ok((_, view_light, extracted_light_view, _, _)) =
-                    self.shadow_view_query.get_manual(world, view_light_entity)
+                let Ok((_, dynamic_view, extracted_dynamic_view)) = self
+                    .dynamic_shadow_view_query
+                    .get_manual(world, dynamic_view_entity)
                 else {
                     continue;
                 };
-                let Some(shadow_phase) =
-                    shadow_render_phases.get(&extracted_light_view.retained_view_entity)
+                if !dynamic_view.claim_render() {
+                    continue;
+                }
+                let Some(dynamic_phase) =
+                    shadow_render_phases.get(&extracted_dynamic_view.retained_view_entity)
                 else {
                     continue;
                 };
-
                 let depth_stencil_attachment =
-                    Some(view_light.depth_attachment.get_attachment(StoreOp::Store));
+                    Some(dynamic_view.depth_attachment.get_attachment(StoreOp::Store));
+                let pass_name = format!(
+                    "dynamic point shadow {:?} face {}",
+                    dynamic_view.key.light, dynamic_view.key.face
+                );
                 let diagnostics = render_context.diagnostic_recorder();
                 render_context.add_command_buffer_generation_task(move |render_device| {
                     let mut command_encoder =
                         render_device.create_command_encoder(&CommandEncoderDescriptor {
-                            label: Some("zevy_cached_shadow_pass_command_encoder"),
+                            label: Some("zevy_dynamic_shadow_overlay_command_encoder"),
                         });
                     let render_pass = command_encoder.begin_render_pass(&RenderPassDescriptor {
-                        label: Some(&view_light.pass_name),
+                        label: Some(&pass_name),
                         color_attachments: &[],
                         depth_stencil_attachment,
                         timestamp_writes: None,
                         occlusion_query_set: None,
                     });
                     let mut render_pass = TrackedRenderPass::new(&render_device, render_pass);
-                    let pass_span =
-                        diagnostics.pass_span(&mut render_pass, view_light.pass_name.clone());
+                    let pass_span = diagnostics.pass_span(&mut render_pass, pass_name.clone());
                     if let Err(error) =
-                        shadow_phase.render(&mut render_pass, world, view_light_entity)
+                        dynamic_phase.render(&mut render_pass, world, dynamic_view_entity)
                     {
-                        error!("Error encountered while rendering cached shadow phase: {error:?}");
+                        error!(
+                            "Error encountered while rendering dynamic shadow overlay: {error:?}"
+                        );
                     }
                     pass_span.end(&mut render_pass);
                     drop(render_pass);

@@ -13,6 +13,7 @@
     transmission,
     clustered_forward as clustering,
     shadows,
+    shadow_sampling::{sample_shadow_cubemap, sample_shadow_cubemap_pcss},
     ambient,
     irradiance_volume,
     mesh_types::{MESH_FLAGS_SHADOW_RECEIVER_BIT, MESH_FLAGS_TRANSMITTED_SHADOW_RECEIVER_BIT},
@@ -70,6 +71,7 @@ const ZEVY_POINT_LIGHT_HERO_SAMPLES: u32 = 2u;
 const ZEVY_POINT_LIGHT_TAIL_SAMPLES: u32 = 2u;
 const ZEVY_TEMPORAL_LIGHT_SAMPLING: bool = false;
 const ZEVY_LIGHT_SAMPLE_PERIOD_FRAMES: u32 = 4u;
+const ZEVY_DYNAMIC_SHADOW_OVERLAY: bool = true;
 
 fn zevy_hash_u32(value: u32) -> u32 {
     var hash = value;
@@ -101,6 +103,85 @@ fn zevy_point_light_has_shadow(light_id: u32) -> bool {
         mesh_view_types::POINT_LIGHT_FLAGS_SHADOWS_ENABLED_BIT) != 0u;
 }
 
+// Matches Bevy's point-shadow projection but allows the light data index and
+// cubemap-array index to differ. Zevy stores static cubes in the first half of
+// the array and dynamic-caster cubes in the second half.
+fn zevy_fetch_point_shadow_cube(
+    light_id: u32,
+    cube_index: u32,
+    world_position: vec4<f32>,
+    world_normal: vec3<f32>,
+) -> f32 {
+    let light = &view_bindings::clusterable_objects.data[light_id];
+    let surface_to_light = (*light).position_radius.xyz - world_position.xyz;
+    let surface_to_light_abs = abs(surface_to_light);
+    let distance_to_light = max(
+        surface_to_light_abs.x,
+        max(surface_to_light_abs.y, surface_to_light_abs.z)
+    );
+    let normal_offset = (*light).shadow_normal_bias * distance_to_light * world_normal;
+    let depth_offset = (*light).shadow_depth_bias * normalize(surface_to_light);
+    let offset_position = world_position.xyz + normal_offset + depth_offset;
+    let frag_ls = offset_position - (*light).position_radius.xyz;
+    let abs_position_ls = abs(frag_ls);
+    let major_axis_magnitude = max(
+        abs_position_ls.x,
+        max(abs_position_ls.y, abs_position_ls.z)
+    );
+    let zw = -major_axis_magnitude * (*light).light_custom_data.xy +
+        (*light).light_custom_data.zw;
+    let depth = zw.x / zw.y;
+    let sample_direction = frag_ls * vec3<f32>(1.0, 1.0, -1.0);
+
+    if ((*light).soft_shadow_size > 0.0) {
+        return sample_shadow_cubemap_pcss(
+            sample_direction,
+            distance_to_light,
+            depth,
+            cube_index,
+            (*light).soft_shadow_size,
+        );
+    }
+    return sample_shadow_cubemap(
+        sample_direction,
+        distance_to_light,
+        depth,
+        cube_index
+    );
+}
+
+fn zevy_fetch_point_shadow_combined(
+    light_id: u32,
+    world_position: vec4<f32>,
+    world_normal: vec3<f32>,
+) -> f32 {
+    let static_visibility = zevy_fetch_point_shadow_cube(
+        light_id, light_id, world_position, world_normal
+    );
+#ifdef NO_CUBE_ARRAY_TEXTURES_SUPPORT
+    return static_visibility;
+#else
+    if (!ZEVY_DYNAMIC_SHADOW_OVERLAY) {
+        return static_visibility;
+    }
+    let total_cubes = textureNumLayers(view_bindings::point_shadow_textures);
+    // Even cube counts are static-only. A live overlay uses 2*N+1 cubes: N
+    // static, N dynamic, and one sentinel cube that makes runtime detection
+    // possible without adding another view uniform or bind group.
+    if ((total_cubes & 1u) == 0u) {
+        return static_visibility;
+    }
+    let dynamic_cube_offset = (total_cubes - 1u) / 2u;
+    let dynamic_visibility = zevy_fetch_point_shadow_cube(
+        light_id,
+        light_id + dynamic_cube_offset,
+        world_position,
+        world_normal
+    );
+    return static_visibility * dynamic_visibility;
+#endif
+}
+
 fn zevy_point_light_shadow(
     light_id: u32,
     mesh_flags: u32,
@@ -109,7 +190,7 @@ fn zevy_point_light_shadow(
 ) -> f32 {
     if ((mesh_flags & MESH_FLAGS_SHADOW_RECEIVER_BIT) != 0u &&
             zevy_point_light_has_shadow(light_id)) {
-        return shadows::fetch_point_shadow(light_id, world_position, world_normal);
+        return zevy_fetch_point_shadow_combined(light_id, world_position, world_normal);
     }
     return 1.0;
 }
@@ -648,7 +729,7 @@ fn apply_pbr_lighting(
         if ((in.flags & (MESH_FLAGS_SHADOW_RECEIVER_BIT | MESH_FLAGS_TRANSMITTED_SHADOW_RECEIVER_BIT)) ==
                 (MESH_FLAGS_SHADOW_RECEIVER_BIT | MESH_FLAGS_TRANSMITTED_SHADOW_RECEIVER_BIT) &&
                 zevy_point_light_has_shadow(light_id)) {
-            transmitted_shadow = shadows::fetch_point_shadow(
+            transmitted_shadow = zevy_fetch_point_shadow_combined(
                 light_id,
                 diffuse_transmissive_lobe_world_position,
                 -in.world_normal

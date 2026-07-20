@@ -88,7 +88,7 @@ OpenXR 1.1 的四视图配置由两个外围 view 和两个 foveated inset view 
 | MSAA | `msaa_samples = 2` | 是移动 VR 的合理起点，仍须实测带宽和边缘质量。 |
 | 灯光分簇 | Map_S03B 已从 `ClusterConfig::Single` 迁移到可配置 Clustered Forward，并叠加固定预算 Scalable Point Lighting 原型 | 当前每个 shading point 默认完整计算 2 个 Hero + 2 个 Tail；下一步应把候选 PDF 上移到双眼共享 tile/froxel。 |
 | 当前 Map_S03B 材质 | glTF 使用 `KHR_materials_unlit` | PointLight 不会影响这些表面；当前性能测试不能代表 PBR 多灯光成本。 |
-| 阴影 | Map_S03B 七盏 PointLight 已接入持久化 cubemap-array atlas 与跨帧静态缓存 | 稳定帧可从 42 面全量重绘降到 6 面重绘/36 面复用；尚未完成 static/dynamic overlay 和 GPU 毫秒预算调度。 |
+| 阴影 | 当前 Map_S03B 的 16 盏 PointLight 已接入持久化静态 cubemap-array 与动态 caster overlay | 默认公平调度每帧最多更新 2 盏灯，即最多 12 面重绘/84 面复用；动态层只清除并重绘当前或上一帧受动态 caster 影响的 face。尚未完成真实 GPU 毫秒预算调度。 |
 | 纹理 | 已有 mip chain、trilinear 和 anisotropic sampler | 方向正确；下一阶段是 ASTC/KTX2、分辨率分级和纹理带宽统计。 |
 | 调试 | HUD 已显示 triangles、draw 估算、fragment、pass 和材质信息 | 应继续加入每 cluster 灯数、阴影 texel 更新量、热状态和双眼实际 GPU 时间。 |
 
@@ -645,7 +645,7 @@ Map_S03B 的七灯 Android VR 实测已经说明，“灯数不多”并不等�
 - 七盏 PointLight 仍有 42 个常驻 cubemap shadow view；持久化缓存已经消除了稳定面每帧重复的 depth clear/raster，但 Bevy 当前仍会为这些 view 准备 visibility/render phase，CPU 侧还可继续下钻；
 - 不允许再次用“相机靠近才打开阴影”作为性能降级策略。低优先级阴影只能降分辨率、降低更新频率并复用缓存，不能在可见画面中突然从无到有。
 
-配置入口为 `RenderQualityConfig.scalable_point_lighting`、`point_light_hero_samples`、`point_light_tail_samples`、`temporal_point_light_sampling` 和 `light_sample_period_frames`。`max_shadowed_point_lights` 现在是与相机无关的稳定驻留上限；Map_S03B 默认为 7。VR 默认关闭 temporal sampling，只有显式实验时才按帧轮换 Tail。关闭 scalable lighting 总开关后完整回退到 Bevy 原始确定性 PBR shader，便于 Android A/B。阴影缓存相关入口为 `persistent_point_shadow_cache`、`point_shadow_cache_warmup_frames`、`cached_point_shadow_update_hz` 和 `max_cached_point_shadow_updates_per_frame`。
+配置入口为 `RenderQualityConfig.scalable_point_lighting`、`point_light_hero_samples`、`point_light_tail_samples`、`temporal_point_light_sampling` 和 `light_sample_period_frames`。`max_shadowed_point_lights` 是与相机无关的可选稳定驻留上限：默认值 `0` 表示自动常驻关卡中所有原本启用阴影的 PointLight，正整数仅用于显式性能 A/B，不再把旧七灯测试数量硬编码成产品默认值。VR 默认关闭 temporal sampling，只有显式实验时才按帧轮换 Tail。关闭 scalable lighting 总开关后完整回退到 Bevy 原始确定性 PBR shader，便于 Android A/B。阴影缓存相关入口为 `persistent_point_shadow_cache`、`dynamic_shadow_caster_overlay`、`point_shadow_cache_warmup_frames`、`cached_point_shadow_update_hz` 和 `max_cached_point_shadow_updates_per_frame`。
 
 ---
 
@@ -691,7 +691,7 @@ Map_S03B PC 运行验证中，稳定帧 HUD 为 `6 redraw / 36 reuse / 42 reside
 
 即 shadow depth raster 的 view/texel 更新量降低约 85.7%；没有灯位移的帧可以复用全部 42 面。这个比例不能直接等同于整帧 GPU 提速，因为当前 Bevy 仍会准备 shadow visibility 和 render phase；Android 上的实际 GPU ms、功耗和热稳定收益仍必须用设备计数器验证。
 
-这一阶段针对 Map_S03B 的“静态建筑 + 静态灯/低频微动灯”成立。它尚未把动态 caster 拆成独立 overlay：若建筑或任意已跟踪静态 caster 发生变化，当前策略会保守地使整套 point cache 失效。下一阶段应实现 `StaticShadow × DynamicShadow`，并把更新单位从“每帧最多 N 盏灯”升级为真实 GPU 毫秒/预测 caster 成本预算。
+这一阶段最初只针对 Map_S03B 的“静态建筑 + 静态灯/低频微动灯”。动态 caster 分层已在下一节完成；后续仍需把更新单位从“每帧最多 N 盏灯”升级为真实 GPU 毫秒/预测 caster 成本预算。
 
 ### 10.2 静态与动态 caster 分离
 
@@ -706,6 +706,32 @@ V=V_{static}\times V_{dynamic}
 \]
 
 代价是多一次 shadow compare，但可以避免每帧把整座建筑为每盏灯重画。若动态物体很少，这通常非常划算。
+
+#### 10.2.1 Zevy PointLight 双层实现（2026-07-20）
+
+当前实现没有为 PBR 额外增加一组 view bind group，而是把同一个 PointLight cube-array 分成等长两半：
+
+\[
+Atlas=[StaticCube_0\ldots StaticCube_{N-1},\ DynamicCube_0\ldots DynamicCube_{N-1},\ Sentinel]
+\]
+
+- 前半区只渲染静态 caster，并继续使用跨帧持久化缓存；
+- 后半区只渲染动态 caster；每个动态 view 使用与静态 view 相同的 light projection，但使用独立 depth layer；
+- Forward PBR 对同一灯分别采样 `light_id` 与 `light_id + N`，最终执行 `V = Vstatic × Vdynamic`；
+- cube 数为偶数时表示 static-only，shader 只做一次 shadow compare；动态 caster 出现后分配 `2N+1` 个 cube，末尾 sentinel 使总数为奇数，shader 无需新增 uniform/bind group 就能运行时识别并启用第二次采样；
+- 动态 phase 直接复用 Bevy 已专门化好的 shadow material pipeline，因此 alpha mask、双面和正常 mesh/material bind group 路径保持一致；
+- 每个 face 只收集该 PointLight cubemap frustum 中可见的动态 caster。当前帧集合与上一帧集合取并集：新 face 重画，旧 face 至少清除一次，因此移动物体离开后不会留下“幽灵阴影”；
+- 左右眼共享同一套 light-space depth。相同 `(light, face)` 在 XR 中去重，并用原子 claim 保证一帧只由第一只执行到该节点的眼睛提交一次动态 pass；
+- 导入关卡层级中的 mesh 默认视为静态；关卡外 mesh 默认视为动态。对导入 Actor 根或任意 mesh 添加公开组件 `DynamicShadowCaster`，其后代 mesh 会进入动态层；
+- 关闭 `dynamic_shadow_caster_overlay` 时恢复整层阴影缓存逻辑，并重新把动态变换纳入静态 cache invalidation，避免留下旧深度。
+
+Map_S03B 当前 16 个 PointLight 在没有动态 caster 时只保留 16 个静态 cube，即 96 个 2D array layer；动态层激活时为 16 static + 16 dynamic + 1 sentinel，即 198 layer。Bevy 0.16.1 使用 `Depth32Float`，128² 下分别约为 6 MiB 与 12.375 MiB。启动时会检查设备的 `max_texture_array_layers`；超过上限会明确要求降低 `max_shadowed_point_lights`，而不是静默丢失后半区阴影。
+
+内置 `--level=performance` 回归场景包含一个持续移动/旋转的 `DynamicShadowCaster`。PC 验证中共有 7 个动态 caster、2 个有阴影的 PointLight（最多 12 个 face），每帧实际只更新约 8～10 个有当前或历史覆盖的动态 face。Map_S03B 没有动态 caster 时，动态层稳定为 0 redraw；静态层共有 96 个 resident face，实际 redraw 数由本帧到期的灯光投影决定。默认每帧最多更新 2 盏 PointLight，因此上限为 `12 redraw / 84 reuse`，没有投影到期的帧仍为 `0 redraw / 96 reuse`。
+
+当前双层合成只覆盖 PointLight Forward PBR 路径。Spot/Directional 仍使用 Bevy 原路径；未来扩展它们时应优先采用 2D-array layer 配对，而不是复制一套独立材质绑定。
+
+运行时把导入 Actor 切换到动态层的最小用法为 `commands.entity(actor).insert(DynamicShadowCaster);`。应优先标记 Actor 根，而不是逐个标记 glTF 子 mesh，这样根节点移动、显隐和全部后代会保持同一 shadow mobility。
 
 ### 10.3 阴影重要度与调度
 
@@ -772,11 +798,20 @@ R_l=2^{round\left(\log_2\left(clamp(k\sqrt{A_{screen,l}},R_{min},R_{max})\right)
 改变灯光 intensity/color 不需要重画 shadow map；改变 position/direction 才会让阴影失效。因此：
 
 - 高频火光变化主要驱动 intensity、color、emissive；
-- 阴影投影的轻微摇动用平滑低频噪声并按预算更新；Map_S03B 当前默认 8 Hz、每帧最多更新 1 盏灯；
+- 阴影投影的轻微摇动用平滑低频噪声并按预算更新；Map_S03B 当前目标为 8 Hz、默认每帧最多更新 2 盏灯；
+- 到期灯光采用无饥饿调度：从未更新的灯优先，其余按“距离上次更新最久”排序。预算不足时所有灯公平轮转，只降低整体更新频率，不允许查询顺序靠前的灯反复抢占预算、让后面的灯永久冻结；
 - 不要每帧随机移动 PointLight 后重画六面 cubemap；
 - 可以用 light cookie、normal perturbation 或低分辨率 shadow mask 模拟投影跳动。
 
 这能保留“活的火光”，同时把最昂贵的 shadow update 与视觉闪烁解耦。
+
+若有 \(N\) 盏到期灯、帧率为 \(F\)、每帧更新预算为 \(B\)，则每盏灯可达到的长期更新频率上界为：
+
+\[
+f_{effective}\le \min\left(f_{requested},\frac{F B}{N}\right)
+\]
+
+例如 Map_S03B 的 16 盏灯在 90 FPS、预算 2 时可以维持 8 Hz 目标；若设备只有 17 FPS，则公平轮转后的上界约为 2.125 Hz。此时不会再出现“有些阴影在动、有些完全不动”，但投影运动会变得更低频。若实机仍觉得阶梯感明显，应提高预算或降低投影运动幅度，而不是恢复按相机距离突然启停阴影。
 
 ---
 
@@ -1171,7 +1206,7 @@ OpenXR 新规范中已有厂商 performance metrics 与 frame synthesis 扩展�
 ### 阶段 3：持久化阴影系统
 
 - [已完成第一阶段] PointLight cubemap-array atlas 内容跨帧保留、静态 cache、按灯局部失效与 HUD telemetry。
-- static/dynamic caster 分离与 dynamic overlay。
+- [已完成 PointLight] static/dynamic caster 分离、双层 cube-array 与 PBR visibility 合成。
 - 按 GPU 毫秒预算调度。
 - Point/Spot authoring 策略。
 - 独立 shadow LOD 和 resolution tier。

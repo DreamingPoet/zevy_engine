@@ -8,6 +8,7 @@ use crate::{
     app::LaunchMode,
     input::{EngineInputState, InputAxis2},
     scene::{LevelEntity, MirrorCamera, desktop_player::DesktopLevelPlayer},
+    shadow_overlay::DynamicShadowCaster,
 };
 
 use super::{CurrentLevel, LevelId};
@@ -21,6 +22,11 @@ pub(super) struct OrbitingLight {
     height: f32,
     phase: f32,
     speed: f32,
+}
+
+#[derive(Component, Clone, Copy)]
+pub(super) struct MovingShadowTestCaster {
+    base_translation: Vec3,
 }
 
 pub(super) fn level_fog(level: &super::LevelId) -> Option<DistanceFog> {
@@ -196,13 +202,21 @@ pub(super) fn spawn_performance_lab(
     ];
 
     for (name, mesh, material, transform) in small_models {
-        commands.spawn((
+        let mut entity = commands.spawn((
             Name::new(name),
             LevelEntity,
             Mesh3d(mesh),
             MeshMaterial3d(material),
             transform,
         ));
+        if name == "PerfCube" {
+            entity.insert((
+                DynamicShadowCaster,
+                MovingShadowTestCaster {
+                    base_translation: transform.translation,
+                },
+            ));
+        }
     }
 
     commands.spawn((
@@ -366,6 +380,22 @@ pub(super) fn animate_orbiting_lights(
     for (light, mut transform) in &mut query {
         let angle = light.phase + seconds * light.speed;
         transform.translation = orbit_position(light.center, light.radius, light.height, angle);
+    }
+}
+
+pub(super) fn animate_shadow_test_caster(
+    time: Res<Time>,
+    mut casters: Query<(&MovingShadowTestCaster, &mut Transform)>,
+) {
+    let seconds = time.elapsed_secs();
+    for (caster, mut transform) in &mut casters {
+        transform.translation = caster.base_translation
+            + Vec3::new(
+                (seconds * 0.9).sin() * 0.45,
+                (seconds * 1.8).sin() * 0.08,
+                0.0,
+            );
+        transform.rotation = Quat::from_rotation_y(seconds * 0.65);
     }
 }
 

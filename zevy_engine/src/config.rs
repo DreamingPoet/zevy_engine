@@ -15,11 +15,12 @@ pub struct RenderQualityConfig {
     /// Supported values are 1 (off), 2, 4, and 8 samples.
     pub msaa_samples: u32,
     /// Width and height of each of the six point-light shadow cubemap faces.
-    /// Bevy's default is 1024; 128 is the current all-seven-lights VR test tier.
+    /// Bevy's default is 1024; 128 is the current multi-light VR test tier.
     pub point_shadow_map_size: usize,
-    /// Stable cap on imported Map_S03B point lights with resident cubemap
-    /// shadows. Selection never depends on camera distance. Set this to at
-    /// least the level's light count to keep every exported shadow resident.
+    /// Optional stable cap on imported Map_S03B PointLights with resident
+    /// cubemap shadows. `0` means all lights that had shadows enabled in the
+    /// exported level. A positive value is an explicit performance-test cap.
+    /// Selection never depends on camera distance.
     pub max_shadowed_point_lights: usize,
     /// Maximum number of clustered-forward froxels for a view.
     pub cluster_total: u32,
@@ -48,14 +49,18 @@ pub struct RenderQualityConfig {
     /// Keeps point-light shadow atlas layers across frames and redraws only
     /// invalidated lights. Non-cacheable lights retain Bevy's normal behavior.
     pub persistent_point_shadow_cache: bool,
+    /// Splits the PointLight cube-array into cached static depth and a separate
+    /// dynamic-caster overlay. The PBR shader combines both visibility terms.
+    pub dynamic_shadow_caster_overlay: bool,
     /// Number of full redraw frames used when an atlas layout first appears,
     /// allowing asynchronously-created shadow pipelines and meshes to settle.
     pub point_shadow_cache_warmup_frames: u8,
     /// Target update frequency for cached candle-light projection movement.
     /// Intensity, color, and emissive animation still update every frame.
     pub cached_point_shadow_update_hz: f32,
-    /// Hard cap on cached PointLights invalidated in one frame. Each point
-    /// light update redraws six cubemap faces.
+    /// Hard cap on cached PointLights invalidated in one frame. Due lights are
+    /// scheduled oldest-first so an overloaded frame budget cannot starve a
+    /// subset of lights. Each point-light update redraws six cubemap faces.
     pub max_cached_point_shadow_updates_per_frame: usize,
 }
 
@@ -65,7 +70,7 @@ impl Default for RenderQualityConfig {
             xr_render_scale: 0.8,
             msaa_samples: 2,
             point_shadow_map_size: 128,
-            max_shadowed_point_lights: 7,
+            max_shadowed_point_lights: 0,
             cluster_total: 4096,
             cluster_z_slices: 24,
             cluster_first_slice_depth_m: 4.0,
@@ -76,9 +81,10 @@ impl Default for RenderQualityConfig {
             temporal_point_light_sampling: false,
             light_sample_period_frames: 4,
             persistent_point_shadow_cache: true,
+            dynamic_shadow_caster_overlay: true,
             point_shadow_cache_warmup_frames: 3,
             cached_point_shadow_update_hz: 8.0,
-            max_cached_point_shadow_updates_per_frame: 1,
+            max_cached_point_shadow_updates_per_frame: 2,
         }
     }
 }
@@ -106,6 +112,14 @@ impl RenderQualityConfig {
         self.point_shadow_map_size
             .clamp(64, 2048)
             .next_power_of_two()
+    }
+
+    pub(crate) fn resolved_point_shadow_resident_count(self, enabled_count: usize) -> usize {
+        if self.max_shadowed_point_lights == 0 {
+            enabled_count
+        } else {
+            enabled_count.min(self.max_shadowed_point_lights)
+        }
     }
 
     pub(crate) fn resolved_cluster_total(self) -> u32 {
@@ -175,6 +189,11 @@ pub(crate) fn apply_render_quality_to_cameras(
 pub(crate) fn log_render_quality_config(config: Res<RenderQualityConfig>) {
     let resolved_scale = config.resolved_xr_render_scale();
     let resolved_msaa = config.resolved_msaa();
+    let point_shadow_policy = if config.max_shadowed_point_lights == 0 {
+        "all level-enabled lights".to_owned()
+    } else {
+        format!("up to {} lights", config.max_shadowed_point_lights)
+    };
 
     if config.msaa_samples != resolved_msaa.samples() {
         warn!(
@@ -191,10 +210,10 @@ pub(crate) fn log_render_quality_config(config: Res<RenderQualityConfig>) {
     }
 
     info!(
-        "Render quality: XR scale {:.2}, MSAA {}x, point shadows {} cubemap lights at {}px, clusters {}/{}z to {:.1}m, scalable point lights {} ({} Hero + {} tail samples, {}), persistent shadow cache {} ({} Hz, {} light/frame)",
+        "Render quality: XR scale {:.2}, MSAA {}x, point shadow residency {} at {}px, clusters {}/{}z to {:.1}m, scalable point lights {} ({} Hero + {} tail samples, {}), persistent shadow cache {} + dynamic overlay {} ({} Hz, {} light/frame)",
         resolved_scale,
         resolved_msaa.samples(),
-        config.max_shadowed_point_lights,
+        point_shadow_policy,
         config.resolved_point_shadow_map_size(),
         config.resolved_cluster_total(),
         config.resolved_cluster_z_slices(),
@@ -219,7 +238,35 @@ pub(crate) fn log_render_quality_config(config: Res<RenderQualityConfig>) {
         } else {
             "off"
         },
+        if config.dynamic_shadow_caster_overlay {
+            "on"
+        } else {
+            "off"
+        },
         config.resolved_cached_point_shadow_update_hz(),
         config.max_cached_point_shadow_updates_per_frame,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_point_shadow_residency_tracks_the_imported_light_count() {
+        let quality = RenderQualityConfig::default();
+        assert_eq!(quality.max_shadowed_point_lights, 0);
+        assert_eq!(quality.resolved_point_shadow_resident_count(16), 16);
+        assert!(quality.dynamic_shadow_caster_overlay);
+    }
+
+    #[test]
+    fn explicit_point_shadow_residency_cap_remains_available_for_ab_tests() {
+        let quality = RenderQualityConfig {
+            max_shadowed_point_lights: 7,
+            ..default()
+        };
+        assert_eq!(quality.resolved_point_shadow_resident_count(16), 7);
+        assert_eq!(quality.resolved_point_shadow_resident_count(4), 4);
+    }
 }

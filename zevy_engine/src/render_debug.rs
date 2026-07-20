@@ -406,6 +406,14 @@ fn update_debug_snapshot(
         quality.resolved_msaa().samples(),
     );
     let shadow_cache = shadow_cache_frame.telemetry();
+    let dynamic_overlay_enabled = quality.persistent_point_shadow_cache
+        && quality.scalable_point_lighting
+        && quality.dynamic_shadow_caster_overlay;
+    let point_shadow_policy = if quality.max_shadowed_point_lights == 0 {
+        "all level-enabled lights".to_owned()
+    } else {
+        format!("cap {} lights", quality.max_shadowed_point_lights)
+    };
 
     let top_pass = pass_rows.first();
     let using_gpu_timestamps = pass_metric == "elapsed_gpu";
@@ -455,7 +463,7 @@ fn update_debug_snapshot(
     let _ = writeln!(
         overview,
         "Point shadows     {:>4} resident / {:>4}px",
-        quality.max_shadowed_point_lights,
+        scene.shadowed_point_lights,
         quality.resolved_point_shadow_map_size(),
     );
     let _ = writeln!(
@@ -468,6 +476,13 @@ fn update_debug_snapshot(
         },
         shadow_cache.rendered_views,
         shadow_cache.reused_views,
+    );
+    let _ = writeln!(
+        overview,
+        "Dynamic overlay   {:>4} / caster {:>2} draw {:>2}",
+        if dynamic_overlay_enabled { "ON" } else { "OFF" },
+        shadow_cache.dynamic_casters,
+        shadow_cache.dynamic_views_rendered,
     );
     let _ = writeln!(
         overview,
@@ -738,8 +753,8 @@ fn update_debug_snapshot(
     );
     let _ = writeln!(
         material_page,
-        "Point shadow resident cap   {} lights",
-        quality.max_shadowed_point_lights
+        "Point shadow residency      {}",
+        point_shadow_policy
     );
     let _ = writeln!(
         material_page,
@@ -758,6 +773,20 @@ fn update_debug_snapshot(
     );
     let _ = writeln!(
         material_page,
+        "Dynamic caster overlay      {}",
+        if dynamic_overlay_enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+    let _ = writeln!(
+        material_page,
+        "Dynamic casters/views       {} / {} redraw",
+        shadow_cache.dynamic_casters, shadow_cache.dynamic_views_rendered,
+    );
+    let _ = writeln!(
+        material_page,
         "Shadow views redraw/reuse   {} / {} of {}",
         shadow_cache.rendered_views, shadow_cache.reused_views, shadow_cache.resident_views,
     );
@@ -768,7 +797,7 @@ fn update_debug_snapshot(
     );
     let _ = writeln!(
         material_page,
-        "Cached projection schedule  {:.1} Hz, <= {} light/frame",
+        "Cached projection schedule  {:.1} Hz, <= {} light/frame (fair)",
         quality.resolved_cached_point_shadow_update_hz(),
         quality.max_cached_point_shadow_updates_per_frame,
     );
@@ -906,6 +935,7 @@ struct SceneRenderStats {
     point_lights: usize,
     spot_lights: usize,
     directional_lights: usize,
+    shadowed_point_lights: usize,
     shadowed_lights: usize,
     estimated_shadow_views: usize,
 }
@@ -1011,6 +1041,7 @@ fn collect_scene_stats(
         .iter()
         .filter(|light| light.shadows_enabled)
         .count();
+    stats.shadowed_point_lights = shadowed_points;
     stats.shadowed_lights = shadowed_points + shadowed_spots + shadowed_directional;
     stats.estimated_shadow_views = shadowed_points * 6 + shadowed_spots + shadowed_directional * 4;
 

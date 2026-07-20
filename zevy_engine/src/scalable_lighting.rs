@@ -7,6 +7,7 @@ const HERO_SAMPLES_TEMPLATE: &str = "const ZEVY_POINT_LIGHT_HERO_SAMPLES: u32 = 
 const TAIL_SAMPLES_TEMPLATE: &str = "const ZEVY_POINT_LIGHT_TAIL_SAMPLES: u32 = 2u;";
 const TEMPORAL_SAMPLING_TEMPLATE: &str = "const ZEVY_TEMPORAL_LIGHT_SAMPLING: bool = false;";
 const SAMPLE_PERIOD_TEMPLATE: &str = "const ZEVY_LIGHT_SAMPLE_PERIOD_FRAMES: u32 = 4u;";
+const DYNAMIC_SHADOW_OVERLAY_TEMPLATE: &str = "const ZEVY_DYNAMIC_SHADOW_OVERLAY: bool = true;";
 
 /// Installs Zevy's fixed-budget local-lighting experiment in place of Bevy's
 /// stock StandardMaterial PBR lighting function. Disabling the corresponding
@@ -31,6 +32,8 @@ fn install_scalable_pbr_shader(
     let hero_samples = quality.resolved_point_light_hero_samples();
     let tail_samples = quality.resolved_point_light_tail_samples();
     let sample_period = quality.resolved_light_sample_period_frames();
+    let dynamic_shadow_overlay =
+        quality.persistent_point_shadow_cache && quality.dynamic_shadow_caster_overlay;
     let source = PBR_FUNCTIONS_TEMPLATE
         .replace(
             HERO_SAMPLES_TEMPLATE,
@@ -50,6 +53,10 @@ fn install_scalable_pbr_shader(
         .replace(
             SAMPLE_PERIOD_TEMPLATE,
             &format!("const ZEVY_LIGHT_SAMPLE_PERIOD_FRAMES: u32 = {sample_period}u;"),
+        )
+        .replace(
+            DYNAMIC_SHADOW_OVERLAY_TEMPLATE,
+            &format!("const ZEVY_DYNAMIC_SHADOW_OVERLAY: bool = {dynamic_shadow_overlay};"),
         );
 
     debug_assert!(source.contains(&format!(
@@ -65,13 +72,16 @@ fn install_scalable_pbr_shader(
     debug_assert!(source.contains(&format!(
         "const ZEVY_LIGHT_SAMPLE_PERIOD_FRAMES: u32 = {sample_period}u;"
     )));
+    debug_assert!(source.contains(&format!(
+        "const ZEVY_DYNAMIC_SHADOW_OVERLAY: bool = {dynamic_shadow_overlay};"
+    )));
     shaders.insert(
         PBR_FUNCTIONS_HANDLE.id(),
         Shader::from_wgsl(source, "zevy://shaders/zevy_pbr_functions.wgsl"),
     );
 
     info!(
-        "Installed Zevy scalable point lighting: {} highest-contribution Hero lights + {} importance-sampled shadowed tail lights per shading point, {}",
+        "Installed Zevy scalable point lighting: {} highest-contribution Hero lights + {} importance-sampled shadowed tail lights per shading point, {}, dynamic shadow overlay {}",
         hero_samples,
         tail_samples,
         if quality.temporal_point_light_sampling {
@@ -79,6 +89,7 @@ fn install_scalable_pbr_shader(
         } else {
             "selection is anchored in world space".to_owned()
         },
+        if dynamic_shadow_overlay { "on" } else { "off" },
     );
 }
 
@@ -92,6 +103,9 @@ mod tests {
         assert!(PBR_FUNCTIONS_TEMPLATE.contains(HERO_SAMPLES_TEMPLATE));
         assert!(PBR_FUNCTIONS_TEMPLATE.contains(TEMPORAL_SAMPLING_TEMPLATE));
         assert!(PBR_FUNCTIONS_TEMPLATE.contains(SAMPLE_PERIOD_TEMPLATE));
+        assert!(PBR_FUNCTIONS_TEMPLATE.contains(DYNAMIC_SHADOW_OVERLAY_TEMPLATE));
         assert!(PBR_FUNCTIONS_TEMPLATE.contains("zevy_point_light_importance"));
+        assert!(PBR_FUNCTIONS_TEMPLATE.contains("zevy_fetch_point_shadow_combined"));
+        assert!(PBR_FUNCTIONS_TEMPLATE.contains("static_visibility * dynamic_visibility"));
     }
 }

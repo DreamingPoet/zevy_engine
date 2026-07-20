@@ -7,6 +7,7 @@ mod render_debug;
 mod scalable_lighting;
 mod scene;
 mod shadow_cache;
+mod shadow_overlay;
 mod xr;
 
 pub use app::{main, run};
@@ -17,6 +18,7 @@ pub use scene::{
     ZevyLevelSceneAsset, ZevyLevelTransform, ZevyLightDefinition, ZevyLightKind,
     ZevyUnrealLightParameters, spawn_zevy_level,
 };
+pub use shadow_overlay::DynamicShadowCaster;
 
 #[cfg(target_os = "android")]
 #[unsafe(no_mangle)]

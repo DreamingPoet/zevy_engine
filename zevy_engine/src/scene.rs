@@ -62,6 +62,7 @@ impl Plugin for ScenePlugin {
                         .after(EngineInputSet::Collect)
                         .after(apply_map_s03b_xr_start),
                     levels::animate_orbiting_lights,
+                    levels::animate_shadow_test_caster,
                 ),
             );
     }
@@ -562,18 +563,25 @@ fn apply_map_s03b_shadow_residency(
         .filter_map(|(entity, _, tuning)| tuning.previous_shadows_enabled.then_some(entity))
         .collect::<Vec<_>>();
     selected.sort_unstable_by_key(|entity| entity.index());
-    selected.truncate(quality.max_shadowed_point_lights);
+    let enabled_count = selected.len();
+    selected.truncate(quality.resolved_point_shadow_resident_count(enabled_count));
 
     for (entity, mut light, tuning) in &mut point_lights {
         light.shadows_enabled = tuning.previous_shadows_enabled && selected.contains(&entity);
     }
 
     if *previous_selection != selected {
+        let policy = if quality.max_shadowed_point_lights == 0 {
+            "all level-enabled lights".to_owned()
+        } else {
+            format!("explicit cap {}", quality.max_shadowed_point_lights)
+        };
         info!(
-            "Map_S03B point-shadow residency fixed at {}/{} lights ({} cubemap shadow views); camera distance does not change this set",
+            "Map_S03B point-shadow residency fixed at {}/{} eligible lights ({} cubemap shadow views, {}); camera distance does not change this set",
             selected.len(),
-            quality.max_shadowed_point_lights,
+            enabled_count,
             selected.len() * 6,
+            policy,
         );
         *previous_selection = selected;
     }
@@ -672,7 +680,8 @@ fn animate_map_s03b_candle_lights(
 
     let seconds = time.elapsed_secs();
     let shadow_update_hz = quality.resolved_cached_point_shadow_update_hz();
-    let mut shadow_update_budget = quality.max_cached_point_shadow_updates_per_frame;
+    let shadow_update_interval = (shadow_update_hz > 0.0).then(|| 1.0 / shadow_update_hz);
+    let mut shadow_update_candidates = Vec::new();
     for (entity, mut light, mut transform, tuning, mut cached_shadow) in &mut point_lights {
         let intensity_multiplier = candle_flicker_multiplier(seconds, tuning.flicker_phase);
         let range_multiplier = 1.0 + (intensity_multiplier - 1.0) * 0.28;
@@ -682,20 +691,39 @@ fn animate_map_s03b_candle_lights(
             light.range = tuning.base_range * range_multiplier;
             transform.translation =
                 tuning.previous_translation + candle_light_offset(seconds, tuning.flicker_phase);
-            cached_shadow.last_update_tick = None;
-        } else if shadow_update_hz > 0.0 && shadow_update_budget > 0 {
-            let phase_offset =
-                tuning.flicker_phase.rem_euclid(core::f32::consts::TAU) / core::f32::consts::TAU;
-            let update_tick = (seconds * shadow_update_hz + phase_offset).floor() as u64;
-            if cached_shadow.last_update_tick != Some(update_tick) {
-                light.range = tuning.base_range * range_multiplier;
-                transform.translation = tuning.previous_translation
-                    + candle_light_offset(seconds, tuning.flicker_phase);
-                cached_shadow.last_update_tick = Some(update_tick);
-                shadow_cache_frame.invalidate_point_light(entity);
-                shadow_update_budget -= 1;
+            cached_shadow.last_update_seconds = None;
+        } else if let Some(update_interval) = shadow_update_interval {
+            let is_due = point_shadow_update_is_due(
+                cached_shadow.last_update_seconds,
+                seconds,
+                update_interval,
+            );
+            if is_due {
+                shadow_update_candidates.push(PointShadowUpdateCandidate {
+                    entity,
+                    last_update_seconds: cached_shadow.last_update_seconds,
+                });
             }
         }
+    }
+
+    select_point_shadow_updates(
+        &mut shadow_update_candidates,
+        quality.max_cached_point_shadow_updates_per_frame,
+    );
+    for candidate in shadow_update_candidates {
+        let Ok((entity, mut light, mut transform, tuning, mut cached_shadow)) =
+            point_lights.get_mut(candidate.entity)
+        else {
+            continue;
+        };
+        let intensity_multiplier = candle_flicker_multiplier(seconds, tuning.flicker_phase);
+        let range_multiplier = 1.0 + (intensity_multiplier - 1.0) * 0.28;
+        light.range = tuning.base_range * range_multiplier;
+        transform.translation =
+            tuning.previous_translation + candle_light_offset(seconds, tuning.flicker_phase);
+        cached_shadow.last_update_seconds = Some(seconds);
+        shadow_cache_frame.invalidate_point_light(entity);
     }
 
     for (mut transform, glow) in &mut candle_glows {
@@ -707,6 +735,41 @@ fn animate_map_s03b_candle_lights(
             material.emissive = glow.base_emissive * intensity_multiplier;
         }
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PointShadowUpdateCandidate {
+    entity: Entity,
+    last_update_seconds: Option<f32>,
+}
+
+fn point_shadow_update_is_due(
+    last_update_seconds: Option<f32>,
+    seconds: f32,
+    update_interval: f32,
+) -> bool {
+    last_update_seconds.is_none_or(|last_update| {
+        !last_update.is_finite()
+            || seconds < last_update
+            || seconds - last_update >= update_interval
+    })
+}
+
+fn select_point_shadow_updates(
+    candidates: &mut Vec<PointShadowUpdateCandidate>,
+    max_updates: usize,
+) {
+    candidates.sort_unstable_by(|left, right| {
+        match (left.last_update_seconds, right.last_update_seconds) {
+            (None, None) => left.entity.index().cmp(&right.entity.index()),
+            (None, Some(_)) => core::cmp::Ordering::Less,
+            (Some(_), None) => core::cmp::Ordering::Greater,
+            (Some(left_time), Some(right_time)) => left_time
+                .total_cmp(&right_time)
+                .then_with(|| left.entity.index().cmp(&right.entity.index())),
+        }
+    });
+    candidates.truncate(max_updates);
 }
 
 fn candle_flicker_multiplier(seconds: f32, phase: f32) -> f32 {
@@ -792,16 +855,25 @@ fn startup_level_from_args() -> LevelId {
     while let Some(arg) = args.next() {
         if let Some(path) = arg.strip_prefix("--level=") {
             if !path.trim().is_empty() {
-                return LevelId::asset(path);
+                return level_id_from_argument(path);
             }
-        } else if arg == "--level" {
-            if let Some(path) = args.next().filter(|path| !path.trim().is_empty()) {
-                return LevelId::asset(path);
-            }
+        } else if arg == "--level"
+            && let Some(path) = args.next().filter(|path| !path.trim().is_empty())
+        {
+            return level_id_from_argument(&path);
         }
     }
 
     LevelId::asset("levels/Map_S03B/Map_S03B.zevy-level.json")
+}
+
+fn level_id_from_argument(value: &str) -> LevelId {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "performance" | "performance-lab" => LevelId::PerformanceLab,
+        "fog" | "fog-pyramid" => LevelId::FogPyramid,
+        "empty" => LevelId::Empty,
+        _ => LevelId::asset(value),
+    }
 }
 
 fn apply_active_level_fog_to_cameras(
@@ -844,6 +916,18 @@ mod tests {
         assert_eq!(
             map_s03b_player_start("levels/Other/Other.zevy-level.json"),
             None,
+        );
+    }
+
+    #[test]
+    fn recognizes_builtin_performance_lab_level_argument() {
+        assert_eq!(
+            level_id_from_argument("performance"),
+            LevelId::PerformanceLab
+        );
+        assert_eq!(
+            level_id_from_argument("levels/Test/Test.zevy-level.json"),
+            LevelId::asset("levels/Test/Test.zevy-level.json")
         );
     }
 
@@ -925,6 +1009,62 @@ mod tests {
             candle_light_offset(1.25, 0.25),
             candle_light_offset(1.25, 2.25),
         );
+    }
+
+    #[test]
+    fn cached_point_shadow_scheduler_is_fair_when_oversubscribed() {
+        const LIGHT_COUNT: usize = 16;
+        const UPDATE_BUDGET: usize = 2;
+        const UPDATE_HZ: f32 = 8.0;
+        const FRAME_RATE: f32 = 17.0;
+        const FRAME_COUNT: usize = 160;
+
+        let mut world = World::new();
+        let entities = (0..LIGHT_COUNT)
+            .map(|_| world.spawn_empty().id())
+            .collect::<Vec<_>>();
+        let mut last_updates = vec![None; LIGHT_COUNT];
+        let mut update_counts = vec![0_usize; LIGHT_COUNT];
+        let update_interval = 1.0 / UPDATE_HZ;
+        let frame_interval = 1.0 / FRAME_RATE;
+
+        for frame in 0..FRAME_COUNT {
+            let seconds = frame as f32 * frame_interval;
+            let mut candidates = entities
+                .iter()
+                .copied()
+                .zip(last_updates.iter().copied())
+                .filter(|(_, last_update)| {
+                    point_shadow_update_is_due(*last_update, seconds, update_interval)
+                })
+                .map(|(entity, last_update_seconds)| PointShadowUpdateCandidate {
+                    entity,
+                    last_update_seconds,
+                })
+                .collect::<Vec<_>>();
+
+            select_point_shadow_updates(&mut candidates, UPDATE_BUDGET);
+            for candidate in candidates {
+                let light_index = entities
+                    .iter()
+                    .position(|entity| *entity == candidate.entity)
+                    .unwrap();
+                last_updates[light_index] = Some(seconds);
+                update_counts[light_index] += 1;
+            }
+        }
+
+        let minimum_updates = update_counts.iter().copied().min().unwrap();
+        let maximum_updates = update_counts.iter().copied().max().unwrap();
+        assert!(minimum_updates > 0);
+        assert!(maximum_updates - minimum_updates <= 1);
+
+        let final_seconds = (FRAME_COUNT - 1) as f32 * frame_interval;
+        let maximum_staleness = last_updates
+            .iter()
+            .map(|last_update| final_seconds - last_update.unwrap())
+            .fold(0.0, f32::max);
+        assert!(maximum_staleness <= LIGHT_COUNT.div_ceil(UPDATE_BUDGET) as f32 * frame_interval);
     }
 
     #[test]
