@@ -1,10 +1,10 @@
 # Zevy VR 一体机渲染优化参考手册
 
-> 文档状态：架构研究与长期参考，不代表当前功能已经实现  
+> 文档状态：已实现里程碑、架构复盘与长期研究路线；每项状态以正文证据标记为准
 > 目标平台：Android VR 一体机，OpenXR + Vulkan，PICO/Quest 级移动 SoC  
 > 目标引擎：高性能、现代 PBR、动态多灯光、动态阴影、稳定双眼输出  
-> 资料校正日期：2026-07-17  
-> 当前项目基线：Bevy 0.16.1、wgpu 24、`bevy_mod_openxr` 0.3 的本地修改版
+> 资料校正日期：2026-07-20
+> 当前项目基线：Bevy 0.16.1、wgpu 24、`bevy_mod_openxr` 0.3 的本地修改版；上游对照为 Bevy 0.19 与 wgpu 30
 
 本文把本目录的四张网页截图作为术语和历史背景，并结合 OpenXR 1.1、Vulkan 1.1+、现代移动 tile-based GPU、2025 年多灯光研究以及 Zevy 当前代码状态进行重新推导。截图中的 Unity、OpenGL ES 和厂商 SDK 结论不能直接等同于 Zevy 的 Vulkan/Bevy 实现。
 
@@ -27,6 +27,7 @@ VR 一体机渲染不是桌面渲染的低画质版本。它同时受到双眼�
 3. **动态灯光不等于所有灯每像素计算，也不等于所有灯每帧更新阴影。** 灯光外观、直接光照、阴影分辨率和阴影更新频率必须解耦。
 4. **优先减少像素、带宽和外部内存往返。** 一体机通常比三角形吞吐更早受到 fragment、attachment bandwidth 和热功耗限制。
 5. **优化顺序是结构复用、感知复用、时间复用，最后才是牺牲正确性。** 先做 Multiview、tile-local、缓存和 foveation，再考虑删灯、删阴影或明显降低画质。
+6. **框架边界不是产品边界。** Bevy、wgpu、Naga、OpenXR 插件、渲染图和 Vulkan backend 都允许 fork、修改或替换；插件层实现只是手段，不能成为限制架构突破的教条。
 
 推荐的长期基线是：
 
@@ -36,7 +37,7 @@ VR 一体机渲染不是桌面渲染的低画质版本。它同时受到双眼�
 
 > **确定性关键灯光 + 双眼共享的随机长尾灯光采样 + 解耦低频阴影项。**
 
-不建议把完整桌面 Deferred、Virtual Shadow Maps、逐像素 ReSTIR 或硬件光追作为第一代一体机基线。这些可以成为高端设备能力层，但不能成为最低公共路径。
+不建议把完整桌面 Deferred、Virtual Shadow Maps、逐像素 ReSTIR 或硬件光追直接指定为第一代一体机公共基线。这不是研究禁令：它们以及 software BVH、tile-local deferred、稀疏 shadow page 等路线都应允许隔离原型和真机竞赛；只有证据不足的方案不能未经验证成为最低公共路径。
 
 ---
 
@@ -82,12 +83,12 @@ OpenXR 1.1 的四视图配置由两个外围 view 和两个 foveated inset view 
 |---|---|---|
 | 图形 API | Android Vulkan + OpenXR | 方向正确，可使用 Vulkan 1.1 Multiview，但仍需查询设备能力。 |
 | 立体渲染 | OpenXR 插件创建两个独立 `XrCamera`，分别指向 swapchain array layer | **当前本质上是 Multi-Pass。** |
-| Bevy Pipeline | 本地 Bevy 0.16.1 的 pipeline cache 把 wgpu `multiview` 固定为 `None` | Multiview 不是简单配置项，需要引擎渲染层修改或升级。 |
+| Bevy Pipeline | 本地 Bevy 0.16.1 的 pipeline cache 把 wgpu `multiview` 固定为 `None` | Multiview 不是简单配置项，需要修改引擎渲染层或升级；这不再被视为禁区。 |
 | GPU-driven | XR 相机带有 `NoIndirectDrawing` | 当前关闭 Bevy GPU transform/culling/indirect 路径，CPU 和 draw 扩展性受到限制。 |
 | XR 分辨率 | `RenderQualityConfig.xr_render_scale = 0.8` | 每眼宽高 0.8，理论像素为推荐分辨率的 64%。 |
 | MSAA | `msaa_samples = 2` | 是移动 VR 的合理起点，仍须实测带宽和边缘质量。 |
 | 灯光分簇 | Map_S03B 已从 `ClusterConfig::Single` 迁移到可配置 Clustered Forward，并叠加固定预算 Scalable Point Lighting 原型 | 当前每个 shading point 默认完整计算 2 个 Hero + 2 个 Tail；下一步应把候选 PDF 上移到双眼共享 tile/froxel。 |
-| 当前 Map_S03B 材质 | glTF 使用 `KHR_materials_unlit` | PointLight 不会影响这些表面；当前性能测试不能代表 PBR 多灯光成本。 |
+| 当前 Map_S03B 材质 | 当前目录有 39 个 glTF，均未声明 `KHR_materials_unlit`；静态模型包含 `pbrMetallicRoughness` | 当前测试已经覆盖可受 PointLight 影响的 StandardMaterial/PBR 接收路径，但仍需用 HUD 区分具体材质复杂度。 |
 | 阴影 | 当前 Map_S03B 的 16 盏 PointLight 已接入持久化静态 cubemap-array 与动态 caster overlay | 默认公平调度每帧最多更新 2 盏灯，即最多 12 面重绘/84 面复用；动态层只清除并重绘当前或上一帧受动态 caster 影响的 face。尚未完成真实 GPU 毫秒预算调度。 |
 | 纹理 | 已有 mip chain、trilinear 和 anisotropic sampler | 方向正确；下一阶段是 ASTC/KTX2、分辨率分级和纹理带宽统计。 |
 | 调试 | HUD 已显示 triangles、draw 估算、fragment、pass 和材质信息 | 应继续加入每 cluster 灯数、阴影 texel 更新量、热状态和双眼实际 GPU 时间。 |
@@ -101,9 +102,69 @@ Map_S03B 测得：
 - `Triangles / eye ≈ 208,989`，随镜头远近基本不变：当前没有有效 LOD。
 - `Fragment invocations` 随画面覆盖率大幅变化，并与帧率强相关：当前更像 fill-rate/带宽瓶颈。
 - VR fragment 大约是 PC 的两倍：符合双眼独立渲染预期。
-- 当前材质是 Unlit：不能把这次 fragment 成本推断为动态灯光或 PBR 成本。
+- 当前重新导出的静态模型不再声明 `KHR_materials_unlit`，并包含 glTF PBR 材质；当前 fragment 成本已经混入动态灯光/PBR 工作，必须通过 shadow-off、direct-off 和 material tier A/B 继续拆分。
 
 因此最近的 0.8 Scale 与 MSAA 2x 是正确的诊断方向，但长期引擎不能止步于统一降分辨率。
+
+### 3.2 16 盏动态灯光里程碑复盘（2026-07-20）
+
+Map_S03B 已在 VR 一体机上同时运行 16 盏 PointLight，全部保持直接光和阴影驻留，火光强度、发光体以及阴影投影都能动态变化。实机约 20 FPS，阴影变化存在明显阶梯感。这个结果是一个重要的**可行性突破**，但还不是“高性能渲染器完成”：20 FPS 对应约 50 ms/frame，而 72 Hz 和 90 Hz 的帧预算分别只有 13.89 ms 与 11.11 ms，仍需约 3.6 倍和 4.5 倍的结构性提速。
+
+当前阴影阶梯感可以直接由预算解释。16 盏灯目标 8 Hz、每帧最多更新 2 盏时，在 20 FPS 下每盏灯的长期上限为：
+
+\[
+f_{shadow}=\min\left(8,\frac{20\times2}{16}\right)=2.5\ \text{Hz}
+\]
+
+即一次完整轮转约 400 ms。调度器现在能保证公平、不会再冻结某几盏灯，但公平调度只能分配稀缺预算，不能凭空创造 GPU 时间。若仍用真实移动 PointLight 重画静态建筑的六面 cubemap，要维持 16 灯 × 8 Hz，在 20 FPS 下至少需要每帧更新：
+
+\[
+B=\left\lceil\frac{16\times8}{20}\right\rceil=7\ \text{lights/frame}=42\ \text{faces/frame}
+\]
+
+这说明下一步不能只继续增大 `max_cached_point_shadow_updates_per_frame`，而必须降低一次投影更新的成本，或让视觉上的连续运动不再依赖每次重画六面深度。
+
+#### 3.2.1 已经形成的突破性方案
+
+| 突破 | Zevy 已做的事情 | 为什么重要 | 尚未解决 |
+|---|---|---|---|
+| 灯光物理范围与相机可见性解耦 | 修复 XR infinite reverse-Z 下错误的灯光远裁剪，保持约 6 m 物理照射范围，同时让远处相机仍能看到墙面受光 | 消除了“靠近才突然亮”的非物理行为，没有用扩大 `light.range` 掩盖问题 | 仍需设备级 cluster/visibility telemetry |
+| 正常 Clustered Forward 候选生成 | 从单一全屏 cluster 迁移到可配置 froxel | 灯光候选由空间相交决定，灯数可以扩展 | Bevy 0.16 的 clustering 与双眼仍有重复，缺少 overflow 观测 |
+| 固定昂贵成本的 Hero + Tail 光照 | 直接替换 Bevy PBR PointLight 循环；每像素保留 2 个确定性 Hero 与 2 个重要性采样 Tail | 完整 BRDF + shadow lookup 从随候选灯数增长，变为默认最多 4 次 | 选灯仍在每个片元扫描候选列表，尚未达到真正固定总成本 |
+| 阴影驻留与相机距离解耦 | 所有关卡启用阴影的 PointLight 常驻，`max_shadowed_point_lights = 0` 自动跟随导入灯数 | 16 盏灯不会因玩家移动突然丢失或出现阴影 | 常驻不等于便宜，96 个静态 face 仍有 view 管理成本 |
+| 真正的跨帧阴影内容缓存 | 不只是复用 texture object，而是有效 layer 完全跳过 clear、render pass 和 shadow draw | 静态建筑不再为所有灯每帧重复 raster | 当前仍较晚才跳过 pass，前置 visibility/queue 工作仍可能发生 |
+| `Static × Dynamic` 双层阴影 | 静态建筑进入持久层，动态 caster 进入独立 overlay，PBR 中执行 `Vstatic × Vdynamic` | 少量动态物体不再使整座建筑的静态阴影失效 | 动态层激活时仍为所有灯预留对称 cube 空间，尚未稀疏分页 |
+| 无额外材质绑定的 atlas 编码 | 用 static/dynamic cube-array 的偶奇性与 sentinel 让 shader 识别双层布局 | 在 Bevy 既有 PBR bind group 约束下完成了双层合成 | 这是兼容性技巧，不应阻止未来重做 bind layout |
+| XR 阴影跨眼复用 | 相同 `(light, face)` 用原子 claim 去重，左右眼共享 light-space depth | 阴影不是 eye-dependent 数据，避免双眼重复提交相同 pass | 主场景渲染仍是双相机 Multi-Pass |
+| 无饥饿阴影调度 | 从未更新优先，其余 oldest-first；低帧率时所有灯公平轮转 | 预算不足只降低整体更新频率，不再永久冻结后排灯 | 固定“灯/帧”不是 GPU 毫秒预算，也没有视觉误差模型 |
+| VR 内可观测性 | HUD 显示 FPS、fragment、draw/triangle 估算、pass、材质、阴影 redraw/reuse、动态 caster | 优化从猜测变成可证伪实验 | Android 真 GPU pass 时间、cluster occupancy、thermal 尚不完整 |
+
+真正的共同突破不是某个单独技巧，而是把一个“动态灯”拆成了彼此独立的预算维度：
+
+\[
+Light = Visibility + DirectLighting + StaticDepth + DynamicDepth + UpdateRate + FilterQuality
+\]
+
+因此“灯必须同时可见”不再等于“每盏灯每像素完整计算、每帧重画六面阴影”。这套解耦是 Zevy 后续扩展到更多灯的核心资产。
+
+#### 3.2.2 仍然保守或只是过渡的做法
+
+| 保守边界 | 当前代价 | 下一步应如何打破 |
+|---|---|---|
+| 固守 Bevy 0.16.1 / wgpu 24 | 错过上游 GPU light clustering、GPU-driven 改进、render schedule 重构和新版 Multiview 基础 | 并行评估升级 Bevy 0.19、选择性回移上游优化、维护 Zevy 引擎 fork；以实机结果决定，不以迁移工作量否决 |
+| XR 两个独立 Camera/Multi-Pass | 重复 view extraction、culling、draw encoding、状态和几何工作；fragment 本来就近似双倍 | 修改 Bevy/wgpu/OpenXR 渲染链，建立真正的 layered Multiview 主 Pass 与 Cyclopean culling |
+| XR 相机使用 `NoIndirectDrawing` | 无法充分使用 GPU culling、batching 与 multi-draw indirect | 修改 XR render target/phase 兼容性，恢复并验证 GPU-driven 路径 |
+| Hero/Tail 在每个片元选灯 | 虽然完整 BRDF 固定为 4 次，但 Hero 扫描、Tail 求和和每个样本查找仍约为 \(O((K+2)N)\) | 把候选重要度、Hero 和 reservoir/alias table 上移到双眼共享 tile/froxel，只把紧凑 ID 列表交给片元 |
+| 16 盏都用 PointLight cubemap | 每次真实更新固定六个 face，灯型表达也未必符合壁灯/烛台 | 尝试 cubemap 六面 Multiview、dual-paraboloid、Spot proxy、octahedral/software raster 与共享 BVH visibility |
+| 5 mm 火光摇摆也重画静态建筑 | 很小的视觉变化会使该灯六个静态 face 全部失效，造成 2.5 Hz 阶梯 | 默认冻结 nominal static depth，在 shader 中连续驱动 PCF/cookie/微扰；真实移动阴影改为关键帧双采样或只给 Hero |
+| 动态 overlay 使用对称双倍 cube-array | 只有少量 `(light, face)` 受动态 caster 影响时仍扩展整套 atlas | 做稀疏 dynamic page、face indirection 与按影响关系分配 |
+| 固定 128²、固定灯/帧预算 | 简单稳定，但没有利用屏幕误差、caster 数和真实 GPU 成本 | 建立 per-face cost EMA、误差/年龄优先级和 GPU-ms token bucket |
+| 没有 LOD/HLOD/PVS | 远近三角形基本不变，阴影 caster 与主视图都承担多余几何 | UE 导出 LOD、room/portal/PVS、shadow-only LOD，并恢复 GPU visibility range |
+| 统一 render scale 0.8 + MSAA 2x | 是有效但粗粒度的 fill-rate 降级，中央与外围一起损失 | 优先接入运行时 foveation/VRS、periphery material tier 和 tile-local attachment 优化 |
+
+截至 2026-07-20，上游 [Bevy 0.19](https://bevy.org/news/bevy-0-19/) 已把 light clustering 搬到 GPU，并继续增强 GPU-driven batching；其官方 `many_lights` 基准报告 clustering 有数量级改进，但该结果不能直接外推到 Android VR，必须在 Map_S03B 上复测。新版 [wgpu Multiview](https://github.com/gfx-rs/wgpu/releases/tag/v28.0.0) 已增加跨后端验证和 view bitmask。它们共同证明：当前 0.16.1 的限制是项目选择，不是图形 API 的物理边界。
+
+结论是：下一阶段不能以“尽量不动 Bevy 源码”为目标。正确目标是让每一个架构假设都接受数学模型、GPU capture 和目标设备 A/B 的检验；必要时 fork Bevy、wgpu、Naga、XR 插件，甚至绕过现有 PBR/shadow pipeline 建立 Zevy 专用移动 VR 路径。
 
 ---
 
@@ -623,26 +684,26 @@ Epic 文档没有把移动双眼作为 MegaLights 的目标平台。对 Zevy 必
 
 ### 9.6 Map_S03B 的 Zevy Scalable Lighting 实验（2026-07-17）
 
-Map_S03B 的七灯 Android VR 实测已经说明，“灯数不多”并不等于确定性遍历足够便宜：双眼、高 fragment 数、完整 PBR BRDF 与 cubemap shadow 会把七盏灯放大成明显瓶颈。因此工程上提前拉取阶段 5 的一部分，在小场景直接验证固定预算模型，而不再把随机长尾限定到几十盏灯之后。
+Map_S03B 最初的七灯 Android VR 实测已经说明，“灯数不多”并不等于确定性遍历足够便宜；当前测试又扩展到 16 盏。双眼、高 fragment 数、完整 PBR BRDF 与 cubemap shadow 会把局部灯放大成明显瓶颈。因此工程上提前拉取突破性多灯光路径，在小场景直接验证固定预算模型，而不再把随机长尾限定到几十盏灯之后。
 
 当前实验路径直接替换 Bevy 0.16.1 的 `pbr_functions.wgsl` PointLight 循环：
 
 - 保留正常 Clustered Forward 作为候选灯生成器，不再使用 `ClusterConfig::Single`；
-- 阴影驻留与相机距离完全解耦；Map_S03B 七盏灯的 cubemap shadow 始终启用，不再在玩家靠近时突然出现；
+- 阴影驻留与相机距离完全解耦；Map_S03B 当前 16 盏灯的 cubemap shadow 始终启用，不再在玩家靠近时突然出现；
 - 每个 shading point 按亮度、距离和 Bevy range attenuation 选择贡献最大的 2 盏灯作为稳定 Hero；
 - 其余 PointLight 作为 Tail，不论它是否投射阴影，都进入相同的重要性 PDF；
 - 每个 shading point 只完整执行固定 K 次 Tail shadow + BRDF，当前默认 K=2；
 - 使用系统分层采样和 `1/(K*p_l)` 权重，保持 Tail 直接光与阴影贡献的估计无偏；
 - 当 cluster 候选总数不超过 Hero + Tail 预算时自动回到完全确定性求和，不引入噪声；
 - 随机种子使用 12.5 cm 量化世界坐标，同一表面的左右眼尽量选择相同灯；默认关闭时间轮换，使同一表面的 Tail 选择不随帧闪烁；
-- 当前七盏 PointLight 阴影全部常驻、cubemap 面为 128²，而完整 PointLight shadow + BRDF 上限从 7 降为 4（2 Hero + 2 Tail）。
+- 当前 16 盏 PointLight 阴影全部常驻、cubemap 面为 128²，而每个 shading point 的完整 PointLight shadow + BRDF 上限从最多 16 降为 4（2 Hero + 2 Tail）。
 
 这个实验不是完整 STB Lighting，也没有 denoiser/reservoir history。它主动接受以下 trade-off：
 
 - 多盏相似强度 Tail 同时影响同一表面时，可能出现空间分块、低频闪烁或高光方差；
 - 世界坐标相关只能提高双眼相关性，不能保证左右眼 cluster 候选列表在 frustum 边缘完全一致；
 - 每像素仍需扫描候选灯来构造 PDF；下一步应把 coarse PDF 和候选采样上移到 Cyclopean tile/froxel，供双眼共享；
-- 七盏 PointLight 仍有 42 个常驻 cubemap shadow view；持久化缓存已经消除了稳定面每帧重复的 depth clear/raster，但 Bevy 当前仍会为这些 view 准备 visibility/render phase，CPU 侧还可继续下钻；
+- 16 盏 PointLight 仍有 96 个常驻 cubemap shadow view；持久化缓存已经消除了稳定 face 每帧重复的 depth clear/raster，但 Bevy 当前仍可能为这些 view 准备 visibility/render phase，CPU 侧还可继续下钻；
 - 不允许再次用“相机靠近才打开阴影”作为性能降级策略。低优先级阴影只能降分辨率、降低更新频率并复用缓存，不能在可见画面中突然从无到有。
 
 配置入口为 `RenderQualityConfig.scalable_point_lighting`、`point_light_hero_samples`、`point_light_tail_samples`、`temporal_point_light_sampling` 和 `light_sample_period_frames`。`max_shadowed_point_lights` 是与相机无关的可选稳定驻留上限：默认值 `0` 表示自动常驻关卡中所有原本启用阴影的 PointLight，正整数仅用于显式性能 A/B，不再把旧七灯测试数量硬编码成产品默认值。VR 默认关闭 temporal sampling，只有显式实验时才按帧轮换 Tail。关闭 scalable lighting 总开关后完整回退到 Bevy 原始确定性 PBR shader，便于 Android A/B。阴影缓存相关入口为 `persistent_point_shadow_cache`、`dynamic_shadow_caster_overlay`、`point_shadow_cache_warmup_frames`、`cached_point_shadow_update_hz` 和 `max_cached_point_shadow_updates_per_frame`。
@@ -675,9 +736,9 @@ Zevy 当前用自定义 `EarlyShadowPass` 节点实现了真正的内容缓存�
 - 静态 layer 有效时完全跳过该 depth render pass，因此既不 clear，也不提交该面的 shadow draw，原深度内容继续留在 cube-array atlas 中；
 - 导入 Actor 的全局变换、可见性、Mesh handle 或 shadow-caster 数量变化时使静态缓存失效；PointLight 自身的位移、range 或 shadow near-z 变化只使该灯的 6 个面失效；
 - SpotLight、DirectionalLight 和未标记为 cacheable 的灯仍走 Bevy 原始逐帧阴影路径，不会被错误缓存；
-- 缓存与相机距离无关。七盏灯始终保留 42 个阴影面，不会因玩家跨过距离阈值而突然出现或消失阴影。
+- 缓存与相机距离无关。当前 16 盏灯始终保留 96 个阴影面，不会因玩家跨过距离阈值而突然出现或消失阴影。
 
-Map_S03B PC 运行验证中，稳定帧 HUD 为 `6 redraw / 36 reuse / 42 resident`。当前每帧最多允许一盏蜡烛灯更新位置，所以只重绘它的 6 面。以 128² face 计，全量更新为
+第一阶段七灯版的 Map_S03B PC 运行验证中，稳定帧 HUD 为 `6 redraw / 36 reuse / 42 resident`。当时每帧最多允许一盏蜡烛灯更新位置，所以只重绘它的 6 面。以 128² face 计，全量更新为
 
 \[
 42\times128^2=688{,}128\ \text{depth texels/frame}
@@ -1158,7 +1219,7 @@ OpenXR 新规范中已有厂商 performance metrics 与 frame synthesis 扩展�
 
 1. 近距离贴墙：最大 screen coverage、纹理和 fragment 压力。
 2. 长廊远眺：mipmap、LOD、远灯和 cluster far range。
-3. 七灯同时可见：多灯分配和阴影预算。
+3. 16 灯同时可见：多灯分配、采样稳定性和阴影预算。
 4. 快速转头：late pose、temporal ghosting 和 foveation。
 5. 门口跨 room：portal/PVS 和 streaming。
 6. 动态物体穿过多灯：dynamic shadow overlay。
@@ -1175,72 +1236,148 @@ OpenXR 新规范中已有厂商 performance metrics 与 frame synthesis 扩展�
 
 ---
 
-## 20. Zevy 研究路线图（不是本次开发任务）
+## 20. Zevy 下一阶段优化执行计划（2026-07-20）
 
-### 阶段 0：可信测量
+这不再是“以后也许研究”的愿望清单。16 灯已经证明架构可行，下一阶段任务是把 50 ms/frame 压入移动 VR 的 13.89 ms（72 Hz）公共预算，并为 11.11 ms（90 Hz）保留升级路径。实现方式不受插件层、Bevy 版本或既有 render graph 限制。
 
-- 完成 GPU pass、双眼分辨率、MSAA、fragment/px、cluster 和 shadow telemetry。
-- 建立固定 camera path 与 thermal soak。
-- 输出设备 capability matrix。
+### 20.1 不可退让的产品约束与可打破的实现假设
 
-成功标准：任何掉帧都能回答是 CPU、geometry、fragment、bandwidth、shadow 还是 thermal。
+不可退让：
 
-### 阶段 1：消除双眼结构重复
+- Map_S03B 至少 16 盏灯的直接光与阴影可同时存在；
+- 灯光物理照射范围不因性能策略被偷偷扩大；
+- 阴影驻留不依赖相机靠近，不允许突然出现/消失；
+- 左右眼灯光选择、阴影状态、LOD 和随机序列必须一致；
+- 最终以目标一体机 20～30 分钟热稳定后的 P95/P99 为准。
 
-- Vulkan Multiview 最小原型。
-- 保留 Multi-Pass fallback。
-- 共享 union-frustum culling、draw list 和 shadow pass。
-- 评估恢复 indirect drawing。
+可以打破：
 
-成功标准：画面完全一致，CPU render time/draw submission 明显下降，fragment 数不会被误解为减半。
+- Bevy 0.16.1、wgpu 24 和当前 OpenXR 插件版本；
+- Bevy StandardMaterial 的 bind group、PBR 函数和 shadow pass 组织；
+- “PointLight 必须用六面 cubemap”“每个 Camera 必须独立跑完整 render graph”“阴影只能是传统 shadow map”等实现假设；
+- 现有文件、模块和插件边界，只要替代方案可测量、可回退并符合许可证。
 
-### 阶段 2：Mobile PBR + 正常 Clustered Forward
+### 20.2 P0：先得到可分解的 50 ms
 
-- [已完成原型] 从 `ClusterConfig::Single` 迁移到可调 froxel。
-- 建立 material tier 和简单 GGX。
-- 正确分离 light physical range 与 emitter visibility。
-- cluster overflow 可视化。
+在继续改算法前，建立固定相机路径和以下 A/B 矩阵；每项记录 CPU main/render、GPU frame、主 Pass、shadow depth、fragment、draw、更新 face 数、温度和频率：
 
-成功标准：七灯或更多灯同时影响远处可见墙面，不依赖扩大 range，也不让每像素遍历全部灯。
+| 实验 | 隔离的问题 |
+|---|---|
+| 16 灯 direct on、shadow off | 直接光、PBR 和每像素选灯成本 |
+| 16 灯 shadow resident、全部投影冻结 | shadow sampling、96 个 view 的管理和缓存下限 |
+| 投影预算 0/1/2/4 light/frame | 每更新一盏 PointLight 的真实边际 GPU ms |
+| dynamic overlay off/on，无 caster/1 caster/7 caster | 动态层的固定成本与每 face 成本 |
+| scalable lighting off、2H+0T、2H+1T、2H+2T | Hero/Tail 扫描、BRDF 和 shadow compare 的成本曲线 |
+| PC 单眼、XR Multi-Pass | 双眼结构重复与纯像素翻倍的比例 |
+| render scale 0.6/0.8/1.0，MSAA 1x/2x | fill-rate、attachment bandwidth 与几何瓶颈区分 |
 
-### 阶段 3：持久化阴影系统
+优先把 Android GPU Inspector/厂商 profiler 的 GPU capture 与 Zevy HUD 对齐。P0 的完成标准不是“多了更多数字”，而是能指出 50 ms 中最大的两个模块，并预测关闭其中一个后帧时间应该下降多少。
 
-- [已完成第一阶段] PointLight cubemap-array atlas 内容跨帧保留、静态 cache、按灯局部失效与 HUD telemetry。
-- [已完成 PointLight] static/dynamic caster 分离、双层 cube-array 与 PBR visibility 合成。
-- 按 GPU 毫秒预算调度。
-- Point/Spot authoring 策略。
-- 独立 shadow LOD 和 resolution tier。
+### 20.3 P1：先消灭阴影阶梯，而不是增加 42 个 face/frame
 
-成功标准：静态七灯可长期保留阴影，只有发生变化的 atlas 区域更新，移动物体没有明显 shadow lag。
+为蜡烛类小幅运动引入三档 `ShadowMotionMode`：
 
-### 阶段 4：Foveation 与自适应质量
+1. **`ContinuousProxy`（移动端默认候选）**：静态深度固定在 nominal light origin；强度、颜色、emissive 每帧变化，shadow shader 连续旋转/缩放 PCF kernel，并叠加低频 cookie 或小幅 lookup perturbation。视觉投影连续，但不使静态 cubemap 失效。
+2. **`KeyframedCrossFade`（质量档）**：保存前后两个低频阴影快照与各自 light transform，在两次真实更新之间采样 `V0`、`V1` 并连续混合。它用额外 atlas/一次 shadow compare 换取时间连续性，需评估双影和漏光。
+3. **`TrueMovingShadow`（Hero/参考档）**：真实移动 light projection 并按 GPU 预算重画，作为正确性参考和关键交互灯路径。
 
-- OpenXR extension/capability matrix。
-- FFR/VRS、render scale、MSAA quality profiles。
-- thermal-aware controller。
-- 高清 compositor UI layer。
+动态 caster overlay 继续独立更新，不因静态火光代理而被冻结。P1 成功标准：16 盏蜡烛的静态层在稳定场景接近 `0 redraw / 96 reuse`，阴影仍有连续火光感，实机看不到约 400 ms 的台阶；Hero 真动态灯保持几何正确。
 
-成功标准：高负载时优先牺牲外围和非关键阴影，P99 恢复且无左右眼不一致。
+### 20.4 P2：把每片元 \(O(N)\) 选灯搬到双眼共享 tile
 
-### 阶段 5：突破性多灯光路径
+当前 Hero/Tail 虽将昂贵的 BRDF + shadow 次数限制为 \(H+K=4\)，但每个片元仍执行 Hero 扫描、Tail 求和，以及每个 Tail 样本的线性查找：
 
-- Cyclopean/shared cluster。
-- [已完成每像素原型] Hero deterministic + importance-sampled tail。
-- [已完成第一步] 世界空间相关的双眼采样；下一步升级为共享 tile reservoir。
-- 解耦 2×2 shadow term。
-- 不依赖长历史的 VR 稳定策略。
+\[
+C_{current}\approx P\left[(K+2)N\,c_{importance}+(H+K)c_{shade}\right]
+\]
 
-成功标准：灯数增长时成本接近固定；关键灯完全稳定；随机长尾没有可感知 binocular mismatch、闪烁或明显能量偏差。
+在 4,000,000 fragment、16 灯、\(K=2\) 时，轻量 importance 循环也可能被放大到数亿次量级。下一步建立 Cyclopean compute pass：
 
-### 阶段 6：高端能力层
+- 用双眼 union frustum 构建一次 tile/froxel light list；
+- 每 tile 选择稳定 Hero，并为 Tail 构建 reservoir、CDF 或 alias table；
+- 两眼共享 light IDs、PDF 和随机种子，片元只做局部 attenuation 修正与固定 \(H+K\) 次完整 shading；
+- 需要 material/normal 敏感时，使用少数方向 cone 或 depth/normal bin，而不是回到逐片元全扫描。
 
-- Eye-tracked foveation / foveated inset views。
-- Temporal upscaling。
-- Space warp/frame synthesis。
-- 单个 Hero light ray-query shadow。
-- Tile-local deferred 实验。
+目标成本变为：
 
-这些都必须是 capability-driven，可完全回退到阶段 4 的公共路径。
+\[
+C_{tile}\approx T\,N\,c_{select}+P(H+K)c_{shade},\qquad T\ll P
+\]
+
+上游 [Bevy 0.19 GPU light clustering](https://bevy.org/news/bevy-0-19/) 应作为可移植代码和数据布局参考，但不直接假设其桌面基准收益等于 Android VR。P2 成功标准：灯数从 16 增到 32/64 时，主光照 Pass 的增长斜率显著变平，且双眼没有不同 light sample 造成的亮度或阴影不一致。
+
+### 20.5 P3：建立 Zevy Render Fork，消除双眼与 CPU 提交重复
+
+并行建立三个可运行实验，不预先认定哪条最省工作量：
+
+| 路径 | 目的 |
+|---|---|
+| 升级到 Bevy 0.19 | 直接获得 GPU clustering、GPU-driven batching、visibility range 和新版渲染调度基础 |
+| 在当前产品分支选择性回移 | 只移植 GPU clustering、multiview、indirect/culling 等高收益模块，控制迁移面 |
+| Zevy 专用 renderer/fork | 保留 ECS/asset，替换主 3D、灯光和阴影 pipeline；必要时直接修改 wgpu-hal/Vulkan backend |
+
+具体实验：
+
+- 使用新版 wgpu 的 view bitmask 与 `@builtin(view_index)` 建立双眼 layered Multiview 主 Pass；
+- 用一次 Cyclopean visibility、draw list 和 command encoding 服务两眼；
+- 修复 XR target 与 GPU preprocessing 的冲突，移除 `NoIndirectDrawing`，恢复 GPU culling/MDI；
+- 试验每盏 PointLight 用 6-view Multiview 一次提交 cubemap 六面；若顶点放大或驱动表现不佳，立即与六 pass、dual-paraboloid 比较。
+
+Multiview 不会消除双眼 fragment，但应消除大量 CPU、draw/state 和可共享几何工作。wgpu 28 已重做并验证 [Multiview 与 view bitmask](https://github.com/gfx-rs/wgpu/releases/tag/v28.0.0)，所以当前 `multiview = None` 不是继续 Multi-Pass 的理由。P3 成功标准：相同画面下 CPU render/draw submission 明显下降，GPU fragment 数保持符合双眼像素事实，所有 StandardMaterial/shadow/post-process 正确读取 view index。
+
+### 20.6 P4：把阴影从“96 个固定 view”升级为稀疏、预测式系统
+
+- 在 view extraction/visibility/queue 之前判定 cache hit，而不是最后只跳过 render pass；
+- dynamic atlas 只为真正受动态 caster 影响的 `(light, face)` 分配 page，通过 indirection 查找，不再全局 `2N+1` 对称扩容；
+- 为每个 face 记录上次 GPU ms、caster/triangle 数、屏幕误差、年龄和运动速度，使用 GPU-ms token bucket 调度；
+- 静态 caster 使用 shadow-only LOD/HLOD，动态 caster 使用独立更保守的 bounds；
+- Hero、Medium、Tail 分别使用 exact update、keyframe/proxy、低分辨率或无 map visibility，不再让 16 盏灯拥有完全相同的成本模型；
+- 对 PointLight 实测 cubemap、6-view Multiview、dual-paraboloid、Spot proxy；任何表示只凭目标机 GPU ms 和误差胜出。
+
+P4 成功标准：没有动态 caster 的静态帧不再为 96 faces 付出显著 CPU queue 成本；一个动态物体只更新它实际覆盖的稀疏 pages；shadow budget 用毫秒和误差控制，而不是固定灯数。
+
+### 20.7 P5：攻击当前最明显的 fragment/带宽瓶颈
+
+- 枚举并接入 OpenXR runtime foveation、eye-tracked foveation、Vulkan FSR/VRS 能力；能力必须运行时查询，参考当前 [OpenXR 1.1 完整扩展规范](https://registry.khronos.org/OpenXR/specs/1.1/html/xrspec.html)；
+- 审计 main/depth/MSAA attachment 的 load/store/resolve，尽量让 MSAA resolve 留在 tile memory；使用 transient/lazy attachment 或可用的 local-read 路径；
+- 建立 `MobileSimple`、`MobilePBR`、`HeroPBR` material tier，评估 f16/mediump、简化 specular、normal map 和 texture sample 数；
+- ASTC/KTX2、mipmap、各向异性档位与纹理 cache 一起评估，不只看容量；
+- 加入 UE LOD 导出、HLOD、room/portal/PVS 和 shadow-only LOD；恢复 GPU visibility range；
+- 对透明、discard、双面和 depth-write 做风险可视化，保护移动 tiler 的 early depth/HSR。
+
+Khronos 的 [Tile-Based Rendering 指南](https://docs.vulkan.org/guide/latest/tile_based_rendering_best_practices.html) 明确把 attachment 往返、load/store、MSAA resolve、barrier 范围和 tile-local 数据视为移动端核心变量。P5 成功标准：fragment/target-pixel 与 attachment bandwidth 同时下降，而不是只把瓶颈从 fragment 转移到纹理或外部内存。
+
+### 20.8 允许失败的突破性实验
+
+| 实验 | 要验证的假设 | 立即停止条件 |
+|---|---|---|
+| 共享静态 BVH + 少量 ray-query visibility | 多灯阴影是否能摆脱每灯六面 map，使 shadowed/unshadowed 边际成本接近 | 目标机无能力，或单 Hero 已超预算/功耗 |
+| 软件 BVH、voxel/SDF 或距离场 shadow | 静态建筑能否用共享场表示所有灯的 visibility | 漏光/内存/更新成本无法控制，或比 128² cache 更慢 |
+| Tile-local Deferred / local-read PBR | 多材质、多灯时是否能减少重复材质 shading，并保持数据在 tile 内 | 驱动未合并 pass、attachment spill 或 MSAA 成本反而上升 |
+| 2×2/4×4 shared shadow term + 边缘重建 | 阴影 compare 是否可按 quad/tile 共享，再以 depth/normal 引导重建 | 双眼边缘闪烁、细阴影丢失或重建成本抵消收益 |
+| Shadow Jacobian/深度梯度重投影 | 微小 light motion 能否从 nominal depth 一阶近似连续投影 | 遮挡拓扑变化产生不可接受漏光/错影 |
+| 双快照 keyframe visibility | 低频真实 map 能否通过两次采样变成连续阴影 | 双影、能量漂移或额外采样大于重画收益 |
+| Cubemap 6-view Multiview / dual-paraboloid | Point shadow 能否把六次 CPU/pass 降到一次/两次 | 顶点放大、接缝过滤或驱动路径使 GPU 更慢 |
+
+这些实验不是承诺全部进入产品。它们的价值是快速打破错误假设；每个实验必须有参考图、GPU capture、误差图和 kill criterion，失败结论也写入文档，避免未来重复踩坑。
+
+### 20.9 建议执行顺序与验收门槛
+
+1. **Wave A：测量 + 阴影连续代理。** 先解释 50 ms，再消除 400 ms 阴影台阶，并尽量停止蜡烛静态 depth redraw。
+2. **Wave B：Cyclopean tile 选灯。** 消除每片元候选全扫描，使 16→64 灯成本曲线变平。
+3. **Wave C：Bevy 0.19/回移/fork 三路竞赛 + Multiview。** 用真机结果选择 Zevy 的长期 renderer 基线。
+4. **Wave D：稀疏 shadow pages + GPU-ms scheduler。** 降低 true dynamic light/caster 的真实成本。
+5. **Wave E：Foveation、tile bandwidth、material tier、LOD/HLOD/PVS。** 把 fragment、带宽和热稳定压入产品预算。
+
+阶段门槛使用毫秒而不是只看 FPS：
+
+- **R0 可复现：** 固定路径的冷机/热机 P50/P95/P99 与 A/B 自动报告；
+- **R1 视觉连续：** 16 灯仍同时存在，阴影无台阶和距离 popping，frame ≤ 33.3 ms；
+- **R2 架构收益：** tile 选灯与 Multiview 后 frame ≤ 20 ms，16→32 灯增长受控；
+- **R3 产品基线：** 20～30 分钟 thermal soak 后 P95 ≤ 13.89 ms（72 Hz），无双眼不一致；
+- **R4 进阶目标：** 支持设备上 P95 ≤ 11.11 ms（90 Hz），或把余量用于更高阴影质量/更多灯。
+
+任何单项优化如果没有可重复的 GPU/CPU 收益、没有解锁灯数扩展性、也没有解决可见伪影，就不因“已经投入很多代码”而保留。反之，只要数学上有希望、工程上可验证，修改 Bevy/wgpu/OpenXR/Vulkan backend 的工作量不能成为否决理由。
 
 ---
 
@@ -1324,6 +1461,9 @@ OpenXR 新规范中已有厂商 performance metrics 与 frame synthesis 扩展�
 - [Arm Vulkan API Best Practices](https://developer.arm.com/mobile-graphics-and-gaming/vulkan-api-best-practices-on-arm-gpus)
 - [AMD FSR2](https://gpuopen.com/fidelityfx-superresolution-2/)
 - [Epic MegaLights 技术文档](https://dev.epicgames.com/documentation/en-us/unreal-engine/megalights-in-unreal-engine)
+- [Bevy 0.19：GPU clustering、GPU-driven 与渲染调度更新](https://bevy.org/news/bevy-0-19/)
+- [wgpu 28：Multiview 与 view bitmask 重构](https://github.com/gfx-rs/wgpu/releases/tag/v28.0.0)
+- [wgpu 30 当前发布基线](https://github.com/gfx-rs/wgpu/releases/tag/v30.0.0)
 
 ### 研究与前沿
 
