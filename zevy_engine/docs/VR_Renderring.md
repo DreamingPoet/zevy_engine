@@ -1270,6 +1270,11 @@ OpenXR 新规范中已有厂商 performance metrics 与 frame synthesis 扩展�
 | scalable lighting off、2H+0T、2H+1T、2H+2T | Hero/Tail 扫描、BRDF 和 shadow compare 的成本曲线 |
 | PC 单眼、XR Multi-Pass | 双眼结构重复与纯像素翻倍的比例 |
 | render scale 0.6/0.8/1.0，MSAA 1x/2x | fill-rate、attachment bandwidth 与几何瓶颈区分 |
+| LOD0 固定、自动 LOD、仅代理几何 | 主视图 vertex/binning 与微三角形成本 |
+| shadow caster 原网格、shadow LOD、投影冻结 | 阴影几何与 shadow-map raster 成本 |
+| PVS/portal off/on，HZB off/on | 不可见房间、遮挡物后几何和 draw 的浪费 |
+| 原始 Actor draw、instancing、room HLOD/批处理 | CPU draw preparation、状态切换和 culling 粒度 |
+| 简单 Unlit、MobileSimple、MobilePBR | 材质 ALU、纹理采样和灯光之外的 fragment 成本 |
 
 优先把 Android GPU Inspector/厂商 profiler 的 GPU capture 与 Zevy HUD 对齐。P0 的完成标准不是“多了更多数字”，而是能指出 50 ms 中最大的两个模块，并预测关闭其中一个后帧时间应该下降多少。
 
@@ -1361,21 +1366,142 @@ Khronos 的 [Tile-Based Rendering 指南](https://docs.vulkan.org/guide/latest/t
 
 这些实验不是承诺全部进入产品。它们的价值是快速打破错误假设；每个实验必须有参考图、GPU capture、误差图和 kill criterion，失败结论也写入文档，避免未来重复踩坑。
 
-### 20.9 建议执行顺序与验收门槛
+### 20.9 全帧成本模型：三角形只是其中一个乘数
 
-1. **Wave A：测量 + 阴影连续代理。** 先解释 50 ms，再消除 400 ms 阴影台阶，并尽量停止蜡烛静态 depth redraw。
-2. **Wave B：Cyclopean tile 选灯。** 消除每片元候选全扫描，使 16→64 灯成本曲线变平。
-3. **Wave C：Bevy 0.19/回移/fork 三路竞赛 + Multiview。** 用真机结果选择 Zevy 的长期 renderer 基线。
-4. **Wave D：稀疏 shadow pages + GPU-ms scheduler。** 降低 true dynamic light/caster 的真实成本。
-5. **Wave E：Foveation、tile bandwidth、material tier、LOD/HLOD/PVS。** 把 fragment、带宽和热稳定压入产品预算。
+后续优化必须同时维护 CPU、GPU geometry、fragment、带宽、内存和热模型：
+
+\[
+T_{frame}\approx\max(T_{CPU},T_{GPU})+T_{sync/pacing}
+\]
+
+\[
+T_{GPU}=T_{visibility}+T_{main\_geom}+T_{main\_frag}+T_{shadow\_geom}+T_{shadow\_sample}+T_{post}+T_{transfer}
+\]
+
+一帧实际处理的三角形不只是 HUD 的 `Triangles / eye`：
+
+\[
+N_{tri/frame}\approx
+\sum_{eye}N_{main,eye}
++\sum_{updated\ shadow\ faces}N_{caster,face}
++N_{depth/prepass}
++N_{overlay}
+\]
+
+因此同一个墙面三角形可能进入左右眼、多个 PointLight face、静态/动态 shadow phase 和 depth prepass。减少主视图三角形只会降低 vertex/binning；只有它同时减少遮挡层、微三角形、shadow caster 或 draw，才会明显降低 fragment/CPU。反过来，即使总三角形不高，大量小 draw、低顶点复用、过宽 vertex stride 或大量面积小于一个像素的微三角形也可能昂贵。
+
+HUD/离线报告新增以下指标后，才能裁决几何方案：
+
+- main triangles/eye、shadow caster triangles/updated face、depth-prepass triangles；
+- vertex shader invocations、clipper input/output、post-transform vertex reuse；
+- 屏幕面积 `<1 px`、`1～4 px`、`>4 px` 的三角形比例；
+- visible/submitted/occluded instance 数，frustum/PVS/HZB 各自剔除数；
+- draw、indirect draw、batch、pipeline/material switch 数；
+- vertex/index bytes、平均 vertex stride、16/32-bit index 比例；
+- fragment/target-pixel、opaque/alpha overdraw、early-depth kill；
+- 主视图与 shadow pass 各自 GPU ms。
+
+### 20.10 几何资产管线：在 UE 导出阶段解决运行时无法补救的问题
+
+UE 导出器必须从“导出一个可见 Mesh”升级为“导出可扩展渲染资产”：
+
+1. **LOD 链。** 每个 StaticMesh 导出 UE 已有 LOD0～N；缺少 LOD 时可用 QEM/meshoptimizer 离线生成，并保存几何误差、bounds、材质槽和推荐屏幕阈值。LOD 仍是独立资产/primitive，保持 Actor 层级与局部变换可编辑。
+2. **Shadow LOD。** 单独生成保轮廓、删内部细节、可去材质属性的 shadow-only mesh。主画面 LOD 与 shadow LOD 使用不同误差目标。
+3. **HLOD/Spatial Chunk。** 按 room/cell 和材质兼容性合并小物件，降低 draw；禁止把整关合成一个大 Mesh，避免只露一角就提交全部几何。门附近、动态 Actor 和交互物体保留独立粒度。
+4. **Portal/PVS 数据。** Map_S03B 这类室内场景离线生成 room、portal、邻接和 conservative PVS；门开关只改变 portal connectivity，不每帧重新分析整关。
+5. **实例引用。** 相同 StaticMesh + material 只导出一份几何，Actor 保存 asset ID 和局部变换；运行时形成 instance batch，不复制 vertex/index buffer。
+6. **GPU 友好重排。** 索引化/去重顶点，优化 post-transform vertex cache、triangle order、overdraw 和 vertex fetch；相邻 LOD 保持稳定边界，避免裂缝。
+7. **紧凑顶点格式。** 可接受误差内使用 16-bit/quantized position、octahedral normal/tangent、half/normalized UV/颜色、尽可能 16-bit index；按 pass 分离 position-only shadow stream 与完整 material stream。
+8. **压缩与验证。** 评估 `KHR_mesh_quantization`、`EXT_meshopt_compression`、`EXT_mesh_gpu_instancing`；输出原始/压缩字节、解码时间、GPU stride 和误差报告。文件压缩本身主要改善加载与 I/O，只有量化和更小 GPU vertex stride 才可能持续改善渲染带宽。
+
+Khronos 已将 [`EXT_meshopt_compression`](https://github.com/KhronosGroup/glTF/blob/main/extensions/2.0/Vendor/EXT_meshopt_compression/README.md) 列为 ratified，并明确建议先优化顶点复用、vertex/index 顺序和量化，再压缩。Zevy 不应把 mesh compression 只当作“包体变小”，而应把离线 mesh processing 设计成 GPU 数据布局的一部分。
+
+验收产物是每个 Level 的离线审计报告：Actor/asset/LOD/HLOD 数量、各 LOD 三角形与几何误差、重复资产比例、预计 draw、vertex/index bytes、无 LOD 资产和超大 culling bounds 列表。
+
+### 20.11 运行时可见性：先不提交，再谈怎么画得快
+
+Map_S03B 的推荐可见性顺序：
+
+1. **Room/Portal/PVS 粗裁剪**：先排除不可能可见的房间及其 mesh、light、probe、particle、streaming 请求和 shadow caster；
+2. **Cyclopean union-frustum**：双眼共用一次保守粗裁剪；
+3. **Projected-size LOD/小物体裁剪**：使用左右眼需求的较高 LOD，并按中央/外围误差阈值选择；
+4. **HZB occlusion**：使用上一帧深度、速度扩张和保守 bounds；相机快速转动、门刚打开和新出现对象回退为可见；
+5. **Per-eye fine culling**：只对 union 结果做轻量精裁剪；
+6. **Shadow-specific culling**：每个更新 face 只收集与 light volume、face frustum 相交的 caster，并使用 shadow LOD；
+7. **GPU indirect compaction**：将最终可见实例压缩为主视图与 shadow pass 的 indirect command/batch。
+
+LOD 仍使用第 5.5 节的 projected-error 模型，并加入双阈值 hysteresis、最短驻留时间和预取。左右眼不得独立选择 LOD；主视图和阴影可以选择不同网格，但不能产生明显轮廓脱离。灯光是否驻留仍不按相机距离决定，PVS 只裁掉当前拓扑上不可能影响任何可见 surface 的灯/阴影工作。
+
+运行时成功标准不是“实现了 HZB”，而是能够分别报告 PVS、frustum、size、HZB、per-eye 和 shadow-face 各裁掉多少实例、三角形、draw 与 GPU ms。若 HZB compute 和 barrier 成本大于节省，室内路径应保留更便宜的 PVS-only 模式。
+
+### 20.12 GPU-driven、Draw 与 ECS：减少提交而不破坏剔除粒度
+
+- 修复 XR 路径并移除 `NoIndirectDrawing`，把 bounds、LOD、material ID、mesh range 和 transform 放入 GPU scene buffer；
+- GPU 执行 frustum/HZB/LOD，生成 compact indirect command 与 count；同一命令列表供 Multiview 双眼使用；
+- 支持 Multi-Draw Indirect、实例化和 material/texture table，减少 per-object bind group 与 CPU draw loop；
+- 按 mesh/material/pipeline 批处理，但 batch/HLOD 必须以 spatial cell 为上限，避免为了少 draw 让大量不可见三角形失去独立 culling；
+- 静态 transform、mesh/material 和 uniform 只上传一次，动态对象只上传 dirty range；避免每帧复制整个导入关卡；
+- shadow depth 使用 position-only batch，静态 cache hit 的 face 在 visibility/queue 前退出；
+- GPU-driven 不支持或小场景固定成本过高时保留并行 CPU culling/secondary command fallback。
+
+Khronos 的 [GPU Rendering and Multi-Draw Indirect 示例](https://docs.vulkan.org/samples/latest/samples/performance/multi_draw_indirect/README.html)展示了 GPU 生成 draw、frustum culling 和资源数组化；上游 [Bevy 0.19](https://bevy.org/news/bevy-0-19/) 也已把 batch unpack、visibility range、light clustering 和更多 mesh preparation 移到 GPU/并行路径。这些代码是 Zevy 的参考和可回移来源，但 Android VR 是否获益仍由场景规模、驱动和真机 capture 决定。
+
+### 20.13 Fragment、Overdraw、材质与 Render Pass
+
+几何减少后仍必须直接攻击当前变化最大的 fragment：
+
+- 增加 opaque/alpha overdraw 热力图、微三角形热力图和 material cost tier；
+- 不透明物体保持 depth write、稳定 compare op，避免无必要 `discard`/`gl_FragDepth`；只在 capture 证明有收益时使用 selective depth prepass；
+- 对室内大遮挡体可先画 cheap occluder/depth，复杂小物件后画；同时验证移动 tiler 是否已通过 HSR 获得相同收益；
+- `UnlitFast`、`MobileSimple`、`MobilePBR`、`HeroPBR` 分层；无 normal map、无 specular、无受光需求的材质不得进入完整 PBR variant；
+- 将可安全降精度的 BRDF、中间向量和材质参数改为 f16/mediump，并用离线图像误差与多设备验证；
+- 透明、粒子、火焰和 UI 严格控制屏幕覆盖、层数和 shader 长度；能用 compositor layer 的 XR UI 不进入主 HDR/MSAA pass；
+- 接入 FFR/VRS/eye-tracked foveation；动态分辨率只作为慢时间尺度控制，避免转头时分辨率振荡；
+- 合并后处理，审计 attachment 格式、load/store、MSAA inline resolve、transient/lazy memory 和 barrier，尽量留在 tile memory。
+
+### 20.14 纹理、内存与 Streaming：优化带宽和抖动，不只优化容量
+
+- 完整 mip chain、trilinear 和合理 anisotropy 保持为基础；根据实机 texel density 限制源纹理尺寸；
+- Android 颜色/法线/mask 分别选择合适 ASTC block 与色彩空间，评估 KTX2/Basis 作为传输格式；
+- 按 room/PVS、相机预测路径和材质重要性预取 mip、mesh LOD 与 shadow proxy；上传和解压必须有每帧字节/毫秒预算；
+- 避免相机转头时同步 I/O、shader 编译、大纹理上传、atlas 重排或 CPU 解压造成 hitch；
+- 统计 resident texture/geometry bytes、requested/loaded mip、upload bytes/frame、staging 峰值、sampler cache 与缺页；
+- GPU buffer 按 static/dynamic、position-only/full-vertex、16/32-bit index 分池，减少无关属性读取和碎片；
+- 资产解码完成后，可在不影响编辑/热重载的 shipping 配置释放不需要的 CPU 副本。
+
+### 20.15 CPU、Frame Pacing 与热稳定
+
+- 把导入关卡的静态 ECS 数据冻结为只读/稀疏 change list；只有真正改变的 transform、visibility、material 和 light 才进入 extraction/上传；
+- visibility、animation、asset streaming、light/shadow scheduling 和 draw preparation 并行化，禁止热点路径每帧小 allocation；
+- pipeline/shader/material variant 在进入 VR 前预热；后台编译和上传必须分帧限额；
+- 对未来动态角色建立 skeletal LOD、骨骼/动画更新频率、离屏冻结和 GPU skinning A/B；动态 bounds 必须保守但不能无限膨胀；
+- 粒子、火焰、布料和特效使用独立 CPU/vertex/fragment 预算，按 PVS、屏幕面积和外围视野降级，禁止大量透明 quad 无上限叠加；
+- 物理/游戏逻辑与渲染更新率解耦，但头部、手柄、交互 Hero 物体继续使用低延迟路径；
+- 遵循 OpenXR `xrWaitFrame`/predicted display time，late pose 靠近提交更新；不要额外引入与 runtime 冲突的 frame queue/pacer；
+- 接入 ADPF thermal headroom、performance hint、CPU/GPU level/frequency 和 runtime missed/reprojected frame；质量控制器根据 GPU/CPU P95 与热趋势，而不是瞬时 FPS；
+- 质量降级顺序优先外围 shading、Tail shadow freshness、shadow LOD、material tier、geometry LOD，最后才动中央清晰度与刷新率。
+
+Android 官方 [ADPF](https://developer.android.com/games/optimize/adpf)强调持续性能、thermal state 和 performance hint，而不只是冷机峰值。对 Zevy，任何能把 10 ms 降到 7 ms 但十分钟后仍降频到 15 ms 的方案，都不能算产品优化。
+
+### 20.16 全栈执行顺序与验收门槛
+
+1. **Wave A：完整基线与 HUD。** 补齐 main/shadow triangles、microtriangle、culling reason、draw/batch、overdraw、upload 与 thermal；完成固定 camera path 自动报告。
+2. **Wave B：离线几何与低风险视觉修复。** UE 导出 LOD/shadow LOD/bounds/重复资产报告；并行完成阴影 `ContinuousProxy`，先消除 400 ms 台阶。
+3. **Wave C：室内可见性。** Map_S03B room/portal/PVS、Cyclopean frustum、稳定 LOD；验证远近 triangles/eye 与 shadow caster triangles 真正下降。
+4. **Wave D：引擎 fork 基线。** Bevy 0.19 升级、选择性回移、Zevy renderer 三路比较；打通 Multiview、GPU scene、indirect/MDI、dirty uploads。
+5. **Wave E：GPU HZB + HLOD/instancing/material table。** 降低被遮挡 geometry、draw 和 bind churn，同时保护 spatial culling 粒度。
+6. **Wave F：Cyclopean tile 选灯 + 稀疏 shadow。** 消除每片元候选全扫描，加入 sparse dynamic pages 和 GPU-ms scheduler。
+7. **Wave G：Fragment/带宽。** Foveation/VRS、material tiers、overdraw、attachment、ASTC/KTX2 和 streaming 预算一起优化。
+8. **Wave H：热稳定控制器。** 用 ADPF/OpenXR 指标驱动 LOD、shadow freshness、material tier 和 render scale，完成长时 soak。
 
 阶段门槛使用毫秒而不是只看 FPS：
 
-- **R0 可复现：** 固定路径的冷机/热机 P50/P95/P99 与 A/B 自动报告；
-- **R1 视觉连续：** 16 灯仍同时存在，阴影无台阶和距离 popping，frame ≤ 33.3 ms；
-- **R2 架构收益：** tile 选灯与 Multiview 后 frame ≤ 20 ms，16→32 灯增长受控；
-- **R3 产品基线：** 20～30 分钟 thermal soak 后 P95 ≤ 13.89 ms（72 Hz），无双眼不一致；
-- **R4 进阶目标：** 支持设备上 P95 ≤ 11.11 ms（90 Hz），或把余量用于更高阴影质量/更多灯。
+- **R0 可复现：** 固定路径的冷机/热机 P50/P95/P99 与 CPU/GPU/geometry/fragment/shadow/upload 分解自动报告；
+- **R1 场景可伸缩：** 相机远近和跨 room 时，main/shadow triangles、visible draw、resident mip 按投影误差和 PVS 下降；无 LOD、双眼或门口 popping；
+- **R2 视觉连续：** 16 灯仍同时存在，阴影无台阶和距离 popping，frame P95 ≤ 33.3 ms；
+- **R3 架构收益：** Multiview、GPU-driven、tile 选灯后 frame P95 ≤ 20 ms，16→32 灯和场景实例增长斜率受控；
+- **R4 产品基线：** 20～30 分钟 thermal soak 后 P95 ≤ 13.89 ms（72 Hz），无双眼不一致、streaming hitch 或持续降频；
+- **R5 进阶目标：** 支持设备上 P95 ≤ 11.11 ms（90 Hz），或把余量用于更高阴影质量、更多灯和更高中央清晰度。
 
 任何单项优化如果没有可重复的 GPU/CPU 收益、没有解锁灯数扩展性、也没有解决可见伪影，就不因“已经投入很多代码”而保留。反之，只要数学上有希望、工程上可验证，修改 Bevy/wgpu/OpenXR/Vulkan backend 的工作量不能成为否决理由。
 
@@ -1391,12 +1517,37 @@ Khronos 的 [Tile-Based Rendering 指南](https://docs.vulkan.org/guide/latest/t
 - 左右眼随机数、LOD、灯光和阴影是否一致？
 - 后处理是否正确识别 array layer/view index？
 
+### 几何与可见性
+
+- main、shadow、depth/overlay 各提交多少三角形，是否把同一静态几何重复放大？
+- 相机远近、跨 room 和遮挡变化时，triangles/draw 是否真的下降？
+- `<1 px` 微三角形、低 post-transform reuse、过宽 vertex stride 的比例是多少？
+- 是否依次利用 PVS、union-frustum、projected LOD、HZB、per-eye fine culling？
+- LOD/HLOD、实例化和 mesh merge 是否破坏双眼一致、silhouette 或空间 culling 粒度？
+- shadow caster 是否使用独立 LOD、position-only stream 和 light/face frustum culling？
+
+### Draw、ECS 与 GPU-driven
+
+- visible instance、draw、batch、pipeline/material switch 各是多少，CPU render/extraction 花在哪里？
+- 静态数据是否仍每帧传播 transform、复制 uniform 或重新 queue？
+- 是否能用 instancing、material table、indirect/MDI，且无需 GPU→CPU readback？
+- GPU culling/compaction 的 compute、barrier 和固定成本是否小于它省掉的 CPU/draw/geometry？
+- batch/HLOD 是否限制在合理 spatial cell，而不是为了少 draw 提交更多不可见三角形？
+
 ### 像素与带宽
 
 - 新增多少目标像素、attachment 字节和全屏 pass？
 - 中间结果能否保持在 tile memory？
 - attachment 是否真的需要 load/store？
 - 是否可以 half/quarter resolution 或 foveated？
+
+### 资产、纹理与 Streaming
+
+- UE 导出是否包含 LOD、shadow LOD、bounds、实例引用、room/portal/PVS 和可验证几何误差？
+- vertex/index 是否索引化、量化、cache/fetch 友好，并按 pass 避免读取无关属性？
+- 纹理是否有正确 mip、ASTC/KTX2 策略和与屏幕 texel density 对应的尺寸？
+- room/相机预测是否驱动 mesh/mip 预取，上传/解压是否遵守每帧毫秒与字节预算？
+- 是否存在同步 I/O、shader 编译、atlas 重排、内存碎片或大批资源销毁造成的 hitch？
 
 ### 灯光
 
@@ -1454,6 +1605,9 @@ Khronos 的 [Tile-Based Rendering 指南](https://docs.vulkan.org/guide/latest/t
 - [Vulkan Fragment Shading Rate](https://docs.vulkan.org/features/latest/features/proposals/VK_KHR_fragment_shading_rate.html)
 - [Khronos Tile-Based Rendering Best Practices](https://docs.vulkan.org/guide/latest/tile_based_rendering_best_practices.html)
 - [Khronos Vulkan Samples](https://github.khronos.org/Vulkan-Site/samples/latest/README.html)
+- [Khronos GPU Rendering and Multi-Draw Indirect Sample](https://docs.vulkan.org/samples/latest/samples/performance/multi_draw_indirect/README.html)
+- [Khronos glTF `EXT_meshopt_compression`](https://github.com/KhronosGroup/glTF/blob/main/extensions/2.0/Vendor/EXT_meshopt_compression/README.md)
+- [Khronos glTF Extension Registry（含量化与 GPU Instancing）](https://github.com/KhronosGroup/glTF/blob/main/extensions/README.md)
 - [Android GPU 性能分析](https://developer.android.com/games/optimize/gameperformance)
 - [Android GPU Inspector Frame Profiler](https://developer.android.com/agi/frame-trace/frame-profiler)
 - [Android Dynamic Performance Framework](https://developer.android.com/games/optimize/adpf)

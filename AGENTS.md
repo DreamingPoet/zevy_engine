@@ -26,7 +26,7 @@ Zevy 的核心目标是：
 2. **再建立可证伪实验。** 在固定 Map、固定相机路径、固定设备状态下做单变量 A/B，记录 CPU、GPU、P50/P95/P99、fragment、draw、shadow redraw、温度和频率。
 3. **以目标 VR 一体机裁决。** PC 结果只用于调试正确性；Android 真机 GPU capture 与 20～30 分钟 thermal soak 才能决定方案是否胜出。
 4. **区分事实和假设。** 文档必须标记已实现、已在 PC 验证、已在 Android 验证、设计假设和失败实验，不能把理论收益写成实测收益。
-5. **优先结构性收益。** 先消除双眼重复、逐片元全扫描、每灯六面重复、无效 pass/attachment 往返和静态内容重画，再微调常数或统一降低画质。
+5. **优先结构性收益。** 先做到“不提交不可见工作”：room/PVS、frustum、LOD/HLOD、occlusion、shadow-caster culling；再消除双眼重复、逐片元全扫描、每灯六面重复、过多 draw/bind、无效 pass/attachment 往返和静态内容重画，最后才微调常数或统一降低画质。
 6. **实验必须可比较、可回退。** 使用 feature/config/独立分支保留 reference path；保留截图、GPU capture、误差图、benchmark 与 kill criterion。
 7. **失败也要沉淀。** 记录失败原因、设备、驱动、成本曲线与画质问题，防止后续 Agent 重复同一条无效路线。
 
@@ -39,6 +39,7 @@ Zevy 的核心目标是：
 - 左右眼必须共享可共享的灯光、阴影、LOD、随机样本和历史状态，避免 binocular mismatch。
 - Hero/交互灯的响应优先于装饰 Tail 灯；低优先级只能平滑降低频率、分辨率或近似质量。
 - 静态内容不应无理由每帧重画；动态内容不应无理由使整个静态缓存失效。
+- 几何优化必须由 projected error、silhouette、屏幕面积和实机成本驱动；不得只为降低三角形数字而制造双眼 LOD 不一致、裂缝、明显 popping 或更差的 HLOD culling 粒度。
 - 平均 FPS 不能掩盖 P95/P99、reprojection、热降频或瞬时视觉跳变。
 
 ## 判断“突破”的标准
@@ -53,13 +54,53 @@ Zevy 的核心目标是：
 
 单纯把参数调低、隐藏远灯、减少灯数或让阴影突然关闭，只能是诊断/应急 trade-off，不能作为项目核心创新。
 
+## 任务检查点与上下文恢复（强制）
+
+编程、架构、资产管线和跨文件开发任务必须使用 `Docs/Checkpoints` 保存可从磁盘恢复的状态，不能只依赖聊天上下文。
+
+### 权威文件
+
+- `Docs/Checkpoints/CURRENT.md`：当前任务唯一的最新恢复入口。开始或恢复开发前必须读取。
+- `Docs/Checkpoints/YYYY-MM-DD-<stage>.md`：阶段完成后的历史快照，完成后原则上不再改写。
+- `Docs/Checkpoints/README.md`：格式、更新时机和模板。
+
+### 何时必须更新
+
+- 一个计划阶段完成并准备进入下一阶段时；
+- 长阶段中完成了会影响后续判断的中间里程碑时；
+- 即将暂停、阻塞、交接、切换对话或进行大规模迁移/实验前；
+- 测试结论、关键约束、工作区文件状态或下一步发生实质变化时。
+
+阶段完成时同时更新 `CURRENT.md` 并新增历史快照；阶段中途只需更新 `CURRENT.md`。检查点不是逐工具调用日志，应简洁但足以让完全没有聊天历史的 Agent 继续工作。
+
+### 检查点必备内容
+
+1. 最终目标和完成标准；
+2. 已完成内容，并标明实现、PC 验证、Android/VR 验证或仅设计；
+3. 当前分支、HEAD、文件和修改/暂存状态，明确区分已有用户改动与本阶段改动；
+4. 关键决定、产品不变量和禁止事项；
+5. 实际执行过的测试、结果、设备与未执行项；不得把“预计通过”写成“已通过”；
+6. 未完成步骤、依赖、风险和唯一明确的下一步；
+7. 恢复时首先应读取的相关文件。
+
+### 压缩、重启或新对话后的恢复协议
+
+1. 先完整读取根 `AGENTS.md` 与 `Docs/Checkpoints/CURRENT.md`；
+2. 再读取检查点引用的规格/代码，并执行 `git status`、必要的 `git diff` 和当前分支/HEAD 检查；
+3. 在第一次 commentary 中先复述一次：最终目标、已完成阶段、当前文件状态、关键约束、测试状态和下一步；
+4. 对照磁盘检查是否遗漏关键约束或出现冲突，再开始修改；
+5. 若信息冲突，优先级为：实际文件与 Git/测试结果 > `CURRENT.md` > 历史检查点 > 压缩后的聊天摘要；不得静默猜测；
+6. 不重复已经完成并验证的工作，不因上下文缩短而擅自缩小目标、丢弃约束或退回保守架构。
+
 ## 当前最高优先级（2026-07-20）
 
-1. 把 Map_S03B 的约 50 ms/frame 分解为 direct lighting、shadow update、shadow sampling、Multi-Pass、fragment/bandwidth、CPU submission 与 thermal 成本。
-2. 为 16 盏蜡烛实现不依赖频繁 cubemap redraw 的连续阴影代理，消除约 400 ms 的投影阶梯。
-3. 把 Hero/Tail 选灯从逐片元 \(O(N)\) 扫描搬到双眼共享 tile/froxel，使完整 shading 接近固定 \(H+K\) 成本。
-4. 并行比较 Bevy 0.19 升级、上游优化回移和 Zevy renderer fork；实现真正的 XR Multiview，并恢复 GPU culling/indirect。
-5. 将 96 个固定 shadow views 演进为提前 cache reject、稀疏 dynamic pages 和 GPU-ms/误差驱动调度。
-6. 接入 foveation/VRS、移动 tile attachment 优化、material tier、LOD/HLOD/PVS，最终达到热稳定 72 Hz，并向 90 Hz 扩展。
+1. 把 Map_S03B 的约 50 ms/frame 分解为 main/shadow geometry、direct lighting、shadow update/sampling、Multi-Pass、fragment/bandwidth、draw/CPU submission、streaming 与 thermal 成本。
+2. 补齐 main/shadow triangles、microtriangle、draw/batch、PVS/frustum/HZB culling、overdraw、vertex/index bytes、upload 与 thermal telemetry。
+3. 升级 UE 导出管线：LOD、shadow LOD、room/portal/PVS、HLOD/spatial chunk、实例引用、GPU 友好索引/顶点顺序、量化与离线审计报告。
+4. 在运行时实现 Cyclopean PVS/frustum、稳定 projected-error LOD、shadow-caster culling，并验证远近场景的三角形和 draw 确实下降。
+5. 为 16 盏蜡烛实现不依赖频繁 cubemap redraw 的连续阴影代理，消除约 400 ms 的投影阶梯。
+6. 并行比较 Bevy 0.19 升级、上游优化回移和 Zevy renderer fork；实现 XR Multiview、GPU scene、HZB、GPU culling、indirect/MDI、instancing 和 dirty uploads。
+7. 把 Hero/Tail 选灯从逐片元 \(O(N)\) 扫描搬到双眼共享 tile/froxel，并将 96 个固定 shadow views 演进为提前 cache reject、稀疏 dynamic pages 和 GPU-ms/误差驱动调度。
+8. 接入 foveation/VRS、移动 tile attachment 优化、material tier、ASTC/KTX2、资源 streaming 与 ADPF 热控制，最终达到热稳定 72 Hz，并向 90 Hz 扩展。
 
 详细架构复盘、公式、实验顺序和验收门槛见 `zevy_engine/docs/VR_Renderring.md`。
