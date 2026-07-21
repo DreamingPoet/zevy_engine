@@ -12,12 +12,15 @@ The goal of this project is to support the production of real-time, first-person
 
 ## Development Environment
 
-This project uses the stable Rust toolchain.
+The reproducible baseline is Rust 1.95.0, Cargo 1.95.0, and cargo-apk 0.10.0.
+The complete clean-machine setup, Android SDK/NDK/JDK matrix, verification
+commands, signing steps, and troubleshooting guide are documented in
+[`Docs/Rust_Android_Environment_Setup.md`](../Docs/Rust_Android_Environment_Setup.md).
 
-Set the local toolchain to stable:
+Set the repository-local toolchain to the exact validated version:
 
 ```powershell
-rustup override set stable
+rustup override set 1.95.0-x86_64-pc-windows-msvc
 ```
 
 Check the installed Cargo version:

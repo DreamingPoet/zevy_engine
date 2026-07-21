@@ -1,117 +1,113 @@
-# 当前任务检查点：UE Static 灯光保持静态
+# 当前任务检查点：Rust 与 Android 构建环境手册
 
 ## 元数据
 
-- 更新时间：2026-07-21 14:19，Asia/Shanghai
-- 状态：第一版已被用户画面测试证伪；profile-once / animate-never 修正版已通过自动化和 Android 编译检查，等待用户画面复测
+- 更新时间：2026-07-21 17:40，Asia/Shanghai
+- 状态：文档编写和本机配置审计完成，等待用户审阅；未提交
 - 工作区：`G:\zevy_engine`
-- 分支 / HEAD：`main @ 5cdde886647330e59678e00b548185ff33dbd3e2`
-- 本阶段历史快照：`Docs/Checkpoints/2026-07-21-static-light-mobility.md`
-- 上一视觉基线：`Docs/Checkpoints/2026-07-21-world-stable-lighting-exact8.md`
+- 分支 / HEAD：`main @ 7c5b9595bfdf0ca805f6231204360f4016fa9663`，与 `origin/main` 一致
+- 本阶段历史快照：`Docs/Checkpoints/2026-07-21-rust-android-environment-guide.md`
+- 上一代码阶段：`Docs/Checkpoints/2026-07-21-static-light-mobility.md`
 
 ## 最终目标和完成标准
 
-最终目标仍是建立面向 VR 一体机的高性能、现代、大量动态灯光/阴影渲染器。当前任务的完成标准是：
+项目最终目标仍是建立面向 VR 一体机的高性能、现代、大量动态灯光/阴影渲染器。
 
-1. UE 导出的 `lights[].unreal.mobility = "static"` 成为运行时权威静态标记；
-2. Map_S03B 对 static PointLight 应用一次关卡亮度/范围校准，随后不得再修改颜色、有效亮度、有效范围和 Transform；
-3. static PointLight 不生成/播放蜡烛发光体动画，不进入 candle shadow 周期性失效队列；
-4. static 灯若启用阴影，仍正常常驻并在首次生成后复用持久化 shadow cache；
-5. movable 蜡烛灯现有动画、exact-8 画质基线和相机无关 shadow residency 不回归。
+当前文档任务要求另一台 Windows 电脑在 clone 后，只依赖仓库文档即可完成 Rust 桌面环境、Rust Android target、cargo-apk、SDK/NDK/JDK、签名和 APK 验证配置。完成标准：
+
+1. 明确已验证的精确版本，不用会漂移的 `stable` 代替；
+2. 覆盖 clean clone → Cargo 依赖 → Windows check/test → Android check → APK build/sign/verify 全流程；
+3. 区分仓库 Rust 依赖、本地 patched crates、Android 外部工具和 PICO OpenXR loader；
+4. 提供可复制 PowerShell 命令、验收清单和故障定位；
+5. 只覆盖 Rust/Android 打包，不扩展到 UE 或内容生产。
 
 ## 已完成内容
 
-### [已实现]
+### [本机实测审计]
 
-- `ZevyUnrealLightParameters::is_static_mobility()`：trim 后大小写不敏感匹配显式 `static`。
-- 旧清单缺失 mobility、`movable`、`stationary` 均不会被误判为 static。
-- `apply_map_s03b_lighting_profile` 直接读取实体上的 `ImportedZevyLight`：
-  - movable/stationary 保持现有 Map 蜡烛倍率与动画路径；
-  - static 与其他灯一样先应用一次 Map authored-to-runtime 强度/范围校准；
-  - 校准后的 static intensity、range 与 Transform 不再随时间变化；
-  - static 仍获得 `CachedPointLightShadow`，可以使用持久化静态阴影缓存。
-- `sync_map_s03b_candle_visuals` 不为 static 灯生成发光球；若状态已存在也会移除。
-- `animate_map_s03b_candle_lights` 在任何亮度、范围、Transform 或 shadow invalidation 写入前跳过 static 灯。
-- 当前 Map_S03B 资产审计：18 个 PointLight，其中 16 个 `movable`、2 个 `static`。
-- 更新 `Docs/UE_to_Bevy_Spec.md`、导出器 README 与 `zevy_engine/docs/VR_Renderring.md`。
+- `rustc 1.95.0 (59807616e 2026-04-14)`，host `x86_64-pc-windows-msvc`。
+- Cargo 1.95.0；rustup 1.29.0。
+- 已安装 `aarch64-linux-android`、rustfmt、clippy、rust-src。
+- cargo-apk 0.10.0；正确版本命令为 `cargo apk version`。
+- Android 已验证基线：JDK 17.0.10、Platform 34、Build Tools 34.0.0、NDK 25.1.8937393/r25b。
+- `Cargo.toml` metadata：arm64、min SDK 29、target SDK 34、assets、PICO OpenXR runtime lib。
+- 仓库没有 `rust-toolchain.toml`；当前开发机依赖目录级 rustup stable override，文档改为要求精确 1.95.0 override。
 
-### [自动化验证]
+### [文档实现]
 
-- 新测试验证只有显式 `static` 才进入静态语义。
-- 新 ECS 系统链测试验证 static PointLight：
-  - intensity/range 只应用一次 Map profile，跨后续时间步保持固定；
-  - Transform 保持导出值；
-  - shadow residency 保持启用；
-  - 不写入 shadow refresh 时间；
-  - 不生成 `MapS03BCandleVisualSpawned`。
+- 新增 `Docs/Rust_Android_Environment_Setup.md`，包含：
+  - 版本矩阵和支持边界；
+  - Visual Studio Build Tools、rustup、Rust target/component 安装；
+  - cargo-apk 0.10.0 精确安装和 deprecation 风险；
+  - SDK/NDK/JDK 安装、环境变量和路径自检；
+  - Cargo.lock、本地 Bevy/OpenXR fork 和 OpenXR loader 完整性检查；
+  - Windows/Android check/test；
+  - shipping、profiling、debug APK 构建；
+  - debug/release keystore、zipalign、apksigner、ADB；
+  - clean-machine 验收清单、故障排查和升级纪律。
+- 更新 `zevy_engine/README.md`：把漂移的 `stable` 指令替换为 Rust 1.95.0，并链接完整手册。
+
+### [官方资料核对]
+
+- Rust 官方安装、rustup override 和 cross-compilation 文档。
+- rust-mobile cargo-apk 上游及 0.10.0 发布 README。
+- Android 官方 sdkmanager、特定 NDK、Build Tools 和 JDK 文档。
 
 ## 当前文件与 Git 状态
 
-阶段起点为已提交的 `5cdde88`。开始本任务前已有一项用户改动，必须保留且不得混淆为本阶段实现：
+任务开始时 HEAD 已是用户提交 `7c5b959 添加静态灯光`。第一次审计曾看到用户把 `xr_render_scale` 从 `0.8` 改为 `1.4`；随后该 diff 在本阶段未编辑 `config.rs` 的情况下由外部状态恢复，当前实际工作树不再包含它。本阶段没有覆盖或提交该配置。
 
-- `zevy_engine/src/config.rs`：用户把 `max_cached_point_shadow_updates_per_frame` 从 `2` 改为 `8`。
+本阶段未暂存、未提交修改：
 
-本阶段修改：
+```text
+ M Docs/Checkpoints/CURRENT.md
+ M zevy_engine/README.md
+?? Docs/Checkpoints/2026-07-21-rust-android-environment-guide.md
+?? Docs/Rust_Android_Environment_Setup.md
+```
 
-- `zevy_engine/src/scene.rs`
-- `zevy_engine/src/scene/zevy_level.rs`
-- `Docs/UE_to_Bevy_Spec.md`
-- `ue_project/Plugins/ZevyLevelExporter/README.md`
-- `zevy_engine/docs/VR_Renderring.md`
-- `Docs/Checkpoints/CURRENT.md`
-- `Docs/Checkpoints/2026-07-21-static-light-mobility.md`
+## 关键决定与禁止事项
 
-所有修改均未暂存、未提交。禁止 reset/checkout/覆盖用户的 shadow budget 修改。
+- 支持基线固定为 Rust/Cargo 1.95.0；不得把理论最低版本冒充为已验证版本。
+- cargo-apk 0.10.0 虽被上游标记 deprecated，但仍是当前权威 APK 路径；禁止在新机初始化时静默换成 xbuild。
+- APK 基线固定 NDK r25b。机器上存在 NDK 27 不代表 APK 应改用 27。
+- `ANDROID_HOME` 与 `ANDROID_SDK_ROOT` 不得指向不同 SDK；当前推荐仅保留前者。
+- 仓库脚本包含原开发机硬编码路径；手册优先提供不依赖该路径的手动命令，并明确机器路径改动不得提交。
+- 不删除/替换 Zevy 的 Bevy/OpenXR local patches，不把 crates.io 同版本当成等价物。
+- 开发 debug keystore 不能用于商店发布，密码和正式密钥不得进入仓库。
 
-## 关键决定、产品不变量与禁止事项
-
-- mobility 已由 UE 导出并完整保存在 `ImportedZevyLight`，不新增重复资产字段。
-- `static` 控制的是时间变化，不得跳过 Map_S03B 必需的一次性 authored-to-runtime 校准。
-- static 只消除 candle 动画与周期性 shadow redraw；它仍有直接光照、cluster、shadow residency 和采样成本。
-- `stationary` 的 UE 混合光照语义尚未完整实现，本阶段不擅自将其等同 static。
-- 不改变灯光物理 range、相机可见距离、exact-8 选择路径或阴影是否由相机距离决定。
-- 不得把自动化测试写成 Android/VR 视觉验证。
-
-## 实际测试结果
+## 实际验证结果
 
 ### 已执行并通过
 
-- `cargo fmt --all`
-- `cargo test --all-targets`：44 passed，0 failed
-- `cargo check --target aarch64-linux-android --message-format=short`
-- `cargo check --no-default-features --all-targets --message-format=short`
-- Map_S03B JSON 审计：18 PointLight = 16 movable + 2 static
+- `rustc -Vv`、`cargo -V`、`rustup show/target/component` 审计。
+- `cargo apk version`：0.10.0。
+- SDK/NDK/JDK/zipalign/apksigner/ADB 路径存在性检查。
+- 文档中的 PowerShell Android 环境自检片段在本机通过，NDK 输出 25.1.8937393。
+- `cargo metadata --locked --no-deps --format-version 1` 通过，版本、features、targets 和 Android metadata 与文档一致。
+- `git diff --check` 通过，仅有 Windows LF→CRLF 提示。
+- 本地 README 链接路径解析正确。
 
-### 非阻塞警告
+### 本任务未重新执行
 
-- vendored `bevy_mod_openxr` 仍有既有 `mismatched_lifetime_syntaxes` warning，本阶段未引入。
+- 未重装 Rust/cargo-apk/SDK/NDK/JDK，避免破坏已工作的机器环境。
+- 未从空 Cargo cache 重新下载依赖。
+- 未重新运行完整 PC test、APK release 构建或设备安装；文档中的这些命令来自当前仓库已验证流程，但新电脑仍必须按验收清单实际执行。
 
-### 用户证伪并已修正
+## 未完成步骤和唯一下一步
 
-- 失败版本让 static 灯完全跳过 Map profile，导致运行时强度比既有路径低 1000 倍、范围小 4 倍；用户观察到 static 灯对场景没有可见效果。
-- 修正策略：所有灯 profile-once；只有非 static 灯 animate-many。修正后的 Android/VR 画面尚待用户复测。
+1. 用户审阅手册是否符合团队的新电脑目录约定。
+2. 在真正的第二台/干净 Windows 电脑按第 15 节执行一次端到端验收。
+3. 若通过，可后续把 `rust-toolchain.toml` 和 Android 脚本参数化作为独立工程改动提交。
 
-### 尚未执行
-
-- PC Map_S03B 实际运行与画面检查
-- Android APK 构建/安装
-- PICO 佩戴验证 static 灯完全稳定、movable 蜡烛继续动画
-- static 灯加入后 fixed-path GPU P50/P95/P99 与 shadow redraw telemetry
-
-## 未完成步骤、风险和唯一下一步
-
-1. 在 Map_S03B 实际运行中确认 `PointLight17`、`PointLight18` 产生正常照明，并保持校准后亮度/范围与导出位置不变，且没有发光球动画。
-2. 确认 16 个 movable 灯继续闪烁，static 灯不会增加周期性 `updated faces`。
-3. 用户确认画面后，再决定是否把用户的 shadow budget=8 与本阶段代码合并提交。
-
-唯一明确的下一步：**由用户在 PC/VR 运行当前 Map_S03B，验证两盏 static 灯完全不动且 movable 蜡烛无回归；若通过，再提交本阶段。**
+唯一明确的下一步：**在第二台干净 Windows 电脑严格按 `Docs/Rust_Android_Environment_Setup.md` 执行，记录第一处不明确或失败的步骤，再据此修正文档；当前不要同时升级 cargo-apk 或 NDK。**
 
 ## 恢复时首先读取
 
 1. `G:\zevy_engine\AGENTS.md`
 2. `G:\zevy_engine\Docs\Checkpoints\CURRENT.md`
-3. `G:\zevy_engine\Docs\Checkpoints\2026-07-21-static-light-mobility.md`
-4. `G:\zevy_engine\zevy_engine\src\scene.rs`
-5. `G:\zevy_engine\zevy_engine\src\scene\zevy_level.rs`
-6. `G:\zevy_engine\Docs\UE_to_Bevy_Spec.md`
+3. `G:\zevy_engine\Docs\Rust_Android_Environment_Setup.md`
+4. `G:\zevy_engine\zevy_engine\Cargo.toml`
+5. `G:\zevy_engine\zevy_engine\scripts\build_android_pico.ps1`
+6. `G:\zevy_engine\zevy_engine\README.md`
 7. 实际 `git status --short`、`git diff`、branch/HEAD
