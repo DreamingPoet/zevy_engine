@@ -30,12 +30,30 @@ once before Bevy plugins and shaders are installed:
 ```powershell
 adb shell setprop debug.zevy.point_direct 0
 adb shell setprop debug.zevy.point_shadows 1
+adb shell setprop debug.zevy.world_reservoir 1
+adb shell setprop debug.zevy.cluster_preselection 0
 adb shell setprop debug.zevy.dynamic_overlay 1
 adb shell setprop debug.zevy.shadow_updates 2
 adb shell setprop debug.zevy.shadow_hz 8
 adb shell setprop debug.zevy.hero_samples 2
 adb shell setprop debug.zevy.tail_samples 2
+adb shell setprop debug.zevy.exact_lights 8
 ```
+
+PointLight selection A/B uses two independent switches. The product default is
+`world_reservoir=1, cluster_preselection=0` (one real-cluster scan with a
+world-anchored reservoir). Set both to `0` for the scalar two-scan reference.
+Set `world_reservoir=0, cluster_preselection=1` only to reproduce the rejected
+aggressive 2x2 screen-supercluster path and its maximum-performance bound.
+When both are `1`, the world-space path takes precedence.
+
+`debug.zevy.exact_lights` sets the compile-time exact local-list threshold for
+the next app start. The VR-validated Map_S03B product default is `8`: clusters
+with at most eight PointLights sum every shadowed BRDF exactly, while only
+denser overflow can enter the experimental reservoir. `4` reproduces the raw
+reservoir cost bound; `6` still showed shadow blotches; `8` removed both the
+screen-space turning blocks and world-space shadow blotches. Use `16` as an
+all-exact quality reference for the current 16-light map.
 
 Boolean values accept `0/1`, `false/true`, `off/on`, or `no/yes`. Empty or
 invalid values retain `RenderQualityConfig::default()`. Force-stop and relaunch

@@ -50,6 +50,7 @@ ndk-context = "0.1"
 openxr = "0.19"
 
 [patch.crates-io]
+bevy_pbr = { path = "third_party/crates/bevy_pbr-0.16.1" }
 bevy_mod_openxr = { path = "third_party/crates/bevy_mod_openxr-0.3.0" }
 bevy_mod_xr = { path = "third_party/crates/bevy_mod_xr-0.3.0" }
 

@@ -69,10 +69,13 @@ const DITHER_THRESHOLD_MAP: vec4<u32> = vec4(
 // BRDF evaluation budget. Shadow residency is independent of this selection.
 const ZEVY_POINT_LIGHT_HERO_SAMPLES: u32 = 2u;
 const ZEVY_POINT_LIGHT_TAIL_SAMPLES: u32 = 2u;
+const ZEVY_POINT_LIGHT_EXACT_THRESHOLD: u32 = 8u;
 const ZEVY_TEMPORAL_LIGHT_SAMPLING: bool = false;
 const ZEVY_LIGHT_SAMPLE_PERIOD_FRAMES: u32 = 4u;
 const ZEVY_DYNAMIC_SHADOW_OVERLAY: bool = true;
 const ZEVY_POINT_LIGHT_DIRECT_LIGHTING: bool = true;
+const ZEVY_CLUSTERED_LIGHT_PRESELECTION: bool = true;
+const ZEVY_WORLD_SPACE_LIGHT_RESERVOIR: bool = true;
 
 fn zevy_hash_u32(value: u32) -> u32 {
     var hash = value;
@@ -97,6 +100,30 @@ fn zevy_light_sample_jitter(world_position: vec3<f32>) -> f32 {
         seed = seed ^ ((view_bindings::globals.frame_count / period) * 0x9e3779b9u);
     }
     return f32(zevy_hash_u32(seed) & 0x00ffffffu) / 16777216.0;
+}
+
+// Build the camera- and eye-independent part once per fragment. Keeping this
+// outside the light loop avoids repeating three floor operations and world-cell
+// hashes for every candidate.
+fn zevy_reservoir_seed(world_position: vec3<f32>) -> u32 {
+    let cell = vec3<i32>(floor(world_position * 8.0));
+    var seed = u32(cell.x) * 0x8da6b343u;
+    seed = seed ^ (u32(cell.y) * 0xd8163841u);
+    seed = seed ^ (u32(cell.z) * 0xcb1ab31fu);
+    if (ZEVY_TEMPORAL_LIGHT_SAMPLING) {
+        let period = max(ZEVY_LIGHT_SAMPLE_PERIOD_FRAMES, 1u);
+        seed = seed ^ ((view_bindings::globals.frame_count / period) * 0xc2b2ae35u);
+    }
+    return seed;
+}
+
+// One 32-bit avalanche hash supplies two stratified 16-bit streams. This is
+// much cheaper than two full hashes per candidate on Adreno, while still being
+// keyed by (world cell, light ID) and shared by both eyes.
+fn zevy_reservoir_random_pair(seed: u32, light_id: u32) -> vec2<f32> {
+    let hash = zevy_hash_u32(seed ^ (light_id * 0x9e3779b9u));
+    let random_bits = vec2<u32>(hash & 0x0000ffffu, hash >> 16u);
+    return (vec2<f32>(random_bits) + vec2<f32>(0.5)) / 65536.0;
 }
 
 fn zevy_point_light_has_shadow(light_id: u32) -> bool {
@@ -212,6 +239,31 @@ fn zevy_point_light_importance(light_id: u32, world_position: vec3<f32>) -> f32 
         vec3<f32>(0.2126, 0.7152, 0.0722)
     );
     return max(luminance * attenuation, 0.000001);
+}
+
+fn zevy_preselected_point_light_contribution(
+    light_id: u32,
+    estimator_weight: f32,
+    mesh_flags: u32,
+    world_position: vec4<f32>,
+    world_normal: vec3<f32>,
+    lighting_input: ptr<function, lighting::LightingInput>,
+) -> vec3<f32> {
+    if (light_id == 0xffffffffu || estimator_weight <= 0.0) {
+        return vec3<f32>(0.0);
+    }
+#ifdef LIGHTMAP
+    let enable_diffuse =
+        (view_bindings::clusterable_objects.data[light_id].flags &
+            mesh_view_types::POINT_LIGHT_FLAGS_AFFECTS_LIGHTMAPPED_MESH_DIFFUSE_BIT) != 0u;
+#else   // LIGHTMAP
+    let enable_diffuse = true;
+#endif  // LIGHTMAP
+    let shadow = zevy_point_light_shadow(
+        light_id, mesh_flags, world_position, world_normal
+    );
+    return lighting::point_light(light_id, lighting_input, enable_diffuse) *
+        (shadow * estimator_weight);
 }
 
 // Processes a visibility range dither value and discards the fragment if
@@ -569,25 +621,173 @@ fn apply_pbr_lighting(
         let first_point_light = clusterable_object_index_ranges.first_point_light_index_offset;
         let point_light_end = clusterable_object_index_ranges.first_spot_light_index_offset;
         let point_light_count = point_light_end - first_point_light;
-        let full_evaluation_budget =
+        let fixed_sample_budget =
             ZEVY_POINT_LIGHT_HERO_SAMPLES + ZEVY_POINT_LIGHT_TAIL_SAMPLES;
+        let exact_evaluation_threshold = max(
+            ZEVY_POINT_LIGHT_EXACT_THRESHOLD,
+            fixed_sample_budget
+        );
+        let preselected = clustering::unpack_preselected_point_lights(cluster_index);
 
-    if (point_light_count <= full_evaluation_budget) {
-        // Exact fast path: small local light lists never receive stochastic noise.
+    if (point_light_count <= exact_evaluation_threshold) {
+        // Correctness fast path must precede every coarse preselection path.
+        // Small real cluster lists are summed exactly and can never inherit a
+        // neighboring supercluster's light IDs or estimator weights.
         for (var i = first_point_light; i < point_light_end; i = i + 1u) {
             let light_id = clustering::get_clusterable_object_id(i);
-#ifdef LIGHTMAP
-            let enable_diffuse =
-                (view_bindings::clusterable_objects.data[light_id].flags &
-                    mesh_view_types::POINT_LIGHT_FLAGS_AFFECTS_LIGHTMAPPED_MESH_DIFFUSE_BIT) != 0u;
-#else   // LIGHTMAP
-            let enable_diffuse = true;
-#endif  // LIGHTMAP
-            let shadow = zevy_point_light_shadow(
-                light_id, in.flags, in.world_position, in.world_normal
+            direct_light += zevy_preselected_point_light_contribution(
+                light_id,
+                1.0,
+                in.flags,
+                in.world_position,
+                in.world_normal,
+                &lighting_input,
             );
-            direct_light += lighting::point_light(light_id, &lighting_input, enable_diffuse) * shadow;
         }
+    } else if (ZEVY_WORLD_SPACE_LIGHT_RESERVOIR &&
+            ZEVY_POINT_LIGHT_TAIL_SAMPLES <= 2u) {
+        // Product-quality scalable path: one walk over the real cluster finds
+        // deterministic Heroes and updates two independent weighted streaming
+        // reservoirs. Samples are tied to world space, not a screen cluster.
+        // Reservoirs include the Heroes; a sampled Hero is discarded below.
+        // For every non-Hero l, E[I(l sampled) * C_l / (K p_l)] = C_l, so the
+        // remaining tail estimate stays unbiased without a second candidate walk.
+        var hero_light_0 = 0xffffffffu;
+        var hero_light_1 = 0xffffffffu;
+        var hero_importance_0 = -1.0;
+        var hero_importance_1 = -1.0;
+        var all_importance_sum = 0.0;
+        var sampled_light_id_0 = 0xffffffffu;
+        var sampled_light_id_1 = 0xffffffffu;
+        let reservoir_seed = zevy_reservoir_seed(lighting_input.P);
+
+        for (var i = first_point_light; i < point_light_end; i = i + 1u) {
+            let light_id = clustering::get_clusterable_object_id(i);
+            let importance = zevy_point_light_importance(light_id, lighting_input.P);
+            all_importance_sum = all_importance_sum + importance;
+            let reservoir_random = zevy_reservoir_random_pair(reservoir_seed, light_id);
+
+            if (ZEVY_POINT_LIGHT_TAIL_SAMPLES > 0u &&
+                    reservoir_random.x * all_importance_sum < importance) {
+                sampled_light_id_0 = light_id;
+            }
+            if (ZEVY_POINT_LIGHT_TAIL_SAMPLES > 1u &&
+                    reservoir_random.y * all_importance_sum < importance) {
+                sampled_light_id_1 = light_id;
+            }
+
+            if (importance > hero_importance_0) {
+                if (ZEVY_POINT_LIGHT_HERO_SAMPLES > 1u) {
+                    hero_light_1 = hero_light_0;
+                    hero_importance_1 = hero_importance_0;
+                }
+                hero_light_0 = light_id;
+                hero_importance_0 = importance;
+            } else if (ZEVY_POINT_LIGHT_HERO_SAMPLES > 1u &&
+                    importance > hero_importance_1) {
+                hero_light_1 = light_id;
+                hero_importance_1 = importance;
+            }
+        }
+
+        direct_light += zevy_preselected_point_light_contribution(
+            hero_light_0,
+            1.0,
+            in.flags,
+            in.world_position,
+            in.world_normal,
+            &lighting_input,
+        );
+        if (ZEVY_POINT_LIGHT_HERO_SAMPLES > 1u) {
+            direct_light += zevy_preselected_point_light_contribution(
+                hero_light_1,
+                1.0,
+                in.flags,
+                in.world_position,
+                in.world_normal,
+                &lighting_input,
+            );
+        }
+
+        if (ZEVY_POINT_LIGHT_TAIL_SAMPLES > 0u &&
+                sampled_light_id_0 != 0xffffffffu &&
+                sampled_light_id_0 != hero_light_0 &&
+                sampled_light_id_0 != hero_light_1) {
+            let sampled_importance_0 = zevy_point_light_importance(
+                sampled_light_id_0, lighting_input.P
+            );
+            let probability = sampled_importance_0 / all_importance_sum;
+            let estimator_weight = 1.0 / max(
+                probability * f32(ZEVY_POINT_LIGHT_TAIL_SAMPLES),
+                0.000001
+            );
+            direct_light += zevy_preselected_point_light_contribution(
+                sampled_light_id_0,
+                estimator_weight,
+                in.flags,
+                in.world_position,
+                in.world_normal,
+                &lighting_input,
+            );
+        }
+        if (ZEVY_POINT_LIGHT_TAIL_SAMPLES > 1u &&
+                sampled_light_id_1 != 0xffffffffu &&
+                sampled_light_id_1 != hero_light_0 &&
+                sampled_light_id_1 != hero_light_1) {
+            let sampled_importance_1 = zevy_point_light_importance(
+                sampled_light_id_1, lighting_input.P
+            );
+            let probability = sampled_importance_1 / all_importance_sum;
+            let estimator_weight = 1.0 / max(
+                probability * f32(ZEVY_POINT_LIGHT_TAIL_SAMPLES),
+                0.000001
+            );
+            direct_light += zevy_preselected_point_light_contribution(
+                sampled_light_id_1,
+                estimator_weight,
+                in.flags,
+                in.world_position,
+                in.world_normal,
+                &lighting_input,
+            );
+        }
+    } else if (ZEVY_CLUSTERED_LIGHT_PRESELECTION &&
+            preselected.light_ids.x != 0xffffffffu) {
+        // Rejected product default, retained only for explicit performance A/B:
+        // four fixed supercluster IDs remove all candidate scans but can expose
+        // head-locked 2x2 screen-block brightness transitions while moving.
+        direct_light += zevy_preselected_point_light_contribution(
+            preselected.light_ids.x,
+            preselected.estimator_weights.x,
+            in.flags,
+            in.world_position,
+            in.world_normal,
+            &lighting_input,
+        );
+        direct_light += zevy_preselected_point_light_contribution(
+            preselected.light_ids.y,
+            preselected.estimator_weights.y,
+            in.flags,
+            in.world_position,
+            in.world_normal,
+            &lighting_input,
+        );
+        direct_light += zevy_preselected_point_light_contribution(
+            preselected.light_ids.z,
+            preselected.estimator_weights.z,
+            in.flags,
+            in.world_position,
+            in.world_normal,
+            &lighting_input,
+        );
+        direct_light += zevy_preselected_point_light_contribution(
+            preselected.light_ids.w,
+            preselected.estimator_weights.w,
+            in.flags,
+            in.world_position,
+            in.world_normal,
+            &lighting_input,
+        );
     } else {
         // Select the two highest-contribution Hero candidates. The configured
         // Hero budget is clamped to this mobile-friendly implementation limit.

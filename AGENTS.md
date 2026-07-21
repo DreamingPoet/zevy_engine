@@ -100,7 +100,7 @@ Zevy 的核心目标是：
 4. 在运行时实现 Cyclopean PVS/frustum、稳定 projected-error LOD、shadow-caster culling，并验证远近场景的三角形和 draw 确实下降。
 5. 为 16 盏蜡烛实现不依赖频繁 cubemap redraw 的连续阴影代理，消除约 400 ms 的投影阶梯。
 6. 并行比较 Bevy 0.19 升级、上游优化回移和 Zevy renderer fork；实现 XR Multiview、GPU scene、HZB、GPU culling、indirect/MDI、instancing 和 dirty uploads。
-7. 把 Hero/Tail 选灯从逐片元 \(O(N)\) 扫描搬到双眼共享 tile/froxel，并将 96 个固定 shadow views 演进为提前 cache reject、稀疏 dynamic pages 和 GPU-ms/误差驱动调度。
+7. Zevy `bevy_pbr` fork 已证明修改引擎层可显著降低选灯成本，但 2×2 screen supercluster 被 VR 运动测试证伪为转头亮度块，未经重建的 world reservoir 又被证伪为阴影斑块；当前 `exact_lights=8` 是 Map_S03B 已验证视觉基线。下一步必须为 8 灯以上 overflow 实现双眼共享 reservoir/Top-K、edge-aware reconstruction 与固定路径 16→32→64 灯斜率验证，不能把 raw stochastic shadow 直接输出到眼睛。并行把 96 个固定 shadow views 演进为提前 cache reject、稀疏 dynamic pages 和 GPU-ms/误差驱动调度。
 8. 接入 foveation/VRS、移动 tile attachment 优化、material tier、ASTC/KTX2、资源 streaming 与 ADPF 热控制，最终达到热稳定 72 Hz，并向 90 Hz 扩展。
 
 详细架构复盘、公式、实验顺序和验收门槛见 `zevy_engine/docs/VR_Renderring.md`。

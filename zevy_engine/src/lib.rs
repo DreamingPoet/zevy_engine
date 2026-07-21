@@ -1,4 +1,5 @@
 mod app;
+mod clustered_light_preselection;
 mod config;
 mod input;
 mod platform;

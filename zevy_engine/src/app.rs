@@ -22,6 +22,7 @@ use bevy_xr_utils::{
 #[cfg(feature = "render_debug")]
 use crate::render_debug::RenderDebugPlugin;
 use crate::{
+    clustered_light_preselection::ClusteredLightPreselectionPlugin,
     config::{RenderQualityConfig, apply_render_quality_to_cameras, log_render_quality_config},
     input,
     input::EngineInputPlugin,
@@ -140,6 +141,7 @@ pub fn run() {
         .add_systems(Startup, (log_launch_mode, log_render_quality_config))
         .add_systems(PostUpdate, apply_render_quality_to_cameras)
         .add_plugins(ScalableLightingPlugin)
+        .add_plugins(ClusteredLightPreselectionPlugin)
         .add_plugins(DynamicShadowOverlayPlugin)
         .add_plugins(ShadowCachePlugin)
         .add_plugins(EngineInputPlugin)

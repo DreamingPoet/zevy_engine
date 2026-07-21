@@ -43,6 +43,23 @@ pub struct RenderQualityConfig {
     /// Replaces Bevy's unbounded per-cluster PointLight BRDF loop with Zevy's
     /// fixed-budget Hero + importance-sampled tail path.
     pub scalable_point_lighting: bool,
+    /// Aggressive fixed O(1) A/B path that moves Hero/Tail selection to a
+    /// Cyclopean 2x2 CPU supercluster. It is disabled by default because moving
+    /// head tests exposed screen-block brightness discontinuities. Keep it as
+    /// a reversible experiment, not as the product-quality fallback.
+    pub clustered_light_preselection: bool,
+    /// Product-quality scalable path for clusters above the exact-light budget.
+    /// A single walk over the real per-fragment cluster simultaneously finds
+    /// deterministic Hero lights and two world-anchored weighted reservoirs.
+    /// This removes the second O(N) scan without tying approximation boundaries
+    /// to screen-space superclusters. It takes precedence over the aggressive
+    /// preselection switch when both are enabled.
+    pub world_space_light_reservoir: bool,
+    /// Real cluster lists at or below this count are always evaluated exactly.
+    /// Map_S03B defaults to eight so its verified local-light overlap never
+    /// exposes raw stochastic shadow samples. Higher-density overflow can still
+    /// use the experimental world-space reservoir.
+    pub point_light_exact_threshold: u32,
     /// Number of highest-contribution PointLights evaluated deterministically
     /// at each shading point, independent of camera-to-light distance.
     pub point_light_hero_samples: u32,
@@ -88,6 +105,9 @@ impl Default for RenderQualityConfig {
             point_light_direct_lighting: true,
             point_light_shadows: true,
             scalable_point_lighting: true,
+            clustered_light_preselection: false,
+            world_space_light_reservoir: true,
+            point_light_exact_threshold: 8,
             point_light_hero_samples: 2,
             point_light_tail_samples: 2,
             temporal_point_light_sampling: false,
@@ -180,6 +200,27 @@ impl RenderQualityConfig {
         self.point_light_hero_samples.clamp(1, 2)
     }
 
+    pub(crate) fn resolved_point_light_exact_threshold(self) -> u32 {
+        let fixed_sample_budget = self
+            .resolved_point_light_hero_samples()
+            .saturating_add(self.resolved_point_light_tail_samples());
+        self.point_light_exact_threshold
+            .max(fixed_sample_budget)
+            .min(64)
+    }
+
+    pub(crate) fn point_light_selection_mode_label(self) -> &'static str {
+        if !self.scalable_point_lighting {
+            "Bevy deterministic"
+        } else if self.world_space_light_reservoir {
+            "single-scan world reservoir"
+        } else if self.clustered_light_preselection {
+            "aggressive 2x2 supercluster"
+        } else {
+            "scalar Hero/Tail reference"
+        }
+    }
+
     pub(crate) fn resolved_light_sample_period_frames(self) -> u32 {
         self.light_sample_period_frames.clamp(1, 120)
     }
@@ -242,9 +283,14 @@ pub(crate) fn log_render_quality_config(config: Res<RenderQualityConfig>) {
             "RenderQualityConfig.point_light_direct_lighting=false only compiles out the PointLight fragment loop when scalable_point_lighting=true"
         );
     }
+    if config.world_space_light_reservoir && config.clustered_light_preselection {
+        warn!(
+            "Both world_space_light_reservoir and clustered_light_preselection are enabled; the world-space path takes precedence"
+        );
+    }
 
     info!(
-        "Render quality: XR scale {:.2}, MSAA {}x, A/B {}, point shadow residency {} at {}px, clusters {}/{}z to {:.1}m, scalable point lights {} ({} Hero + {} tail samples, {}), persistent shadow cache {} + dynamic overlay {} ({} Hz, {} light/frame)",
+        "Render quality: XR scale {:.2}, MSAA {}x, A/B {}, point shadow residency {} at {}px, clusters {}/{}z to {:.1}m, scalable point lights {} ({} Hero + {} tail samples, exact through {} lights, {}, selection {}), persistent shadow cache {} + dynamic overlay {} ({} Hz, {} light/frame)",
         resolved_scale,
         resolved_msaa.samples(),
         config.point_light_ab_profile_label(),
@@ -260,6 +306,7 @@ pub(crate) fn log_render_quality_config(config: Res<RenderQualityConfig>) {
         },
         config.resolved_point_light_hero_samples(),
         config.resolved_point_light_tail_samples(),
+        config.resolved_point_light_exact_threshold(),
         if config.temporal_point_light_sampling {
             format!(
                 "{} frame temporal rotation",
@@ -268,6 +315,7 @@ pub(crate) fn log_render_quality_config(config: Res<RenderQualityConfig>) {
         } else {
             "world-stable sampling".to_owned()
         },
+        config.point_light_selection_mode_label(),
         if config.persistent_point_shadow_cache {
             "on"
         } else {
@@ -291,6 +339,13 @@ mod tests {
         assert!(quality.point_light_direct_lighting);
         assert!(quality.point_light_shadows);
         assert!(quality.dynamic_shadow_caster_overlay);
+        assert!(!quality.clustered_light_preselection);
+        assert!(quality.world_space_light_reservoir);
+        assert_eq!(quality.resolved_point_light_exact_threshold(), 8);
+        assert_eq!(
+            quality.point_light_selection_mode_label(),
+            "single-scan world reservoir"
+        );
     }
 
     #[test]
@@ -336,5 +391,59 @@ mod tests {
             ..full
         };
         assert_eq!(hero_only.resolved_point_light_tail_samples(), 0);
+    }
+
+    #[test]
+    fn light_selection_modes_are_explicit_and_world_path_has_priority() {
+        let world = RenderQualityConfig::default();
+        assert_eq!(
+            world.point_light_selection_mode_label(),
+            "single-scan world reservoir"
+        );
+
+        let scalar = RenderQualityConfig {
+            world_space_light_reservoir: false,
+            clustered_light_preselection: false,
+            ..world
+        };
+        assert_eq!(
+            scalar.point_light_selection_mode_label(),
+            "scalar Hero/Tail reference"
+        );
+
+        let aggressive = RenderQualityConfig {
+            clustered_light_preselection: true,
+            ..scalar
+        };
+        assert_eq!(
+            aggressive.point_light_selection_mode_label(),
+            "aggressive 2x2 supercluster"
+        );
+
+        let both = RenderQualityConfig {
+            world_space_light_reservoir: true,
+            ..aggressive
+        };
+        assert_eq!(
+            both.point_light_selection_mode_label(),
+            "single-scan world reservoir"
+        );
+    }
+
+    #[test]
+    fn exact_light_threshold_never_drops_below_the_fixed_sample_budget() {
+        let quality = RenderQualityConfig {
+            point_light_exact_threshold: 1,
+            point_light_hero_samples: 2,
+            point_light_tail_samples: 2,
+            ..default()
+        };
+        assert_eq!(quality.resolved_point_light_exact_threshold(), 4);
+
+        let exact_reference = RenderQualityConfig {
+            point_light_exact_threshold: 16,
+            ..quality
+        };
+        assert_eq!(exact_reference.resolved_point_light_exact_threshold(), 16);
     }
 }

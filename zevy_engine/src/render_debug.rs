@@ -29,6 +29,7 @@ use bevy_xr_utils::xr_utils_actions::XRUtilsActionState;
 
 use crate::{
     app::{LaunchMode, StartupMode},
+    clustered_light_preselection::ClusterLightPreselectionStats,
     config::RenderQualityConfig,
     input::{XrDebugHudPageAction, XrDebugHudToggleAction},
     scene::{ImportedZevyEntity, MirrorCamera},
@@ -209,6 +210,18 @@ pub(crate) fn apply_android_render_quality_overrides(config: &mut RenderQualityC
     {
         config.point_light_shadows = value;
     }
+    if let Some(value) = android_system_property("debug.zevy.cluster_preselection")
+        .as_deref()
+        .and_then(parse_debug_bool)
+    {
+        config.clustered_light_preselection = value;
+    }
+    if let Some(value) = android_system_property("debug.zevy.world_reservoir")
+        .as_deref()
+        .and_then(parse_debug_bool)
+    {
+        config.world_space_light_reservoir = value;
+    }
     if let Some(value) = android_system_property("debug.zevy.dynamic_overlay")
         .as_deref()
         .and_then(parse_debug_bool)
@@ -239,6 +252,12 @@ pub(crate) fn apply_android_render_quality_overrides(config: &mut RenderQualityC
         .and_then(|value| value.trim().parse::<u32>().ok())
     {
         config.point_light_tail_samples = value.min(8);
+    }
+    if let Some(value) = android_system_property("debug.zevy.exact_lights")
+        .as_deref()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+    {
+        config.point_light_exact_threshold = value.min(64);
     }
 }
 
@@ -502,6 +521,7 @@ fn update_debug_snapshot(
     diagnostics: Res<DiagnosticsStore>,
     support: Res<GpuDiagnosticSupport>,
     quality: Res<RenderQualityConfig>,
+    cluster_preselection: Res<ClusterLightPreselectionStats>,
     shadow_cache_frame: Res<ZevyShadowCacheFrame>,
     xr_session_config: Option<Res<OxrCurrentSessionConfig>>,
     camera_views: Query<(&Camera, &Msaa, Option<&XrCamera>), With<Camera3d>>,
@@ -665,6 +685,31 @@ fn update_debug_snapshot(
     );
     let _ = writeln!(
         overview,
+        "Light selection  {}",
+        quality.point_light_selection_mode_label(),
+    );
+    if quality.clustered_light_preselection {
+        let average_candidates = if cluster_preselection.nonempty_superclusters > 0 {
+            cluster_preselection.candidate_references as f64
+                / cluster_preselection.nonempty_superclusters as f64
+        } else {
+            0.0
+        };
+        let _ = writeln!(
+            overview,
+            "Cluster select    {:>4} / XR {:>1} / avgN {:>3.1} max {:>2}",
+            if cluster_preselection.active {
+                "ON"
+            } else {
+                "WAIT"
+            },
+            cluster_preselection.xr_views,
+            average_candidates,
+            cluster_preselection.max_candidates,
+        );
+    }
+    let _ = writeln!(
+        overview,
         "Dynamic overlay   {:>4} / caster {:>2} draw {:>2}",
         if dynamic_overlay_enabled { "ON" } else { "OFF" },
         shadow_cache.dynamic_casters,
@@ -685,6 +730,11 @@ fn update_debug_snapshot(
         } else {
             "stable".to_owned()
         },
+    );
+    let _ = writeln!(
+        overview,
+        "Exact local list  <= {:>2} lights",
+        quality.resolved_point_light_exact_threshold(),
     );
     if let Some(resolution) = target_stats.resolution_per_view {
         let resolution_label = if target_stats.xr_active {
@@ -1199,11 +1249,24 @@ fn update_debug_snapshot(
         "Scalable PointLight path    {}",
         if !quality.point_light_direct_lighting && quality.scalable_point_lighting {
             "compiled out for fixed A/B"
-        } else if quality.scalable_point_lighting {
-            "Hero + stochastic tail"
         } else {
-            "Bevy deterministic"
+            quality.point_light_selection_mode_label()
         }
+    );
+    let _ = writeln!(
+        material_page,
+        "Cluster preselection        {} ({} views / {} superclusters)",
+        if cluster_preselection.active {
+            "active"
+        } else if quality.clustered_light_preselection && quality.world_space_light_reservoir {
+            "ignored (world path wins)"
+        } else if quality.clustered_light_preselection {
+            "waiting/fallback"
+        } else {
+            "disabled"
+        },
+        cluster_preselection.views,
+        cluster_preselection.superclusters,
     );
     if quality.scalable_point_lighting && quality.point_light_direct_lighting {
         let hero_lights = quality.resolved_point_light_hero_samples() as usize;
@@ -1211,8 +1274,9 @@ fn update_debug_snapshot(
         let bounded_evaluations = hero_lights.saturating_add(tail_samples);
         let _ = writeln!(
             material_page,
-            "Point BRDF budget/pixel    <= {} ({} Hero + {} tail)",
-            bounded_evaluations, hero_lights, tail_samples,
+            "Point BRDF budget/pixel    <= {} exact / {} overflow",
+            quality.resolved_point_light_exact_threshold(),
+            bounded_evaluations,
         );
         let _ = writeln!(
             material_page,

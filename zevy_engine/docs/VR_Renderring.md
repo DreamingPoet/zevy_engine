@@ -1383,7 +1383,7 @@ C_{tail\ shade}\approx C_{2T}-C_{1T}=1.46\text{ ms/sample}
 C_{current,K=2}\approx P\left[2N\,c_{importance}+(H+K)c_{shade}\right]
 \]
 
-在 4,000,000 fragment、16 灯、\(K=2\) 时，即使已经减半，importance 仍可能达到约 1.28 亿次/帧；PICO 同频实验估计 Tail 扫描本身约 2.29 ms。下一步建立 Cyclopean compute pass：
+在 4,000,000 fragment、16 灯、\(K=2\) 时，即使已经减半，importance 仍可能达到约 1.28 亿次/帧；PICO 同频实验估计 Tail 扫描本身约 2.29 ms。先用 CPU + cluster ABI 验证阶数变化，再把同一数据模型迁移为 Cyclopean compute：
 
 - 用双眼 union frustum 构建一次 tile/froxel light list；
 - 每 tile 选择稳定 Hero，并为 Tail 构建 reservoir、CDF 或 alias table；
@@ -1397,6 +1397,114 @@ C_{tile}\approx T\,N\,c_{select}+P(H+K)c_{shade},\qquad T\ll P
 \]
 
 上游 [Bevy 0.19 GPU light clustering](https://bevy.org/news/bevy-0-19/) 应作为可移植代码和数据布局参考，但不直接假设其桌面基准收益等于 Android VR。P2 成功标准：灯数从 16 增到 32/64 时，主光照 Pass 的增长斜率显著变平，且双眼没有不同 light sample 造成的亮度或阴影不一致。
+
+#### 20.4.1 已实现：Zevy `bevy_pbr` fork 与 Cyclopean supercluster 原型（2026-07-20）
+
+第一版没有先增加 compute pass 或新 bind group，而是直接修改最短的数据路径：
+
+1. 将 `bevy_pbr 0.16.1` vendor 到 `third_party/crates/bevy_pbr-0.16.1`，通过 `[patch.crates-io]` 让 Bevy、glTF、gizmos 和 Zevy 共用同一 fork；
+2. storage-buffer 平台的每个 cluster header 从两个 `vec4<u32>` 扩展为四个；前两个完全保留 Bevy offset/count ABI，第三个保存四个 PointLight ID，第四个保存四个 estimator weight 的 f32 bit pattern；
+3. 不新增 binding、descriptor 或 render pass。4096 clusters 的额外容量为约 128 KiB/view，双眼约 256 KiB；Uniform/WebGL 路径保持原布局并自动回退 scalar reference；
+4. Bevy 完成 light-volume 与 cluster 相交测试后，Zevy 把左右 XR view 按相同 cluster index 合组，再把 2×2 XY clusters 合成一个 Cyclopean supercluster；
+5. 候选集是两个眼睛、2×2 block 的保守 union，因此不会因只取单眼列表漏掉另一眼的灯；两个眼睛写入完全相同的四个 ID 和权重；
+6. 以 block 内所有 cluster center 的最大 importance 选两个确定性 Hero，并用世界空间稳定 hash 对其余 Tail 做两次系统重要性采样；权重仍为 `1/(K p_l)`；
+7. fragment shader 用四次标量读取和四个显式调用直接执行 BRDF/shadow，不使用局部数组、动态索引或候选循环；缺失预选数据时仍走上一阶段的约 2N scalar reference。
+
+默认 K=2 的 GPU 成本模型由：
+
+\[
+C_{scalar}\approx P[2N c_{importance}+4c_{shade}]
+\]
+
+变为：
+
+\[
+C_{cyclopean}\approx S\,N\,c_{CPUselect}+P(4c_{shade}+4c_{id}),
+\qquad S\approx T/4\ll P
+\]
+
+这里 CPU prototype 的目的不是宣称 CPU 是最终归宿，而是用最少工程变量证明“把选择从 fragment 移走”在目标 Adreno 上确实胜出。若 32/64 灯时 CPU 增长明显，再把同一 supercluster selection 搬到 compute/GPU scene，不改变 shader 消费 ABI。
+
+设备 `PA9410MGJ9260457G`，同一 release + HUD APK、默认起点、599 MHz、约 60°C、每组预热 30～45 秒后采集 11～12 个 PICO runtime 样本：
+
+| 固定 A/B | CPU avg | GPU avg | GPU P95 | 变化 |
+|---|---:|---:|---:|---:|
+| Direct only，scalar reference | 5.31 ms | 20.89 ms | 21.74 ms | reference |
+| Direct only，Cyclopean preselection | 5.27 ms | 17.18 ms | 17.55 ms | GPU -3.71 ms（-17.8%） |
+| Full，scalar reference | 8.81 ms | 30.29 ms | 31.42 ms | reference |
+| Full，Cyclopean preselection | 8.05 ms | 23.78 ms | 24.30 ms | GPU -6.51 ms（-21.5%） |
+| Full，反向关闭复测 | 8.91 ms | 30.98 ms | 32.28 ms | 回到 reference |
+| Full，重新开启复测 | 8.12 ms | 24.20 ms | 25.78 ms | 恢复优化档 |
+
+收益明显超过预设的 2.29 ms kill criterion，而且开→关→开可逆，不能用 DVFS 或测试顺序解释。CPU 没有测得回退，说明当前 16 灯/4096 cluster 下的分组、union 和 selection 尚未成为主线程瓶颈。真机 HUD 确认 `XR 2` 使用共享选择，当前相机的单 supercluster 最大候选数为 6。
+
+PC 与 PICO 静态截图的整体光照和阴影结构一致，但这不是最终视觉验收。当前仍需佩戴设备沿墙面、柱边、灯光交界和快速转头路径检查：
+
+- 2×2 supercluster 边界是否出现块状亮度跳变；
+- 同一表面落入左右眼相邻 cluster 时是否仍有 binocular mismatch；
+- 蜡烛强度/位置变化是否让 Tail ID 频繁切换；
+- estimator weight 是否产生局部过亮、高光方差或阴影颗粒。
+
+若出现边界问题，优先增加 world-space hysteresis、邻块候选 halo 或 persistent reservoir，而不是退回逐片元全扫描。下一性能验收是 16→32→64 灯增长曲线和 20 分钟 thermal soak；下一架构演进是把 CPU selection 迁移到一次 Cyclopean compute，并让 Multiview 主 Pass 直接共享同一 buffer。
+
+#### 20.4.2 已证伪并修正：屏幕块硬切改为单遍世界空间 reservoir（2026-07-21）
+
+**[Android/VR 用户验证，已证伪默认路径]** 佩戴测试确认：第一版 2×2 supercluster 在灯光交界处和转头时出现块状亮度变化，观察距离越远越明显。原因不是 PointLight 的物理 `range`，而是选择误差被绑定到随头部旋转的屏幕 froxel。设横向 cluster 数为 (n_x)、水平视场为 \(\theta_x\)，深度 (z) 处一个横向 cluster 的近似世界宽度为：
+
+\[
+\Delta x(z)\approx \frac{2z\tan(\theta_x/2)}{n_x}
+\]
+
+2×2 supercluster 又把这个宽度扩大约两倍，所以同一个 ID/estimator-weight 硬切在远处覆盖更大的墙面；转头时该分区相对世界滑动，形成用户看到的亮度块。代码中预选分支还排在“小列表精确求和”之前，导致真实 cluster 只有 1～4 盏灯时也可能消费相邻 cluster 的 union 选择，这是额外的正确性错误。
+
+修正后的默认路径必须先满足：
+
+1. 当真实 cluster 的 \(N\le Q\) 时，直接对真实列表严格求和，不读取任何 supercluster 近似，其中 \(Q=\max(H+K,E)\)，\(E\) 是可配置 exact threshold；
+2. 当 \(N>Q\) 时，只遍历真实 cluster 一次，在同一遍中选择 \(H=2\) 个确定性 Hero，并建立 \(K=2\) 路独立的流式加权 reservoir；
+3. 第 (i) 个候选的重要度为 (w_i>0)，累计权重为 (W_i=\sum_{j\le i}w_j)。每一路 reservoir 以概率 (w_i/W_i) 用候选 (i) 替换当前样本，因此最终 (p_i=w_i/W)；
+4. Hero 精确计算。reservoir 若抽到 Hero 则丢弃该次 tail 项；若抽到非 Hero 灯 (l)，使用 (C_l/(Kp_l)) 估计其完整 BRDF 与阴影贡献。虽然 Hero 可能占用一次抽样，但 tail 仍无偏：
+
+\[
+\mathbb E[\widehat L_{tail}]
+=\sum_{l\notin Hero}Kp_l\frac{C_l}{Kp_l}
+=\sum_{l\notin Hero}C_l
+\]
+
+5. 随机数只由量化世界位置、light ID、sample stream 和可选低频 epoch 产生，不读取屏幕坐标、cluster ID 或眼睛 ID；默认关闭 epoch 轮换。因此同一世界表面转头时保持选择，两眼共享同一随机场，误差块的物理尺寸不会随观察距离扩大；
+6. 第一版 `O(1)` Cyclopean preselection 保留为显式性能 A/B 和后续研究材料，但由于已经违反运动视觉连续性，退出默认产品路径。
+
+默认 (K=2) 的片元成本从 scalar reference 的
+
+\[
+C_{scalar}\approx P[2N c_{importance}+4c_{shade}]
+\]
+
+变为
+
+\[
+C_{world-reservoir}\approx P[N(c_{importance}+c_{hash})+4c_{shade}]
+\]
+
+两个 reservoir stream 已优化为每片元一个 world seed、每候选一个 32-bit avalanche hash，再拆为两路 16-bit 随机数，避免每灯重复两次完整 hash。它不会保留第一版 `O(1)` 的全部性能收益，但仍消除第二次候选遍历，并且不再让屏幕块决定光照。静态截图只能验证 shader/ABI 和大体画面，不能代替佩戴验收。
+
+#### 20.4.3 第二次证伪：无重建的原始 shadow reservoir 产生世界空间斑块
+
+**[Android/VR 用户验证，2026-07-21]** 单遍世界空间 reservoir 确实消除了灯光交界处随转头移动、远处放大的屏幕块，但在地面和墙上产生了固定于世界的约 12.5 cm 阴影斑块。用户截图中的规则明暗块与 `floor(world_position * 8)` 的 cell 尺寸一致，不是 128² shadow atlas 的 texel 放大。
+
+根因是把高方差的二值/软阴影可见性 \(V_l\) 直接放入单样本 Horvitz–Thompson 项：
+
+\[
+\widehat C_l=\frac{f_l V_l}{Kp_l}
+\]
+
+估计器在期望上无偏，但单个静态世界 cell 只看到一个 realization；当相邻 cell 抽到“被遮挡”和“未遮挡”的不同 Tail 灯时，\(V_l\) 的大方差被 \(1/(Kp_l)\) 放大为可见斑块。把 cell 变小只会把斑块改成噪点，把 cell 变大只会得到更大的斑块；没有空间/时间重建时，两者都不是产品解。
+
+立即修正分两层：
+
+1. **[已实现并经 Android/VR 用户验证]** `RenderQualityConfig.point_light_exact_threshold` 默认设为 8。用户在同一问题位置验证：`exact_lights=6` 仍有世界空间阴影斑块，说明移动后的局部列表可达到 7～8 灯；提高到 `8` 后阴影斑块消失，画面正常，先前随转头移动的屏幕块也没有回归。真实 cluster 的 \(N\le8\) 时对每盏灯的 BRDF 与静态/动态阴影严格求和。Android A/B 属性为 `debug.zevy.exact_lights`；`4` 复现原始随机成本档，`6` 复现残余斑块失败档，`8` 是当前 VR 验证基线，`16` 是当前地图的全精确参考。
+2. **[设计要求]** 对 \(N>8\) 的高密度 overflow，原始 reservoir 只能保留为研究路径。产品化必须加入双眼共享的低分辨率 shadow/lighting reservoir buffer、edge-aware 空间重建、短历史或确定性 Top-K + 低频 Tail proxy；不得再把未经重建的随机阴影直接输出到眼睛。
+
+这一修正是明确的 quality/performance trade-off：Map_S03B 的 5～8 灯重叠像素相对 2H+2T 最多增加四次完整 shadowed BRDF，以换取已验证的无随机阴影误差；灯数更高时仍需下一代重建路径改变成本阶数。当前视觉门槛已经通过，但仍需记录 exact threshold 4/6/8/16 的固定路径 GPU P50/P95/P99，不能把 exact 8 当作最终 32/64 灯架构。
 
 ### 20.5 P3：建立 Zevy Render Fork，消除双眼与 CPU 提交重复
 
