@@ -169,6 +169,16 @@ pub struct ZevyUnrealLightParameters {
     pub outer_cone_angle_degrees: f32,
 }
 
+impl ZevyUnrealLightParameters {
+    /// Returns whether Unreal authored this light as fully static.
+    ///
+    /// Older manifests may omit mobility, so only an explicit `static` value
+    /// opts into static-only runtime behavior.
+    pub fn is_static_mobility(&self) -> bool {
+        self.mobility.trim().eq_ignore_ascii_case("static")
+    }
+}
+
 impl Default for ZevyUnrealLightParameters {
     fn default() -> Self {
         Self {
@@ -1124,6 +1134,25 @@ mod tests {
         assert_eq!(manifest.entities[0].lights[0].kind, ZevyLightKind::Point);
         assert_eq!(manifest.entities[0].lights[0].bevy.intensity, 1200.0);
         assert_eq!(manifest.entities[0].lights[0].bevy.range_m, 8.0);
+    }
+
+    #[test]
+    fn static_light_mobility_requires_an_explicit_static_value() {
+        for mobility in ["static", " Static ", "STATIC"] {
+            let parameters = ZevyUnrealLightParameters {
+                mobility: mobility.to_owned(),
+                ..default()
+            };
+            assert!(parameters.is_static_mobility());
+        }
+
+        for mobility in ["", "movable", "stationary"] {
+            let parameters = ZevyUnrealLightParameters {
+                mobility: mobility.to_owned(),
+                ..default()
+            };
+            assert!(!parameters.is_static_mobility());
+        }
     }
 
     #[test]

@@ -45,6 +45,9 @@ and Directional/Point/Spot lights without saving them back into the source Map.
 - Complex UE-only shaders are baked or degraded to glTF PBR.
 - Non-uniform parent scale combined with child rotation can differ after TRS
   decomposition; the exporter records a warning in the manifest.
-- Rect Light, Sky Light, IES, Light Function, shadow settings, Mobility, Lumen,
-  collision, Blueprint gameplay, Niagara, and World Partition streaming need
-  later Zevy-specific metadata or runtime systems.
+- Rect Light, Sky Light, IES, Light Function, advanced shadow settings,
+  Stationary mixed-lighting semantics, Lumen, collision, Blueprint gameplay,
+  Niagara, and World Partition streaming need later Zevy-specific metadata or
+  runtime systems. PointLight `static` mobility is exported; Map_S03B applies
+  its level calibration once, then prevents candle visuals, animation and
+  periodic projection invalidation for that light.

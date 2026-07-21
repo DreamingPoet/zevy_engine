@@ -784,11 +784,12 @@ Atlas=[StaticCube_0\ldots StaticCube_{N-1},\ DynamicCube_0\ldots DynamicCube_{N-
 - 每个 face 只收集该 PointLight cubemap frustum 中可见的动态 caster。当前帧集合与上一帧集合取并集：新 face 重画，旧 face 至少清除一次，因此移动物体离开后不会留下“幽灵阴影”；
 - 左右眼共享同一套 light-space depth。相同 `(light, face)` 在 XR 中去重，并用原子 claim 保证一帧只由第一只执行到该节点的眼睛提交一次动态 pass；
 - 导入关卡层级中的 mesh 默认视为静态；关卡外 mesh 默认视为动态。对导入 Actor 根或任意 mesh 添加公开组件 `DynamicShadowCaster`，其后代 mesh 会进入动态层；
+- 导入灯的 UE mobility 同样参与运行时策略。Map_S03B 对所有 PointLight 一次性应用关卡校准（强度 `×1000`、范围 `×4`）；显式 `static` 的灯随后固定校准结果与 Transform，不生成蜡烛发光体、不播放动画、不进入周期性 candle shadow invalidation；它的静态 shadow face 只在首次生成或真正的缓存失效时重画；
 - 关闭 `dynamic_shadow_caster_overlay` 时恢复整层阴影缓存逻辑，并重新把动态变换纳入静态 cache invalidation，避免留下旧深度。
 
-Map_S03B 当前 16 个 PointLight 在没有动态 caster 时只保留 16 个静态 cube，即 96 个 2D array layer；动态层激活时为 16 static + 16 dynamic + 1 sentinel，即 198 layer。Bevy 0.16.1 使用 `Depth32Float`，128² 下分别约为 6 MiB 与 12.375 MiB。启动时会检查设备的 `max_texture_array_layers`；超过上限会明确要求降低 `max_shadowed_point_lights`，而不是静默丢失后半区阴影。
+Map_S03B 当前导出清单有 18 个 PointLight：16 个 movable 蜡烛灯和 2 个 static 灯。在全部启用阴影且没有动态 caster 时保留 18 个静态 cube，即 108 个 2D array layer；动态层激活时为 18 static + 18 dynamic + 1 sentinel，即 222 layer。Bevy 0.16.1 使用 `Depth32Float`，128² 下分别约为 6.75 MiB 与 13.875 MiB。启动时会检查设备的 `max_texture_array_layers`；超过上限会明确要求降低 `max_shadowed_point_lights`，而不是静默丢失后半区阴影。
 
-内置 `--level=performance` 回归场景包含一个持续移动/旋转的 `DynamicShadowCaster`。PC 验证中共有 7 个动态 caster、2 个有阴影的 PointLight（最多 12 个 face），每帧实际只更新约 8～10 个有当前或历史覆盖的动态 face。Map_S03B 没有动态 caster 时，动态层稳定为 0 redraw；静态层共有 96 个 resident face，实际 redraw 数由本帧到期的灯光投影决定。默认每帧最多更新 2 盏 PointLight，因此上限为 `12 redraw / 84 reuse`，没有投影到期的帧仍为 `0 redraw / 96 reuse`。
+内置 `--level=performance` 回归场景包含一个持续移动/旋转的 `DynamicShadowCaster`。PC 验证中共有 7 个动态 caster、2 个有阴影的 PointLight（最多 12 个 face），每帧实际只更新约 8～10 个有当前或历史覆盖的动态 face。Map_S03B 没有动态 caster 时，动态层稳定为 0 redraw；静态层共有 108 个 resident face，但周期性投影调度只包含 16 个 movable 灯，2 个 static 灯不会因蜡烛节奏失效。每帧重画上限由 `max_cached_point_shadow_updates_per_frame × 6 faces` 决定，没有 movable 投影到期的帧仍为 `0 redraw / 108 reuse`。
 
 当前双层合成只覆盖 PointLight Forward PBR 路径。Spot/Directional 仍使用 Bevy 原路径；未来扩展它们时应优先采用 2D-array layer 配对，而不是复制一套独立材质绑定。
 

@@ -199,6 +199,8 @@ schema v2 还会在对应 `entities[]` 项中写入可手工编辑的 `lights[]`
 
 Zevy 在 glTF 实例化后用 `lights[].bevy` 精确覆盖实际 `PointLight` / `SpotLight` / `DirectionalLight`，并把完整定义挂在公开组件 `ImportedZevyLight` 上，便于运行时或编辑工具继续修改。UE 的自定义 `LightFalloffExponent` 在 Bevy 0.16 标准 PBR 灯光中没有完全等价实现；这类灯光目前使用 inverse-square cutoff 近似渲染，但原始衰减方式和指数不会丢失。
 
+运行时必须尊重显式的 `lights[].unreal.mobility = "static"`。Map_S03B 的 authored-to-runtime 灯光校准（当前强度 `×1000`、范围 `×4`）会对所有 PointLight 应用一次，保证 static 灯也具有该关卡所需的有效照明；mobility 决定校准后的值是否随时间变化。static 灯保持颜色和 Transform，校准后的亮度与范围固定，不生成蜡烛发光体，不参与亮度、范围、位置动画，也不进入周期性 candle shadow invalidation；若启用阴影，其静态 depth 在首次生成后进入持久化缓存。只有显式 `static` 才启用该规则，旧清单缺失 mobility 时保持兼容行为。`stationary` 的 UE 混合光照语义尚未完整实现，当前不会被误判为 static。
+
 Zevy 桌面预览只在导入关卡没有灯光时启用非破坏性的相机补光；检测到导入灯光后会隐藏默认 Directional Light。
 
 ## 7. UE 插件入口

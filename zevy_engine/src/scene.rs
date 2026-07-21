@@ -151,6 +151,7 @@ struct MapS03BPointLightTuningApplied {
     base_intensity: f32,
     base_range: f32,
     flicker_phase: f32,
+    candle_animated: bool,
 }
 
 #[derive(Component, Clone, Copy)]
@@ -416,15 +417,13 @@ fn apply_map_s03b_lighting_profile(
     current_level: Res<CurrentLevel>,
     quality: Res<RenderQualityConfig>,
     mut commands: Commands,
-    mut point_lights: Query<
-        (
-            Entity,
-            &mut PointLight,
-            &mut Transform,
-            Option<&MapS03BPointLightTuningApplied>,
-        ),
-        With<ImportedZevyLight>,
-    >,
+    mut point_lights: Query<(
+        Entity,
+        &mut PointLight,
+        &mut Transform,
+        &ImportedZevyLight,
+        Option<&MapS03BPointLightTuningApplied>,
+    )>,
     mut cameras: Query<
         (
             Entity,
@@ -441,12 +440,17 @@ fn apply_map_s03b_lighting_profile(
         .as_ref()
         .is_some_and(|level| matches!(level, LevelId::Asset(path) if is_map_s03b_asset(path)));
 
-    for (entity, mut light, mut transform, applied) in &mut point_lights {
+    for (entity, mut light, mut transform, imported, applied) in &mut point_lights {
         if use_profile && applied.is_none() {
             let previous_intensity = light.intensity;
             let previous_range = light.range;
             let previous_shadows_enabled = light.shadows_enabled;
             let previous_translation = transform.translation;
+            let candle_animated = !imported.source.unreal.is_static_mobility();
+            // Map_S03B's authored-to-runtime calibration is applied once to
+            // every imported PointLight. Mobility controls whether that
+            // calibrated result changes over time, not whether the light is
+            // bright enough to participate in this level's lighting profile.
             light.intensity *= MAP_S03B_POINT_LIGHT_INTENSITY_SCALE;
             light.range *= MAP_S03B_POINT_LIGHT_RANGE_SCALE;
             // Stable shadow residency is applied after this profile. Starting
@@ -460,14 +464,26 @@ fn apply_map_s03b_lighting_profile(
                 base_intensity: light.intensity,
                 base_range: light.range,
                 flicker_phase: entity.index() as f32 * 1.618_034,
+                candle_animated,
             };
             commands
                 .entity(entity)
                 .insert((tuning, CachedPointLightShadow::default()));
-            info!(
-                "Applied Map_S03B PointLight tuning: intensity {:.3} -> {:.3} lm, range {:.3} -> {:.3} m",
-                tuning.previous_intensity, light.intensity, tuning.previous_range, light.range,
-            );
+            if candle_animated {
+                info!(
+                    "Applied Map_S03B candle PointLight tuning: intensity {:.3} -> {:.3} lm, range {:.3} -> {:.3} m",
+                    tuning.previous_intensity, light.intensity, tuning.previous_range, light.range,
+                );
+            } else {
+                info!(
+                    "Applied fixed static Map_S03B PointLight profile: intensity {:.3} -> {:.3} lm, range {:.3} -> {:.3} m, mobility '{}'",
+                    tuning.previous_intensity,
+                    light.intensity,
+                    tuning.previous_range,
+                    light.range,
+                    imported.source.unreal.mobility,
+                );
+            }
         } else if !use_profile && let Some(applied) = applied {
             light.intensity = applied.previous_intensity;
             light.range = applied.previous_range;
@@ -612,7 +628,7 @@ fn sync_map_s03b_candle_visuals(
         .is_some_and(|level| matches!(level, LevelId::Asset(path) if is_map_s03b_asset(path)));
 
     for (entity, light, tuning, visual) in &point_lights {
-        if use_profile && visual.is_none() {
+        if use_profile && tuning.candle_animated && visual.is_none() {
             let mesh = candle_mesh
                 .get_or_insert_with(|| meshes.add(Sphere::new(0.10).mesh().ico(2).unwrap()))
                 .clone();
@@ -646,7 +662,9 @@ fn sync_map_s03b_candle_visuals(
             commands
                 .entity(entity)
                 .insert(MapS03BCandleVisualSpawned { child });
-        } else if !use_profile && let Some(visual) = visual {
+        } else if (!use_profile || !tuning.candle_animated)
+            && let Some(visual) = visual
+        {
             commands.entity(visual.child).despawn();
             commands
                 .entity(entity)
@@ -686,6 +704,9 @@ fn animate_map_s03b_candle_lights(
     let shadow_update_interval = (shadow_update_hz > 0.0).then(|| 1.0 / shadow_update_hz);
     let mut shadow_update_candidates = Vec::new();
     for (entity, mut light, mut transform, tuning, mut cached_shadow) in &mut point_lights {
+        if !tuning.candle_animated {
+            continue;
+        }
         let intensity_multiplier = candle_flicker_multiplier(seconds, tuning.flicker_phase);
         let range_multiplier = 1.0 + (intensity_multiplier - 1.0) * 0.28;
         light.intensity = tuning.base_intensity * intensity_multiplier;
@@ -1098,6 +1119,7 @@ mod tests {
                     base_intensity: 100.0,
                     base_range: 6.0,
                     flicker_phase: 0.75,
+                    candle_animated: true,
                 },
                 CachedPointLightShadow::default(),
             ))
@@ -1116,5 +1138,79 @@ mod tests {
 
         let transform = app.world().entity(point_light).get::<Transform>().unwrap();
         assert_ne!(transform.translation, base_translation);
+    }
+
+    #[test]
+    fn static_imported_point_light_applies_profile_once_and_skips_candle_animation() {
+        let mut app = App::new();
+        app.insert_resource(CurrentLevel(Some(LevelId::asset(MAP_S03B_ASSET_PATH))))
+            .insert_resource(RenderQualityConfig::default())
+            .init_resource::<ZevyShadowCacheFrame>()
+            .init_resource::<Time>()
+            .init_resource::<Assets<Mesh>>()
+            .init_resource::<Assets<StandardMaterial>>()
+            .add_systems(
+                Update,
+                (
+                    apply_map_s03b_lighting_profile,
+                    sync_map_s03b_candle_visuals,
+                    apply_map_s03b_shadow_residency,
+                    animate_map_s03b_candle_lights,
+                )
+                    .chain(),
+            );
+
+        let authored_intensity = 1_256.6371;
+        let authored_range = 12.0;
+        let authored_translation = Vec3::new(1.0, 2.0, 3.0);
+        let point_light = app
+            .world_mut()
+            .spawn((
+                PointLight {
+                    intensity: authored_intensity,
+                    range: authored_range,
+                    shadows_enabled: true,
+                    ..default()
+                },
+                Transform::from_translation(authored_translation),
+                ImportedZevyLight {
+                    source: ZevyLightDefinition {
+                        component_name: "LightComponent0".to_owned(),
+                        gltf_name: "StaticPointLight".to_owned(),
+                        kind: ZevyLightKind::Point,
+                        bevy: ZevyBevyLightParameters::default(),
+                        unreal: ZevyUnrealLightParameters {
+                            mobility: "static".to_owned(),
+                            ..default()
+                        },
+                    },
+                },
+            ))
+            .id();
+
+        app.update();
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(std::time::Duration::from_secs(1));
+        app.update();
+
+        let entity = app.world().entity(point_light);
+        let light = entity.get::<PointLight>().unwrap();
+        let transform = entity.get::<Transform>().unwrap();
+        let tuning = entity.get::<MapS03BPointLightTuningApplied>().unwrap();
+        let cached_shadow = entity.get::<CachedPointLightShadow>().unwrap();
+        assert_eq!(
+            light.intensity,
+            authored_intensity * MAP_S03B_POINT_LIGHT_INTENSITY_SCALE
+        );
+        assert_eq!(
+            light.range,
+            authored_range * MAP_S03B_POINT_LIGHT_RANGE_SCALE
+        );
+        assert!(light.shadows_enabled);
+        assert_eq!(transform.translation, authored_translation);
+        assert!(!tuning.candle_animated);
+        assert!(cached_shadow.last_update_seconds.is_none());
+        assert!(!entity.contains::<MapS03BCandleVisualSpawned>());
     }
 }

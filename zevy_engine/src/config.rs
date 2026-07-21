@@ -116,7 +116,7 @@ impl Default for RenderQualityConfig {
             dynamic_shadow_caster_overlay: true,
             point_shadow_cache_warmup_frames: 3,
             cached_point_shadow_update_hz: 8.0,
-            max_cached_point_shadow_updates_per_frame: 2,
+            max_cached_point_shadow_updates_per_frame: 8,
         }
     }
 }
