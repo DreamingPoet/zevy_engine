@@ -1,5 +1,6 @@
 mod desktop_player;
 mod levels;
+mod map_s03b_motion_test;
 mod mip_texture;
 mod zevy_level;
 
@@ -8,7 +9,7 @@ use std::env;
 use bevy::{
     pbr::{
         ClusterConfig, ClusterFarZMode, ClusterZConfig, NotShadowCaster, NotShadowReceiver,
-        ShadowFilteringMethod,
+        PointLightShadowMapJitter, ShadowFilteringMethod,
     },
     prelude::*,
     render::primitives::Aabb,
@@ -20,6 +21,7 @@ use crate::{
     config::RenderQualityConfig,
     input::EngineInputSet,
     shadow_cache::{CachedPointLightShadow, ZevyShadowCacheFrame},
+    shadow_motion_policy::{LightShadowMotionClass, LightShadowMotionPolicy},
 };
 
 pub use zevy_level::{
@@ -54,6 +56,9 @@ impl Plugin for ScenePlugin {
                     animate_map_s03b_candle_lights
                         .after(sync_map_s03b_candle_visuals)
                         .after(apply_map_s03b_shadow_residency),
+                    map_s03b_motion_test::sync_flying_shadow_test.after(open_level),
+                    map_s03b_motion_test::animate_flying_shadow_test
+                        .after(map_s03b_motion_test::sync_flying_shadow_test),
                     desktop_player::update_desktop_level_player
                         .after(EngineInputSet::Collect)
                         .after(frame_asset_level_camera),
@@ -152,6 +157,7 @@ struct MapS03BPointLightTuningApplied {
     base_range: f32,
     flicker_phase: f32,
     candle_animated: bool,
+    previous_shadow_motion_policy: Option<LightShadowMotionPolicy>,
 }
 
 #[derive(Component, Clone, Copy)]
@@ -423,6 +429,7 @@ fn apply_map_s03b_lighting_profile(
         &mut Transform,
         &ImportedZevyLight,
         Option<&MapS03BPointLightTuningApplied>,
+        Option<&LightShadowMotionPolicy>,
     )>,
     mut cameras: Query<
         (
@@ -440,7 +447,8 @@ fn apply_map_s03b_lighting_profile(
         .as_ref()
         .is_some_and(|level| matches!(level, LevelId::Asset(path) if is_map_s03b_asset(path)));
 
-    for (entity, mut light, mut transform, imported, applied) in &mut point_lights {
+    for (entity, mut light, mut transform, imported, applied, previous_policy) in &mut point_lights
+    {
         if use_profile && applied.is_none() {
             let previous_intensity = light.intensity;
             let previous_range = light.range;
@@ -453,7 +461,7 @@ fn apply_map_s03b_lighting_profile(
             // bright enough to participate in this level's lighting profile.
             light.intensity *= MAP_S03B_POINT_LIGHT_INTENSITY_SCALE;
             light.range *= MAP_S03B_POINT_LIGHT_RANGE_SCALE;
-            // Stable shadow residency is applied after this profile. Starting
+            // Stable shadow eligibility is applied after this profile. Starting
             // disabled prevents a one-frame allocation with incomplete data.
             light.shadows_enabled = false;
             let tuning = MapS03BPointLightTuningApplied {
@@ -465,10 +473,15 @@ fn apply_map_s03b_lighting_profile(
                 base_range: light.range,
                 flicker_phase: entity.index() as f32 * 1.618_034,
                 candle_animated,
+                previous_shadow_motion_policy: previous_policy.copied(),
             };
-            commands
-                .entity(entity)
-                .insert((tuning, CachedPointLightShadow::default()));
+            let mut entity_commands = commands.entity(entity);
+            let motion_class = if candle_animated {
+                LightShadowMotionClass::BoundedMicroMotion
+            } else {
+                LightShadowMotionClass::Static
+            };
+            entity_commands.insert((tuning, LightShadowMotionPolicy::fixed(motion_class)));
             if candle_animated {
                 info!(
                     "Applied Map_S03B candle PointLight tuning: intensity {:.3} -> {:.3} lm, range {:.3} -> {:.3} m",
@@ -489,9 +502,13 @@ fn apply_map_s03b_lighting_profile(
             light.range = applied.previous_range;
             light.shadows_enabled = applied.previous_shadows_enabled;
             transform.translation = applied.previous_translation;
-            commands
-                .entity(entity)
-                .remove::<(MapS03BPointLightTuningApplied, CachedPointLightShadow)>();
+            let mut entity_commands = commands.entity(entity);
+            entity_commands.remove::<MapS03BPointLightTuningApplied>();
+            if let Some(previous_policy) = applied.previous_shadow_motion_policy {
+                entity_commands.insert(previous_policy);
+            } else {
+                entity_commands.remove::<LightShadowMotionPolicy>();
+            }
         }
     }
 
@@ -596,7 +613,7 @@ fn apply_map_s03b_shadow_residency(
             format!("explicit cap {}", quality.max_shadowed_point_lights)
         };
         info!(
-            "Map_S03B point-shadow residency fixed at {}/{} eligible lights ({} cubemap shadow views, {}); camera distance does not change this set",
+            "Map_S03B point-shadow eligibility fixed at {}/{} lights (up to {} cubemap faces before RenderWorld visibility extraction, {}); camera distance does not change eligibility",
             selected.len(),
             enabled_count,
             selected.len() * 6,
@@ -685,6 +702,7 @@ fn animate_map_s03b_candle_lights(
             &mut Transform,
             &MapS03BPointLightTuningApplied,
             &mut CachedPointLightShadow,
+            Option<&mut PointLightShadowMapJitter>,
         ),
         Without<MapS03BCandleGlow>,
     >,
@@ -702,8 +720,12 @@ fn animate_map_s03b_candle_lights(
     let seconds = time.elapsed_secs();
     let shadow_update_hz = quality.resolved_cached_point_shadow_update_hz();
     let shadow_update_interval = (shadow_update_hz > 0.0).then(|| 1.0 / shadow_update_hz);
+    let continuous_shadow_proxy = quality.continuous_point_shadow_proxy_enabled();
+    let shadow_proxy_sway_scale = quality.resolved_point_shadow_proxy_sway_scale();
     let mut shadow_update_candidates = Vec::new();
-    for (entity, mut light, mut transform, tuning, mut cached_shadow) in &mut point_lights {
+    for (entity, mut light, mut transform, tuning, mut cached_shadow, shadow_map_jitter) in
+        &mut point_lights
+    {
         if !tuning.candle_animated {
             continue;
         }
@@ -711,22 +733,38 @@ fn animate_map_s03b_candle_lights(
         let range_multiplier = 1.0 + (intensity_multiplier - 1.0) * 0.28;
         light.intensity = tuning.base_intensity * intensity_multiplier;
 
-        if !quality.persistent_point_shadow_cache {
-            light.range = tuning.base_range * range_multiplier;
-            transform.translation =
-                tuning.previous_translation + candle_light_offset(seconds, tuning.flicker_phase);
+        if continuous_shadow_proxy {
+            // Keep the real PointLight and its cubemap projection stable. Only
+            // the shader's virtual lookup origin moves, so the persistent
+            // static layer remains valid while both eyes see the same offset.
+            light.range = tuning.base_range;
+            transform.translation = tuning.previous_translation;
             cached_shadow.last_update_seconds = None;
-        } else if let Some(update_interval) = shadow_update_interval {
-            let is_due = point_shadow_update_is_due(
-                cached_shadow.last_update_seconds,
-                seconds,
-                update_interval,
-            );
-            if is_due {
-                shadow_update_candidates.push(PointShadowUpdateCandidate {
-                    entity,
-                    last_update_seconds: cached_shadow.last_update_seconds,
-                });
+            if let Some(mut jitter) = shadow_map_jitter {
+                jitter.local_offset =
+                    candle_light_offset(seconds, tuning.flicker_phase) * shadow_proxy_sway_scale;
+            }
+        } else {
+            if let Some(mut jitter) = shadow_map_jitter {
+                jitter.local_offset = Vec3::ZERO;
+            }
+            if !quality.persistent_point_shadow_cache {
+                light.range = tuning.base_range * range_multiplier;
+                transform.translation = tuning.previous_translation
+                    + candle_light_offset(seconds, tuning.flicker_phase);
+                cached_shadow.last_update_seconds = None;
+            } else if let Some(update_interval) = shadow_update_interval {
+                let is_due = point_shadow_update_is_due(
+                    cached_shadow.last_update_seconds,
+                    seconds,
+                    update_interval,
+                );
+                if is_due {
+                    shadow_update_candidates.push(PointShadowUpdateCandidate {
+                        entity,
+                        last_update_seconds: cached_shadow.last_update_seconds,
+                    });
+                }
             }
         }
     }
@@ -736,7 +774,7 @@ fn animate_map_s03b_candle_lights(
         quality.max_cached_point_shadow_updates_per_frame,
     );
     for candidate in shadow_update_candidates {
-        let Ok((entity, mut light, mut transform, tuning, mut cached_shadow)) =
+        let Ok((entity, mut light, mut transform, tuning, mut cached_shadow, _)) =
             point_lights.get_mut(candidate.entity)
         else {
             continue;
@@ -1092,7 +1130,7 @@ mod tests {
     }
 
     #[test]
-    fn candle_animation_system_accepts_disjoint_transform_queries() {
+    fn continuous_shadow_proxy_keeps_real_light_stable_and_moves_virtual_origin() {
         let mut app = App::new();
         app.insert_resource(CurrentLevel(Some(LevelId::asset(MAP_S03B_ASSET_PATH))))
             .insert_resource(RenderQualityConfig::default())
@@ -1120,8 +1158,10 @@ mod tests {
                     base_range: 6.0,
                     flicker_phase: 0.75,
                     candle_animated: true,
+                    previous_shadow_motion_policy: None,
                 },
                 CachedPointLightShadow::default(),
+                PointLightShadowMapJitter::default(),
             ))
             .id();
         app.world_mut().spawn((
@@ -1136,8 +1176,62 @@ mod tests {
 
         app.update();
 
-        let transform = app.world().entity(point_light).get::<Transform>().unwrap();
+        let entity = app.world().entity(point_light);
+        let light = entity.get::<PointLight>().unwrap();
+        let transform = entity.get::<Transform>().unwrap();
+        let jitter = entity.get::<PointLightShadowMapJitter>().unwrap();
+        let cached_shadow = entity.get::<CachedPointLightShadow>().unwrap();
+        assert_eq!(transform.translation, base_translation);
+        assert_eq!(light.range, 6.0);
+        assert_ne!(jitter.local_offset, Vec3::ZERO);
+        assert!(cached_shadow.last_update_seconds.is_none());
+    }
+
+    #[test]
+    fn disabling_continuous_shadow_proxy_restores_real_cubemap_redraw_path() {
+        let mut app = App::new();
+        app.insert_resource(CurrentLevel(Some(LevelId::asset(MAP_S03B_ASSET_PATH))))
+            .insert_resource(RenderQualityConfig {
+                continuous_point_shadow_proxy: false,
+                max_cached_point_shadow_updates_per_frame: 1,
+                ..default()
+            })
+            .init_resource::<ZevyShadowCacheFrame>()
+            .init_resource::<Time>()
+            .init_resource::<Assets<StandardMaterial>>()
+            .add_systems(Update, animate_map_s03b_candle_lights);
+
+        let base_translation = Vec3::new(1.0, 2.0, 3.0);
+        let point_light = app
+            .world_mut()
+            .spawn((
+                PointLight::default(),
+                Transform::from_translation(base_translation),
+                MapS03BPointLightTuningApplied {
+                    previous_intensity: 1.0,
+                    previous_range: 1.0,
+                    previous_shadows_enabled: true,
+                    previous_translation: base_translation,
+                    base_intensity: 100.0,
+                    base_range: 6.0,
+                    flicker_phase: 0.75,
+                    candle_animated: true,
+                    previous_shadow_motion_policy: None,
+                },
+                CachedPointLightShadow::default(),
+                PointLightShadowMapJitter::default(),
+            ))
+            .id();
+
+        app.update();
+
+        let entity = app.world().entity(point_light);
+        let transform = entity.get::<Transform>().unwrap();
+        let jitter = entity.get::<PointLightShadowMapJitter>().unwrap();
+        let cached_shadow = entity.get::<CachedPointLightShadow>().unwrap();
         assert_ne!(transform.translation, base_translation);
+        assert_eq!(jitter.local_offset, Vec3::ZERO);
+        assert_eq!(cached_shadow.last_update_seconds, Some(0.0));
     }
 
     #[test]
@@ -1149,6 +1243,7 @@ mod tests {
             .init_resource::<Time>()
             .init_resource::<Assets<Mesh>>()
             .init_resource::<Assets<StandardMaterial>>()
+            .add_plugins(crate::shadow_motion_policy::ShadowMotionPolicyPlugin)
             .add_systems(
                 Update,
                 (
@@ -1212,5 +1307,6 @@ mod tests {
         assert!(!tuning.candle_animated);
         assert!(cached_shadow.last_update_seconds.is_none());
         assert!(!entity.contains::<MapS03BCandleVisualSpawned>());
+        assert!(!entity.contains::<PointLightShadowMapJitter>());
     }
 }

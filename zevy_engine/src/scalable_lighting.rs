@@ -167,6 +167,8 @@ mod tests {
         assert!(PBR_FUNCTIONS_TEMPLATE.contains("zevy_reservoir_seed"));
         assert!(PBR_FUNCTIONS_TEMPLATE.contains("zevy_reservoir_random_pair"));
         assert!(PBR_FUNCTIONS_TEMPLATE.contains("zevy_fetch_point_shadow_combined"));
+        assert!(PBR_FUNCTIONS_TEMPLATE.contains("zevy_point_shadow_map_jitter"));
+        assert!(PBR_FUNCTIONS_TEMPLATE.contains("POINT_LIGHT_FLAGS_SHADOW_MAP_JITTER_BIT"));
         assert!(PBR_FUNCTIONS_TEMPLATE.contains("static_visibility * dynamic_visibility"));
     }
 

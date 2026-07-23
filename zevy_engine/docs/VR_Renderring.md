@@ -89,7 +89,7 @@ OpenXR 1.1 的四视图配置由两个外围 view 和两个 foveated inset view 
 | MSAA | `msaa_samples = 2` | 是移动 VR 的合理起点，仍须实测带宽和边缘质量。 |
 | 灯光分簇 | Map_S03B 已从 `ClusterConfig::Single` 迁移到可配置 Clustered Forward，并叠加固定预算 Scalable Point Lighting 原型 | 当前每个 shading point 默认完整计算 2 个 Hero + 2 个 Tail；下一步应把候选 PDF 上移到双眼共享 tile/froxel。 |
 | 当前 Map_S03B 材质 | 当前目录有 39 个 glTF，均未声明 `KHR_materials_unlit`；静态模型包含 `pbrMetallicRoughness` | 当前测试已经覆盖可受 PointLight 影响的 StandardMaterial/PBR 接收路径，但仍需用 HUD 区分具体材质复杂度。 |
-| 阴影 | 当前 Map_S03B 的 16 盏 PointLight 已接入持久化静态 cubemap-array 与动态 caster overlay | 默认公平调度每帧最多更新 2 盏灯，即最多 12 面重绘/84 面复用；动态层只清除并重绘当前或上一帧受动态 caster 影响的 face。尚未完成真实 GPU 毫秒预算调度。 |
+| 阴影 | 当前 Map_S03B 有 18 盏 shadow-eligible PointLight，已接入持久化静态 cubemap-array、动态 caster overlay 与连续投影代理；RenderWorld 按 `ViewVisibility` 形成实际 resident 集合 | 默认代理消除蜡烛摇摆的静态 cubemap 重画；关闭代理后回到 8 Hz 公平调度 reference。动态层只清除并重绘当前或上一帧受动态 caster 影响的 face；current-view 集合 hysteresis 与真实 GPU 毫秒预算调度尚未完成。 |
 | 纹理 | 已有 mip chain、trilinear 和 anisotropic sampler | 方向正确；下一阶段是 ASTC/KTX2、分辨率分级和纹理带宽统计。 |
 | 调试 | HUD 已显示 triangles、draw 估算、fragment、pass 和材质信息 | 应继续加入每 cluster 灯数、阴影 texel 更新量、热状态和双眼实际 GPU 时间。 |
 
@@ -1368,13 +1368,60 @@ C_{tail\ shade}\approx C_{2T}-C_{1T}=1.46\text{ ms/sample}
 
 ### 20.3 P1：先消灭阴影阶梯，而不是增加 42 个 face/frame
 
-为蜡烛类小幅运动引入三档 `ShadowMotionMode`：
+为蜡烛类小幅运动引入三档投影策略：
 
-1. **`ContinuousProxy`（移动端默认候选）**：静态深度固定在 nominal light origin；强度、颜色、emissive 每帧变化，shadow shader 连续旋转/缩放 PCF kernel，并叠加低频 cookie 或小幅 lookup perturbation。视觉投影连续，但不使静态 cubemap 失效。
-2. **`KeyframedCrossFade`（质量档）**：保存前后两个低频阴影快照与各自 light transform，在两次真实更新之间采样 `V0`、`V1` 并连续混合。它用额外 atlas/一次 shadow compare 换取时间连续性，需评估双影和漏光。
-3. **`TrueMovingShadow`（Hero/参考档）**：真实移动 light projection 并按 GPU 预算重画，作为正确性参考和关键交互灯路径。
+1. **`ContinuousProxy`（已实现、移动端默认候选）**：静态深度固定在 nominal light origin；强度和 emissive 每帧变化，真实 PointLight transform/range 固定；shadow shader 使用不超过数毫米的虚拟 origin 连续重投影持久化 cubemap。视觉投影连续，但不使静态 cubemap 失效。
+2. **`KeyframedCrossFade`（仅设计、质量档）**：保存前后两个低频阴影快照与各自 light transform，在两次真实更新之间采样 `V0`、`V1` 并连续混合。它用额外 atlas/一次 shadow compare 换取时间连续性，需评估双影和漏光。
+3. **`TrueMovingShadow`（已保留参考路径）**：真实移动 light projection 并按频率/灯数预算重画，作为正确性参考和关键交互灯路径。
 
-动态 caster overlay 继续独立更新，不因静态火光代理而被冻结。P1 成功标准：16 盏蜡烛的静态层在稳定场景接近 `0 redraw / 96 reuse`，阴影仍有连续火光感，实机看不到约 400 ms 的台阶；Hero 真动态灯保持几何正确。
+动态 caster overlay 继续独立更新，不因静态火光代理而被冻结。当前 Map_S03B 为 16 盏 Movable 蜡烛 + 2 盏 Static 灯，因此静态层目标更新为稳定场景 `0 redraw / 108 reuse`；阴影仍需在实机确认具有连续火光感且没有漏光，Hero 真动态灯仍应保持几何正确。
+
+#### 20.3.1 第一版实现与 PC 证据（2026-07-22）
+
+第一版没有增加纹理、bind group、storage buffer 或 shadow sample：
+
+1. Zevy `bevy_pbr` fork 新增通用 `PointLightShadowMapJitter` 组件；Map_S03B 只给 16 个非 Static 灯创建，UE `mobility=static` 的两盏灯仍完全不动画。
+2. CPU 每灯每帧计算一次局部 5 mm 摇摆，并转换到世界空间。三个分量以 0.25 mm 精度量化为 signed 8-bit，复用 `ClusterableObject.flags` 的 bits 8～31；bit 4 表示代理存在，可表达每轴约 -32～+31.75 mm。
+3. 接收端从虚拟位置 \(p'_l=p_l+\delta_l(t)\) 计算 cubemap lookup direction 与 compare depth，但读取仍在 \(p_l\) 生成的静态深度。距离 \(d\) 处的一阶角误差为 \(\epsilon_\theta\approx\lVert\delta_l\rVert/d\)；5 mm、1.5 m 时约 0.19°。
+4. 该路径不在 shader 内计算三角函数；GPU 每次既有 shadow lookup 只增加 flag decode 与向量加法。灯光强度和火焰 emissive 继续逐帧变化，real transform/range 不再使静态缓存失效。
+5. `RenderQualityConfig.continuous_point_shadow_proxy=true` 为当前默认候选，`point_shadow_proxy_sway_scale` 控制幅度；设为 `false` 即恢复原 `cached_point_shadow_update_hz` + `max_cached_point_shadow_updates_per_frame` 真实重画路径。Android A/B 属性为 `debug.zevy.shadow_proxy` 与 `debug.zevy.shadow_proxy_scale`。
+
+[PC 运行验证] `cargo run -- --level=levels/Map_S03B/Map_S03B.zevy-level.json` 成功完成 Naga/wgpu shader 编译和截图；18 个 shadow-enabled PointLight 常驻，warmup 后 HUD 为 `Resident/Draw/Reuse = 108/0/108`，证明蜡烛摇摆不再重画任何静态 face。静态截图未观察到新的规则斑块，但不能证明动态投影自然。
+
+[Android/VR 静态 A/B] 用户授权后旧包卸载、新 APK 安装与 PICO OpenXR/Vulkan 启动成功。相同构图下 proxy 两次 Frame P50/P95/P99 为 `33.3/36.4/37.7` 与 `33.5/37.0/39.9 ms`；real-redraw 两次为 `39.1/47.5/49.9` 与 `40.6/48.0/49.5 ms`。proxy 均值相对 reference 均值降低约 6.5 ms P50（16%）、11.1 ms P95（23%）和 10.9 ms P99（22%）。第二组 actual resident 同为 60 faces，而 cache 为 `60/0/60` 对 `60/30/30`；triangles、primitives 与 fragment 基本一致，因此收益方向可归因于消除蜡烛摇摆导致的静态 cubemap redraw，而不是隐藏灯光或降低主画面负载。
+
+[遥测边界] Map_S03B 的 18/18 是主世界、与相机无关的 shadow eligibility；Android 当前构图中 Bevy RenderWorld 经 `GlobalVisibleClusterableObjects` / `ViewVisibility` 实际抽取 10 灯、60 faces。后者才是 HUD cache resident，不能把 18 灯/108 eligible faces 写成每帧全部 resident，也不能在没有设备 limit 证据时归因于 64-layer 上限。current-view 集合仍需 hysteresis/prewarm 实验，避免视锥边界变化触发整组 cache layout 重建。
+
+[最终包确认] 仅含遥测措辞修正的 14:48:06 APK 已覆盖安装并冷启动；日志确认 PICO OpenXR/Vulkan、Map_S03B、18/18 eligibility、RenderWorld visibility extraction 边界和 `proxy on at 1.00x` 正常，无 panic。
+
+[Android/VR 用户验证，1.0×] 佩戴转头/移动确认阴影连续跳动，无明显运动台阶、漏光或阴影漂浮，左右眼一致；但感知跳动幅度小于旧真实重画路径。当前设备已把 `debug.zevy.shadow_proxy_scale` 单变量提高到 `2.0`，约等于 10 mm 虚拟位移；1.5 m 接收距离的一阶角误差约 0.38°。该实验不改变真实灯位、物理 range、静态 redraw 或双眼共享状态，等待用户同时裁决幅度与误差回归。
+
+[通用化边界] Map_S03B 只负责构造 bounded micro-motion 反例与性能基准；`2.0×` 是误差曲线采样，不是全局 renderer 默认候选。虚拟原点复用 nominal cubemap 不能正确处理自由飞行灯产生的大视差与 disocclusion。产品路径必须把 Map 专属 candle wiring 下沉为通用 `ShadowMotionPolicy`，按 Static、BoundedMicroMotion、SlowMoving/Keyframed、FullyDynamic/Hero 分类，并由位移/角误差、priority 与 stale time 自动选择代理、关键帧重建、稀疏更新或真实每帧阴影。至少在第二个独立合成场景覆盖慢移和快速飞行灯后，才算 renderer feature。
+
+[尚未验证] 2.0× 幅度的佩戴结果、固定路径 AGI capture 与 20～30 分钟 thermal soak 尚未执行。完整公式、量化布局与 kill criterion 见 [`Continuous_Point_Shadow_Proxy.md`](../../Docs/Design/Continuous_Point_Shadow_Proxy.md)。
+
+#### 20.3.2 已实现：通用 Motion Policy P1（2026-07-23）
+
+第一版通用策略已把“蜡烛用代理、飞行灯真实更新、运动物体走 overlay”的选择从 Map 脚本下沉到主世界 ECS 状态机。公开 API 为 `LightShadowMotionPolicy`、`ShadowCasterMotionPolicy`、对应的自动阈值、固定模式和只读 resolved telemetry；策略在 `GlobalTransform` 传播后、shadow-cache 最终分类前运行一次，因此左右眼共享同一个类别和历史，不读取相机距离或 eye 状态。
+
+灯光路径为：
+
+- `Static`：持久静态 cache，无虚拟偏移；
+- `BoundedMicroMotion`：持久 cache + `PointLightShadowMapJitter`；
+- `SlowMoving`：cache-on-dirty，真实 transform/range 改变会重画；
+- `FullyDynamic`：退出持久 cache，保留真实 moving-light redraw。
+
+自动灯每帧以 (O(L)) 测量世界线速度和 range 变化率的指数平滑值。向更动态类别立即升级；降级必须让同一低成本候选连续满足 `settle_seconds`，防止阈值附近抖动。导入灯以低成本静态假设启动，实际发生运动后立即升级；运行时未知灯 correctness-first 地从全动态启动。真实 Transform 的小幅位移不会被偷偷解释为旧 cubemap 的虚拟偏移，微动类别必须有明确的 jitter motion signal。
+
+Caster 路径为 `Static` 或 `DynamicOverlay`。自动模式测量 root 的世界平移、旋转与缩放；任一变化越过 epsilon 即进入 overlay，稳定达到迟滞后才回静态层。root marker 通过现有父层级覆盖后代 mesh。迁移导致静态 caster 数变化时会使静态 cache 失效；dynamic overlay 同时重画当前与上一组受影响 face，因此旧静态影和离开后的动态“幽灵影”都有明确清理路径。没有 policy 的旧 `DynamicShadowCaster` API 仍兼容。
+
+通用接入已经覆盖：UE 导入 actor root 默认 Automatic；UE `mobility=static` 的 PointLight 固定 Static，其余导入 PointLight 默认 Automatic；PerformanceLab 的运动 cube/灯使用 Automatic；Map_S03B 只作为测试 harness，16 盏蜡烛明确固定为 BoundedMicroMotion、2 盏 UE Static 灯固定 Static、两盏飞行灯和两颗飞行球使用 Automatic。HUD 新增 `Motion L S/M/K/F` 与 `C S/D`，不依赖 Map 名。
+
+[PC 实现验证] `cargo test --lib` 为 58/58；覆盖手动四类路由、自动升级/迟滞降级、caster 静态/overlay 迁移、导入实体初始状态、运行时手动切换和 policy 删除清理。Map_S03B 启动、Naga/wgpu 编译及 8 秒截图通过，无 panic/shader error；HUD 实测 `L S/M/K/F = 2/16/0/2`、`C S/D = 43/2`，与 18 个导入灯、2 个轨道灯和 2 个运动球相符。该截图只证明某一帧的分类与画面完整，不能证明 VR 双眼、长时间迁移或性能收益。
+
+[Android 构建] `cargo check --target aarch64-linux-android` 与 release/render-debug APK 构建、4K 对齐、签名均通过。设备在线，但 ADB incremental install 在读取 APK 时返回 `Bad file descriptor`，因此本版尚未安装、冷启动或完成 Android/VR 视觉验证。
+
+[P1 边界] `SlowMoving` 目前只是 cache-on-dirty；连续慢移仍可能频繁重画，并不等于双快照无阶梯重建。尚未实现 KeyframedCrossFade、priority/stale-time/GPU-ms 调度、局部 face/page invalidation、UE 可编辑 policy schema，以及第二独立场景的 16→32→64 斜率实验。完整状态、公式与 kill criterion 见 [`Shadow_Motion_Policies.md`](../../Docs/Design/Shadow_Motion_Policies.md)。
 
 ### 20.4 P2：把每片元 \(O(N)\) 选灯搬到双眼共享 tile
 

@@ -176,6 +176,11 @@ impl ZevyShadowCacheFrame {
 
 pub(crate) struct ShadowCachePlugin;
 
+#[derive(SystemSet, Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum ShadowCacheSet {
+    Finalize,
+}
+
 impl Plugin for ShadowCachePlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<ZevyShadowCacheFrame>()
@@ -183,7 +188,9 @@ impl Plugin for ShadowCachePlugin {
             .add_systems(PreUpdate, begin_shadow_cache_frame)
             .add_systems(
                 PostUpdate,
-                finalize_shadow_cache_frame.after(TransformSystem::TransformPropagate),
+                finalize_shadow_cache_frame
+                    .after(TransformSystem::TransformPropagate)
+                    .in_set(ShadowCacheSet::Finalize),
             );
 
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {

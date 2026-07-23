@@ -64,6 +64,9 @@ pub struct ExtractedPointLight {
     pub spot_light_angles: Option<(f32, f32)>,
     pub volumetric: bool,
     pub soft_shadows_enabled: bool,
+    /// Small world-space virtual translation used only by Zevy's cached
+    /// point-shadow sampling path. It never changes the shadow render views.
+    pub shadow_map_jitter: Vec3,
     /// whether this point light contributes diffuse light to lightmapped meshes
     pub affects_lightmapped_mesh_diffuse: bool,
 }
@@ -97,8 +100,37 @@ bitflags::bitflags! {
         const SPOT_LIGHT_Y_NEGATIVE             = 1 << 1;
         const VOLUMETRIC                        = 1 << 2;
         const AFFECTS_LIGHTMAPPED_MESH_DIFFUSE  = 1 << 3;
+        const SHADOW_MAP_JITTER                 = 1 << 4;
         const NONE                              = 0;
         const UNINITIALIZED                     = 0xFFFF;
+    }
+}
+
+// Zevy packs a small world-space shadow lookup offset into otherwise unused
+// PointLight flag bits. Three signed bytes at 0.25 mm precision cover
+// [-32.0, 31.75] mm per axis without increasing ClusterableObject's 80-byte
+// GPU ABI or adding another binding.
+const SHADOW_MAP_JITTER_QUANTIZATION_METERS: f32 = 0.000_25;
+const SHADOW_MAP_JITTER_COMPONENT_MASK: u32 = 0xff;
+
+fn quantize_shadow_map_jitter_component(value: f32) -> u32 {
+    if !value.is_finite() {
+        return 0;
+    }
+    let quantized = (value / SHADOW_MAP_JITTER_QUANTIZATION_METERS)
+        .round()
+        .clamp(i8::MIN as f32, i8::MAX as f32) as i32;
+    (quantized as u32) & SHADOW_MAP_JITTER_COMPONENT_MASK
+}
+
+fn pack_shadow_map_jitter_flags(offset: Vec3) -> u32 {
+    let packed = (quantize_shadow_map_jitter_component(offset.x) << 8)
+        | (quantize_shadow_map_jitter_component(offset.y) << 16)
+        | (quantize_shadow_map_jitter_component(offset.z) << 24);
+    if packed == 0 {
+        0
+    } else {
+        PointLightFlags::SHADOW_MAP_JITTER.bits() | packed
     }
 }
 
@@ -241,6 +273,7 @@ pub fn extract_lights(
             &ViewVisibility,
             &CubemapFrusta,
             Option<&VolumetricLight>,
+            Option<&PointLightShadowMapJitter>,
         )>,
     >,
     spot_lights: Extract<
@@ -322,6 +355,7 @@ pub fn extract_lights(
             view_visibility,
             frusta,
             volumetric_light,
+            shadow_map_jitter,
         )) = point_lights.get(entity)
         else {
             continue;
@@ -356,6 +390,9 @@ pub fn extract_lights(
             shadow_map_near_z: point_light.shadow_map_near_z,
             spot_light_angles: None,
             volumetric: volumetric_light.is_some(),
+            shadow_map_jitter: shadow_map_jitter.map_or(Vec3::ZERO, |jitter| {
+                transform.affine().transform_vector3(jitter.local_offset)
+            }),
             affects_lightmapped_mesh_diffuse: point_light.affects_lightmapped_mesh_diffuse,
             #[cfg(feature = "experimental_pbr_pcss")]
             soft_shadows_enabled: point_light.soft_shadows_enabled,
@@ -421,6 +458,7 @@ pub fn extract_lights(
                         shadow_map_near_z: spot_light.shadow_map_near_z,
                         spot_light_angles: Some((spot_light.inner_angle, spot_light.outer_angle)),
                         volumetric: volumetric_light.is_some(),
+                        shadow_map_jitter: Vec3::ZERO,
                         affects_lightmapped_mesh_diffuse: spot_light
                             .affects_lightmapped_mesh_diffuse,
                         #[cfg(feature = "experimental_pbr_pcss")]
@@ -983,6 +1021,12 @@ pub fn prepare_lights(
             }
         };
 
+        let shadow_map_jitter_flags = if light.spot_light_angles.is_none() {
+            pack_shadow_map_jitter_flags(light.shadow_map_jitter)
+        } else {
+            0
+        };
+
         gpu_point_lights.push(GpuClusterableObject {
             light_custom_data,
             // premultiply color by intensity
@@ -992,7 +1036,7 @@ pub fn prepare_lights(
                 .xyz()
                 .extend(1.0 / (light.range * light.range)),
             position_radius: light.transform.translation().extend(light.radius),
-            flags: flags.bits(),
+            flags: flags.bits() | shadow_map_jitter_flags,
             shadow_depth_bias: light.shadow_depth_bias,
             shadow_normal_bias: light.shadow_normal_bias,
             shadow_map_near_z: light.shadow_map_near_z,

@@ -8,6 +8,7 @@ mod render_debug;
 mod scalable_lighting;
 mod scene;
 mod shadow_cache;
+mod shadow_motion_policy;
 mod shadow_overlay;
 mod xr;
 
@@ -18,6 +19,12 @@ pub use scene::{
     ZevyLevelAsset, ZevyLevelAssetLoader, ZevyLevelEntityDefinition, ZevyLevelPlugin,
     ZevyLevelSceneAsset, ZevyLevelTransform, ZevyLightDefinition, ZevyLightKind,
     ZevyUnrealLightParameters, spawn_zevy_level,
+};
+pub use shadow_motion_policy::{
+    LightShadowAutomaticThresholds, LightShadowMotionClass, LightShadowMotionMode,
+    LightShadowMotionPolicy, ResolvedLightShadowMotion, ResolvedShadowCasterMotion,
+    ShadowCasterAutomaticThresholds, ShadowCasterMotionClass, ShadowCasterMotionMode,
+    ShadowCasterMotionPolicy, ShadowMotionPolicyTelemetry,
 };
 pub use shadow_overlay::DynamicShadowCaster;
 

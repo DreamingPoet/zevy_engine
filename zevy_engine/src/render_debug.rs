@@ -34,6 +34,7 @@ use crate::{
     input::{XrDebugHudPageAction, XrDebugHudToggleAction},
     scene::{ImportedZevyEntity, MirrorCamera},
     shadow_cache::{ZevyShadowCacheFrame, is_dynamic_shadow_caster},
+    shadow_motion_policy::ShadowMotionPolicyTelemetry,
     shadow_overlay::DynamicShadowCaster,
 };
 
@@ -227,6 +228,19 @@ pub(crate) fn apply_android_render_quality_overrides(config: &mut RenderQualityC
         .and_then(parse_debug_bool)
     {
         config.dynamic_shadow_caster_overlay = value;
+    }
+    if let Some(value) = android_system_property("debug.zevy.shadow_proxy")
+        .as_deref()
+        .and_then(parse_debug_bool)
+    {
+        config.continuous_point_shadow_proxy = value;
+    }
+    if let Some(value) = android_system_property("debug.zevy.shadow_proxy_scale")
+        .as_deref()
+        .and_then(|value| value.trim().parse::<f32>().ok())
+        .filter(|value| value.is_finite())
+    {
+        config.point_shadow_proxy_sway_scale = value;
     }
     if let Some(value) = android_system_property("debug.zevy.shadow_updates")
         .as_deref()
@@ -523,6 +537,7 @@ fn update_debug_snapshot(
     quality: Res<RenderQualityConfig>,
     cluster_preselection: Res<ClusterLightPreselectionStats>,
     shadow_cache_frame: Res<ZevyShadowCacheFrame>,
+    motion_policy: Res<ShadowMotionPolicyTelemetry>,
     xr_session_config: Option<Res<OxrCurrentSessionConfig>>,
     camera_views: Query<(&Camera, &Msaa, Option<&XrCamera>), With<Camera3d>>,
     scene_data: RenderDebugSceneData,
@@ -714,6 +729,16 @@ fn update_debug_snapshot(
         if dynamic_overlay_enabled { "ON" } else { "OFF" },
         shadow_cache.dynamic_casters,
         shadow_cache.dynamic_views_rendered,
+    );
+    let _ = writeln!(
+        overview,
+        "Motion L S/M/K/F  {:>2}/{:>2}/{:>2}/{:>2} C S/D {:>2}/{:>2}",
+        motion_policy.light_static,
+        motion_policy.light_micro_motion,
+        motion_policy.light_slow_moving,
+        motion_policy.light_fully_dynamic,
+        motion_policy.caster_static,
+        motion_policy.caster_dynamic_overlay,
     );
     let _ = writeln!(
         overview,
@@ -1234,10 +1259,33 @@ fn update_debug_snapshot(
     );
     let _ = writeln!(
         material_page,
-        "Cached projection schedule  {:.1} Hz, <= {} light/frame (fair)",
-        quality.resolved_cached_point_shadow_update_hz(),
-        quality.max_cached_point_shadow_updates_per_frame,
+        "Light policy S/M/K/F        {} / {} / {} / {}",
+        motion_policy.light_static,
+        motion_policy.light_micro_motion,
+        motion_policy.light_slow_moving,
+        motion_policy.light_fully_dynamic,
     );
+    let _ = writeln!(
+        material_page,
+        "Caster policy static/dyn    {} / {} ({} transitions)",
+        motion_policy.caster_static,
+        motion_policy.caster_dynamic_overlay,
+        motion_policy.transitions_this_frame,
+    );
+    if quality.continuous_point_shadow_proxy_enabled() {
+        let _ = writeln!(
+            material_page,
+            "Projection animation       continuous proxy x{:.2} (no sway redraw)",
+            quality.resolved_point_shadow_proxy_sway_scale(),
+        );
+    } else {
+        let _ = writeln!(
+            material_page,
+            "Projection animation       real redraw {:.1} Hz, <= {} light/frame",
+            quality.resolved_cached_point_shadow_update_hz(),
+            quality.max_cached_point_shadow_updates_per_frame,
+        );
+    }
     let _ = writeln!(
         material_page,
         "Cluster grid budget         {} / {} z-slices",

@@ -21,6 +21,9 @@ const POINT_LIGHT_FLAGS_SHADOWS_ENABLED_BIT: u32                    = 1u;
 const POINT_LIGHT_FLAGS_SPOT_LIGHT_Y_NEGATIVE: u32                  = 2u;
 const POINT_LIGHT_FLAGS_VOLUMETRIC_BIT: u32                         = 4u;
 const POINT_LIGHT_FLAGS_AFFECTS_LIGHTMAPPED_MESH_DIFFUSE_BIT: u32   = 8u;
+// Zevy: bits 8..31 contain three signed 8-bit shadow-map jitter
+// components when this bit is set. Stock Bevy shader paths ignore them.
+const POINT_LIGHT_FLAGS_SHADOW_MAP_JITTER_BIT: u32                  = 16u;
 
 struct DirectionalCascade {
     clip_from_world: mat4x4<f32>,

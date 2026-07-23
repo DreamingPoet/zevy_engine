@@ -8,7 +8,7 @@ use crate::{
     app::LaunchMode,
     input::{EngineInputState, InputAxis2},
     scene::{LevelEntity, MirrorCamera, desktop_player::DesktopLevelPlayer},
-    shadow_overlay::DynamicShadowCaster,
+    shadow_motion_policy::ShadowCasterMotionPolicy,
 };
 
 use super::{CurrentLevel, LevelId};
@@ -211,7 +211,7 @@ pub(super) fn spawn_performance_lab(
         ));
         if name == "PerfCube" {
             entity.insert((
-                DynamicShadowCaster,
+                ShadowCasterMotionPolicy::automatic(),
                 MovingShadowTestCaster {
                     base_translation: transform.translation,
                 },
@@ -282,7 +282,7 @@ pub(super) fn spawn_performance_lab(
         };
         let casts_shadow = matches!(index, 0 | 4);
 
-        commands.spawn((
+        let mut light_entity = commands.spawn((
             Name::new(format!("OrbitLight{index}")),
             LevelEntity,
             PointLight {
@@ -296,6 +296,9 @@ pub(super) fn spawn_performance_lab(
             orbit,
             Transform::from_translation(position),
         ));
+        if casts_shadow {
+            light_entity.insert(crate::shadow_motion_policy::LightShadowMotionPolicy::automatic());
+        }
 
         commands.spawn((
             Name::new(format!("OrbitLightMarker{index}")),

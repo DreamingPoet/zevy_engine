@@ -30,6 +30,7 @@ use crate::{
     scalable_lighting::ScalableLightingPlugin,
     scene::{CurrentLevel, ImportedLevelCameraFramed, LevelId, ScenePlugin},
     shadow_cache::ShadowCachePlugin,
+    shadow_motion_policy::ShadowMotionPolicyPlugin,
     shadow_overlay::DynamicShadowOverlayPlugin,
     xr,
 };
@@ -143,6 +144,7 @@ pub fn run() {
         .add_plugins(ScalableLightingPlugin)
         .add_plugins(ClusteredLightPreselectionPlugin)
         .add_plugins(DynamicShadowOverlayPlugin)
+        .add_plugins(ShadowMotionPolicyPlugin)
         .add_plugins(ShadowCachePlugin)
         .add_plugins(EngineInputPlugin)
         .add_plugins(ScenePlugin);

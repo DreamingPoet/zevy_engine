@@ -74,7 +74,10 @@ pub mod prelude {
     #[doc(hidden)]
     pub use crate::{
         fog::{DistanceFog, FogFalloff},
-        light::{light_consts, AmbientLight, DirectionalLight, PointLight, SpotLight},
+        light::{
+            light_consts, AmbientLight, DirectionalLight, PointLight, PointLightShadowMapJitter,
+            SpotLight,
+        },
         light_probe::{environment_map::EnvironmentMapLight, LightProbe},
         material::{Material, MaterialPlugin},
         mesh_material::MeshMaterial3d,
@@ -336,6 +339,7 @@ impl Plugin for PbrPlugin {
             .register_type::<NotShadowCaster>()
             .register_type::<NotShadowReceiver>()
             .register_type::<PointLight>()
+            .register_type::<PointLightShadowMapJitter>()
             .register_type::<PointLightShadowMap>()
             .register_type::<SpotLight>()
             .register_type::<ShadowFilteringMethod>()

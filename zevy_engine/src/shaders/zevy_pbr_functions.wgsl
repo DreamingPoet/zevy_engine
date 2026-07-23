@@ -131,6 +131,25 @@ fn zevy_point_light_has_shadow(light_id: u32) -> bool {
         mesh_view_types::POINT_LIGHT_FLAGS_SHADOWS_ENABLED_BIT) != 0u;
 }
 
+// The CPU quantizes each world-space component at 0.25 mm and stores the
+// signed bytes in flags[8..32). This keeps the proxy eye-independent and avoids
+// per-fragment trigonometry or another storage-buffer fetch.
+fn zevy_decode_shadow_map_jitter_component(encoded: u32) -> f32 {
+    let signed_value = select(i32(encoded), i32(encoded) - 256, encoded >= 128u);
+    return f32(signed_value) * 0.00025;
+}
+
+fn zevy_point_shadow_map_jitter(flags: u32) -> vec3<f32> {
+    if ((flags & mesh_view_types::POINT_LIGHT_FLAGS_SHADOW_MAP_JITTER_BIT) == 0u) {
+        return vec3<f32>(0.0);
+    }
+    return vec3<f32>(
+        zevy_decode_shadow_map_jitter_component((flags >> 8u) & 0xffu),
+        zevy_decode_shadow_map_jitter_component((flags >> 16u) & 0xffu),
+        zevy_decode_shadow_map_jitter_component((flags >> 24u) & 0xffu),
+    );
+}
+
 // Matches Bevy's point-shadow projection but allows the light data index and
 // cubemap-array index to differ. Zevy stores static cubes in the first half of
 // the array and dynamic-caster cubes in the second half.
@@ -141,7 +160,12 @@ fn zevy_fetch_point_shadow_cube(
     world_normal: vec3<f32>,
 ) -> f32 {
     let light = &view_bindings::clusterable_objects.data[light_id];
-    let surface_to_light = (*light).position_radius.xyz - world_position.xyz;
+    // The cubemap remains rendered at position_radius.xyz. For sub-centimeter
+    // candle motion, sample it from a continuously moving virtual origin. The
+    // bounded reprojection error replaces six real depth redraws per update.
+    let shadow_sample_origin = (*light).position_radius.xyz +
+        zevy_point_shadow_map_jitter((*light).flags);
+    let surface_to_light = shadow_sample_origin - world_position.xyz;
     let surface_to_light_abs = abs(surface_to_light);
     let distance_to_light = max(
         surface_to_light_abs.x,
@@ -150,7 +174,7 @@ fn zevy_fetch_point_shadow_cube(
     let normal_offset = (*light).shadow_normal_bias * distance_to_light * world_normal;
     let depth_offset = (*light).shadow_depth_bias * normalize(surface_to_light);
     let offset_position = world_position.xyz + normal_offset + depth_offset;
-    let frag_ls = offset_position - (*light).position_radius.xyz;
+    let frag_ls = offset_position - shadow_sample_origin;
     let abs_position_ls = abs(frag_ls);
     let major_axis_magnitude = max(
         abs_position_ls.x,

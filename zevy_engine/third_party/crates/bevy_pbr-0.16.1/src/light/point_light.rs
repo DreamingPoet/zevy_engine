@@ -1,6 +1,27 @@
 use bevy_render::view::{self, Visibility};
+use bevy_math::Vec3;
 
 use super::*;
+
+/// A small virtual translation applied only when sampling this point light's
+/// cached shadow map.
+///
+/// The shadow depth itself remains rendered from the point light's real
+/// transform. This component is intended for sub-centimeter, perceptual motion
+/// such as candle flicker, where redrawing six cubemap faces every frame would
+/// be substantially more expensive than accepting a tightly bounded
+/// reprojection error. `local_offset` is transformed to world space using the
+/// light's [`GlobalTransform`] before it is quantized for the GPU.
+///
+/// Stock Bevy shaders ignore this component. Zevy's scalable PBR path decodes
+/// it from otherwise-unused point-light flag bits without adding a bind group.
+#[derive(Component, Debug, Clone, Copy, Default, Reflect)]
+#[reflect(Component, Default, Debug, Clone)]
+pub struct PointLightShadowMapJitter {
+    /// Virtual shadow-sampling translation in the PointLight's local space.
+    /// Keep this much smaller than the distance to nearby casters/receivers.
+    pub local_offset: Vec3,
+}
 
 /// A light that emits light in all directions from a central point.
 ///

@@ -8,8 +8,8 @@ use bevy::{
     pbr::{
         DrawPrepass, ExtractedPointLight, GlobalClusterableObjectMeta, LightEntity,
         RenderCubemapVisibleEntities, Shadow, ShadowBatchSetKey, ShadowBinKey, ShadowView,
-        SpecializedShadowMaterialPipelineCache, ViewShadowBindings, prepare_lights, queue_shadows,
-        specialize_shadows,
+        SpecializedShadowMaterialPipelineCache, ViewLightEntities, ViewShadowBindings,
+        prepare_lights, queue_shadows, specialize_shadows,
     },
     prelude::*,
     render::{
@@ -69,7 +69,7 @@ pub(crate) struct DynamicShadowOverlayState {
     pub(crate) render_view_entities: HashSet<Entity>,
     pub(crate) dynamic_view_by_static: HashMap<Entity, Entity>,
     pub(crate) enabled: bool,
-    last_logged_counts: Option<(usize, usize)>,
+    last_logged_counts: Option<(usize, usize, usize, usize)>,
 }
 
 pub(crate) struct DynamicShadowOverlayPlugin;
@@ -115,6 +115,8 @@ fn prepare_dynamic_point_shadow_overlay(
     light_main_entities: Query<&MainEntity>,
     mut view_shadow_bindings: Query<&mut ViewShadowBindings>,
     mut static_shadow_views: Query<(Entity, &mut ShadowView, &ExtractedView, &LightEntity)>,
+    mut main_view_lights: Query<&mut ViewLightEntities>,
+    mut shadow_render_phases: ResMut<ViewBinnedRenderPhases<Shadow>>,
     mut state: ResMut<DynamicShadowOverlayState>,
 ) {
     state.render_view_entities.clear();
@@ -321,6 +323,14 @@ fn prepare_dynamic_point_shadow_overlay(
             color_grading: record.color_grading,
         };
 
+        // Create/reset the phase while views are managed, matching Bevy's
+        // native shadow-view lifecycle. Creating it later in QueueMeshes can
+        // miss phase preparation that assigns valid instance buffer ranges.
+        shadow_render_phases.prepare_for_new_frame(
+            retained_view_entity,
+            GpuPreprocessingMode::PreprocessingOnly,
+        );
+
         let dynamic_view_entity = if let Some(&entity) = state.dynamic_views.get(&record.key) {
             commands
                 .entity(entity)
@@ -337,6 +347,31 @@ fn prepare_dynamic_point_shadow_overlay(
         state
             .dynamic_view_by_static
             .insert(record.static_view_entity, dynamic_view_entity);
+    }
+
+    // Bevy's EarlyGpuPreprocessNode only dispatches mesh preprocessing for the
+    // main camera and the shadow views registered in ViewLightEntities. The
+    // synthetic overlay views own separate Shadow phases, so they must join
+    // that list or their instance-output ranges remain unwritten even though
+    // the later draw calls still submit primitives.
+    for mut view_lights in &mut main_view_lights {
+        register_dynamic_preprocess_views(&mut view_lights, &state.dynamic_view_by_static);
+    }
+}
+
+fn register_dynamic_preprocess_views(
+    view_lights: &mut ViewLightEntities,
+    dynamic_view_by_static: &HashMap<Entity, Entity>,
+) {
+    let dynamic_views = view_lights
+        .lights
+        .iter()
+        .filter_map(|static_view| dynamic_view_by_static.get(static_view).copied())
+        .collect::<Vec<_>>();
+    for dynamic_view in dynamic_views {
+        if !view_lights.lights.contains(&dynamic_view) {
+            view_lights.lights.push(dynamic_view);
+        }
     }
 }
 
@@ -419,13 +454,11 @@ fn queue_dynamic_shadow_overlay(
         .id::<DrawPrepass<StandardMaterial>>();
     let mut current_active_keys = HashSet::new();
     let mut dynamic_entity_by_key = HashMap::new();
+    let mut visible_caster_references = 0;
+    let mut queued_caster_draws = 0;
 
     for (dynamic_view_entity, dynamic_view, extracted_view) in &dynamic_views {
         dynamic_entity_by_key.insert(dynamic_view.key, dynamic_view_entity);
-        shadow_render_phases.prepare_for_new_frame(
-            extracted_view.retained_view_entity,
-            GpuPreprocessingMode::PreprocessingOnly,
-        );
         let Some(shadow_phase) = shadow_render_phases.get_mut(&extracted_view.retained_view_entity)
         else {
             continue;
@@ -439,6 +472,7 @@ fn queue_dynamic_shadow_overlay(
             .copied()
             .filter(|(_, main_entity)| dynamic_casters.contains(main_entity))
             .collect::<Vec<_>>();
+        visible_caster_references += visible_dynamic_entities.len();
         if !visible_dynamic_entities.is_empty() {
             current_active_keys.insert(dynamic_view.key);
         }
@@ -480,6 +514,7 @@ fn queue_dynamic_shadow_overlay(
                 ),
                 *current_change_tick,
             );
+            queued_caster_draws += 1;
         }
     }
 
@@ -500,11 +535,13 @@ fn queue_dynamic_shadow_overlay(
     let counts = (
         frame.dynamic_shadow_casters().len(),
         state.render_view_entities.len(),
+        visible_caster_references,
+        queued_caster_draws,
     );
     if state.last_logged_counts != Some(counts) {
         debug!(
-            "Dynamic point-shadow overlay: {} casters, {} cubemap faces redrawn this frame",
-            counts.0, counts.1,
+            "Dynamic point-shadow overlay: {} casters, {} cubemap faces redrawn, {} visible caster-face references, {} queued caster draws",
+            counts.0, counts.1, counts.2, counts.3,
         );
         state.last_logged_counts = Some(counts);
     }
@@ -552,9 +589,14 @@ fn set_dynamic_shadow_caster_flags(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
 
-    use super::{overlay_keys_to_render, point_shadow_cube_capacity};
+    use bevy::pbr::ViewLightEntities;
+    use bevy::prelude::Entity;
+
+    use super::{
+        overlay_keys_to_render, point_shadow_cube_capacity, register_dynamic_preprocess_views,
+    };
 
     #[test]
     fn dual_atlas_uses_matching_static_and_dynamic_cube_indices() {
@@ -589,5 +631,26 @@ mod tests {
         let render =
             overlay_keys_to_render(&HashSet::<u32>::new(), &HashSet::new(), true, [0, 1, 2, 3]);
         assert_eq!(render, HashSet::from([0, 1, 2, 3]));
+    }
+
+    #[test]
+    fn dynamic_shadow_views_join_gpu_preprocessing_once() {
+        let static_a = Entity::from_raw(1);
+        let static_b = Entity::from_raw(2);
+        let unrelated = Entity::from_raw(3);
+        let dynamic_a = Entity::from_raw(11);
+        let dynamic_b = Entity::from_raw(12);
+        let mapping = HashMap::from([(static_a, dynamic_a), (static_b, dynamic_b)]);
+        let mut view_lights = ViewLightEntities {
+            lights: vec![static_a, unrelated, static_b],
+        };
+
+        register_dynamic_preprocess_views(&mut view_lights, &mapping);
+        register_dynamic_preprocess_views(&mut view_lights, &mapping);
+
+        assert_eq!(
+            view_lights.lights,
+            vec![static_a, unrelated, static_b, dynamic_a, dynamic_b]
+        );
     }
 }

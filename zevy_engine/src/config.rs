@@ -79,6 +79,14 @@ pub struct RenderQualityConfig {
     /// Splits the PointLight cube-array into cached static depth and a separate
     /// dynamic-caster overlay. The PBR shader combines both visibility terms.
     pub dynamic_shadow_caster_overlay: bool,
+    /// Keeps candle PointLight transforms and ranges fixed while applying a
+    /// sub-centimeter virtual offset only during cached cubemap lookup. This
+    /// makes projection motion continuous without invalidating six static
+    /// shadow faces per light. Disable for the real-redraw A/B reference path.
+    pub continuous_point_shadow_proxy: bool,
+    /// Multiplier for the Map_S03B candle proxy's authored 5 mm sway. This is
+    /// clamped so the virtual origin remains inside the packed GPU range.
+    pub point_shadow_proxy_sway_scale: f32,
     /// Number of full redraw frames used when an atlas layout first appears,
     /// allowing asynchronously-created shadow pipelines and meshes to settle.
     pub point_shadow_cache_warmup_frames: u8,
@@ -107,13 +115,15 @@ impl Default for RenderQualityConfig {
             scalable_point_lighting: true,
             clustered_light_preselection: false,
             world_space_light_reservoir: true,
-            point_light_exact_threshold: 8,
+            point_light_exact_threshold: 18,
             point_light_hero_samples: 2,
             point_light_tail_samples: 2,
             temporal_point_light_sampling: false,
             light_sample_period_frames: 4,
             persistent_point_shadow_cache: true,
             dynamic_shadow_caster_overlay: true,
+            continuous_point_shadow_proxy: true,
+            point_shadow_proxy_sway_scale: 1.0,
             point_shadow_cache_warmup_frames: 3,
             cached_point_shadow_update_hz: 8.0,
             max_cached_point_shadow_updates_per_frame: 8,
@@ -229,6 +239,21 @@ impl RenderQualityConfig {
         self.point_shadow_cache_warmup_frames.clamp(1, 30)
     }
 
+    pub(crate) fn continuous_point_shadow_proxy_enabled(self) -> bool {
+        self.point_light_shadows
+            && self.scalable_point_lighting
+            && self.persistent_point_shadow_cache
+            && self.continuous_point_shadow_proxy
+    }
+
+    pub(crate) fn resolved_point_shadow_proxy_sway_scale(self) -> f32 {
+        if self.point_shadow_proxy_sway_scale.is_finite() {
+            self.point_shadow_proxy_sway_scale.clamp(0.0, 4.0)
+        } else {
+            1.0
+        }
+    }
+
     pub(crate) fn resolved_cached_point_shadow_update_hz(self) -> f32 {
         if self.cached_point_shadow_update_hz.is_finite() {
             self.cached_point_shadow_update_hz.clamp(0.0, 30.0)
@@ -290,7 +315,7 @@ pub(crate) fn log_render_quality_config(config: Res<RenderQualityConfig>) {
     }
 
     info!(
-        "Render quality: XR scale {:.2}, MSAA {}x, A/B {}, point shadow residency {} at {}px, clusters {}/{}z to {:.1}m, scalable point lights {} ({} Hero + {} tail samples, exact through {} lights, {}, selection {}), persistent shadow cache {} + dynamic overlay {} ({} Hz, {} light/frame)",
+        "Render quality: XR scale {:.2}, MSAA {}x, A/B {}, point shadow eligibility {} at {}px, clusters {}/{}z to {:.1}m, scalable point lights {} ({} Hero + {} tail samples, exact through {} lights, {}, selection {}), persistent shadow cache {} + dynamic overlay {}, continuous projection proxy {} at {:.2}x (redraw reference {} Hz, {} light/frame)",
         resolved_scale,
         resolved_msaa.samples(),
         config.point_light_ab_profile_label(),
@@ -322,6 +347,12 @@ pub(crate) fn log_render_quality_config(config: Res<RenderQualityConfig>) {
             "off"
         },
         if dynamic_overlay_enabled { "on" } else { "off" },
+        if config.continuous_point_shadow_proxy_enabled() {
+            "on"
+        } else {
+            "off"
+        },
+        config.resolved_point_shadow_proxy_sway_scale(),
         config.resolved_cached_point_shadow_update_hz(),
         config.max_cached_point_shadow_updates_per_frame,
     );
@@ -339,9 +370,11 @@ mod tests {
         assert!(quality.point_light_direct_lighting);
         assert!(quality.point_light_shadows);
         assert!(quality.dynamic_shadow_caster_overlay);
+        assert!(quality.continuous_point_shadow_proxy_enabled());
+        assert_eq!(quality.resolved_point_shadow_proxy_sway_scale(), 1.0);
         assert!(!quality.clustered_light_preselection);
         assert!(quality.world_space_light_reservoir);
-        assert_eq!(quality.resolved_point_light_exact_threshold(), 8);
+        assert_eq!(quality.resolved_point_light_exact_threshold(), 18);
         assert_eq!(
             quality.point_light_selection_mode_label(),
             "single-scan world reservoir"
@@ -445,5 +478,26 @@ mod tests {
             ..quality
         };
         assert_eq!(exact_reference.resolved_point_light_exact_threshold(), 16);
+    }
+
+    #[test]
+    fn point_shadow_proxy_scale_is_finite_and_bounded() {
+        let negative = RenderQualityConfig {
+            point_shadow_proxy_sway_scale: -1.0,
+            ..default()
+        };
+        assert_eq!(negative.resolved_point_shadow_proxy_sway_scale(), 0.0);
+
+        let oversized = RenderQualityConfig {
+            point_shadow_proxy_sway_scale: 99.0,
+            ..default()
+        };
+        assert_eq!(oversized.resolved_point_shadow_proxy_sway_scale(), 4.0);
+
+        let invalid = RenderQualityConfig {
+            point_shadow_proxy_sway_scale: f32::NAN,
+            ..default()
+        };
+        assert_eq!(invalid.resolved_point_shadow_proxy_sway_scale(), 1.0);
     }
 }

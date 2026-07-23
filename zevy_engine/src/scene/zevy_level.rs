@@ -12,6 +12,10 @@ use bevy::{
 use serde::Deserialize;
 use thiserror::Error;
 
+use crate::shadow_motion_policy::{
+    LightShadowMotionClass, LightShadowMotionPolicy, ShadowCasterMotionPolicy,
+};
+
 use super::LevelEntity;
 
 pub const ZEVY_LEVEL_SCHEMA_VERSION: u32 = 2;
@@ -595,6 +599,7 @@ fn spawn_composed_level(commands: &mut Commands, root: Entity, level: &ZevyLevel
                     id: definition.id.clone(),
                     asset_id: definition.asset.clone(),
                 },
+                ShadowCasterMotionPolicy::automatic(),
             ))
             .id();
 
@@ -694,7 +699,8 @@ fn apply_pending_light_overrides(
             }
 
             if let Some(light_entity) = matched_entity {
-                commands.entity(light_entity).insert((
+                let mut light_commands = commands.entity(light_entity);
+                light_commands.insert((
                     ImportedZevyLight {
                         source: definition.clone(),
                     },
@@ -704,6 +710,14 @@ fn apply_pending_light_overrides(
                         Visibility::Hidden
                     },
                 ));
+                if definition.kind == ZevyLightKind::Point {
+                    let policy = if definition.unreal.is_static_mobility() {
+                        LightShadowMotionPolicy::fixed(LightShadowMotionClass::Static)
+                    } else {
+                        LightShadowMotionPolicy::automatic()
+                    };
+                    light_commands.insert(policy);
+                }
                 if definition.unreal.attenuation_model == "custom_exponent" {
                     warn!(
                         "UE light '{}' uses custom falloff exponent {}; Bevy uses its standard inverse-square cut-off, while the UE parameters remain available in ImportedZevyLight",
