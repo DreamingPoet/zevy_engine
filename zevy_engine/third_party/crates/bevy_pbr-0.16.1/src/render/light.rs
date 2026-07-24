@@ -2094,11 +2094,11 @@ pub fn queue_shadows<M: Material>(
                     continue;
                 };
 
-                // Skip the entity if it's cached in a bin and up to date.
-                if shadow_phase.validate_cached_entity(main_entity, *current_change_tick) {
-                    continue;
-                }
-
+                // Check this before validating the cached phase entry. Zevy's
+                // persistent point-shadow path temporarily disables moving
+                // casters while the static layer is queued. Validating first
+                // would keep a stale caster in that static layer forever when
+                // an entity changes from static to dynamic classification.
                 let Some(mesh_instance) = render_mesh_instances.render_mesh_queue_data(main_entity)
                 else {
                     continue;
@@ -2107,6 +2107,11 @@ pub fn queue_shadows<M: Material>(
                     .flags
                     .contains(RenderMeshInstanceFlags::SHADOW_CASTER)
                 {
+                    continue;
+                }
+
+                // Skip the entity if it's cached in a bin and up to date.
+                if shadow_phase.validate_cached_entity(main_entity, *current_change_tick) {
                     continue;
                 }
 

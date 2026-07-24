@@ -4,12 +4,13 @@ use std::time::Duration;
 #[cfg(not(target_os = "android"))]
 use bevy::window::{PresentMode, Window};
 use bevy::{
+    pbr::{NotShadowCaster, NotShadowReceiver},
     prelude::*,
     render::{RenderPlugin, pipelined_rendering::PipelinedRenderingPlugin},
     window::WindowPlugin,
 };
 use bevy_mod_openxr::{
-    action_binding::OxrActionBindingPlugin,
+    action_binding::{OxrActionBindingPlugin, OxrSuggestActionBinding},
     action_set_attaching::OxrActionAttachingPlugin,
     action_set_syncing::OxrActionSyncingPlugin,
     features::{handtracking::HandTrackingPlugin, overlay::OxrOverlayPlugin},
@@ -19,15 +20,38 @@ use bevy_mod_openxr::{
     reference_space::OxrReferenceSpacePlugin,
     render::OxrRenderPlugin,
     resources::{OxrCurrentSessionConfig, OxrViews},
+    session::OxrSession,
     spaces::{OxrSpacePatchingPlugin, OxrSpatialPlugin},
 };
 use bevy_mod_xr::{
     camera::{XrCamera, XrCameraPlugin},
     session::{XrCreateSessionEvent, XrSessionPlugin, XrState, XrTracker, XrTrackingRoot},
 };
-use bevy_xr_utils::tracking_utils::{XrTrackedLeftGrip, XrTrackedRightGrip, XrTrackedView};
+use bevy_xr_utils::tracking_utils::{ControllerActions, XrTrackedView};
 
 use crate::{platform, scene::MirrorCamera};
+
+/// Direct OpenXR grip-pose anchors. Unlike the convenience copy components,
+/// these entities own action spaces and therefore expose XrSpaceLocationFlags
+/// so gameplay can distinguish a valid tracked pose from a stale transform.
+#[derive(Component)]
+pub(crate) struct XrLeftGripPoseAnchor;
+
+#[derive(Component)]
+pub(crate) struct XrRightGripPoseAnchor;
+
+#[derive(Component)]
+pub(crate) struct ZevyXrAnchorVisual;
+
+/// Grip profiles proven by the target runtime. PICO 4 Ultra Runtime 2.2.0
+/// reports `pico4s_controller` from `xrGetCurrentInteractionProfile` while
+/// exposing OpenXR 1.0. Keep the working Oculus compatibility binding as a
+/// fallback; do not substitute OpenXR 1.1 promoted profile names unless their
+/// extension/core-version capability has first been negotiated.
+const XR_GRIP_POSE_PROFILES: &[&str] = &[
+    "/interaction_profiles/oculus/touch_controller",
+    "/interaction_profiles/bytedance/pico4s_controller",
+];
 
 pub fn plugins() -> bevy::app::PluginGroupBuilder {
     let mut oxr_init = OxrInitPlugin::default();
@@ -93,11 +117,36 @@ pub fn request_session_when_available(
     }
 }
 
+pub fn suggest_grip_pose_bindings(
+    actions: Res<ControllerActions>,
+    mut bindings: EventWriter<OxrSuggestActionBinding>,
+) {
+    for profile in XR_GRIP_POSE_PROFILES {
+        bindings.write(OxrSuggestActionBinding {
+            action: actions.left.as_raw(),
+            interaction_profile: (*profile).into(),
+            bindings: vec!["/user/hand/left/input/grip/pose".into()],
+        });
+        bindings.write(OxrSuggestActionBinding {
+            action: actions.right.as_raw(),
+            interaction_profile: (*profile).into(),
+            bindings: vec!["/user/hand/right/input/grip/pose".into()],
+        });
+    }
+}
+
 pub fn spawn_anchor_visuals(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    session: Option<Res<OxrSession>>,
+    actions: Option<Res<ControllerActions>>,
 ) {
+    let (Some(session), Some(actions)) = (session, actions) else {
+        warn!("XR session created before grip-pose actions were available; hand anchors skipped");
+        return;
+    };
+
     commands.spawn((
         Name::new("XrHeadAnchor"),
         Mesh3d(meshes.add(Cuboid::new(0.18, 0.12, 0.12))),
@@ -105,25 +154,49 @@ pub fn spawn_anchor_visuals(
         Transform::default(),
         XrTrackedView,
         XrTracker,
+        ZevyXrAnchorVisual,
+        NotShadowCaster,
+        NotShadowReceiver,
     ));
 
-    commands.spawn((
-        Name::new("XrLeftGripAnchor"),
-        Mesh3d(meshes.add(Cuboid::new(0.08, 0.12, 0.18))),
-        MeshMaterial3d(materials.add(Color::srgb(0.3, 0.7, 1.0))),
-        Transform::default(),
-        XrTrackedLeftGrip,
-        XrTracker,
-    ));
+    match session.create_action_space(&actions.left, Default::default(), Isometry3d::IDENTITY) {
+        Ok(left_space) => {
+            commands.spawn((
+                Name::new("XrLeftGripAnchor"),
+                left_space,
+                XrLeftGripPoseAnchor,
+                ZevyXrAnchorVisual,
+                NotShadowCaster,
+                NotShadowReceiver,
+            ));
+        }
+        Err(error) => error!("Failed to create the Zevy left grip action space: {error}"),
+    }
 
-    commands.spawn((
-        Name::new("XrRightGripAnchor"),
-        Mesh3d(meshes.add(Cuboid::new(0.08, 0.12, 0.18))),
-        MeshMaterial3d(materials.add(Color::srgb(1.0, 0.65, 0.25))),
-        Transform::default(),
-        XrTrackedRightGrip,
-        XrTracker,
-    ));
+    match session.create_action_space(&actions.right, Default::default(), Isometry3d::IDENTITY) {
+        Ok(right_space) => {
+            commands.spawn((
+                Name::new("XrRightGripAnchor"),
+                Mesh3d(meshes.add(Cuboid::new(0.08, 0.12, 0.18))),
+                MeshMaterial3d(materials.add(Color::srgb(1.0, 0.65, 0.25))),
+                right_space,
+                XrRightGripPoseAnchor,
+                ZevyXrAnchorVisual,
+                NotShadowCaster,
+                NotShadowReceiver,
+            ));
+        }
+        Err(error) => error!("Failed to create the Zevy right grip action space: {error}"),
+    }
+}
+
+pub fn cleanup_anchor_visuals(
+    mut commands: Commands,
+    anchors: Query<Entity, With<ZevyXrAnchorVisual>>,
+) {
+    for entity in &anchors {
+        commands.entity(entity).despawn();
+    }
 }
 
 pub fn sync_mirror_camera(

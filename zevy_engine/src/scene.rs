@@ -1,6 +1,7 @@
 mod desktop_player;
 mod levels;
 mod map_s03b_motion_test;
+mod map_s03b_xr_hand_test;
 mod mip_texture;
 mod zevy_level;
 
@@ -59,6 +60,7 @@ impl Plugin for ScenePlugin {
                     map_s03b_motion_test::sync_flying_shadow_test.after(open_level),
                     map_s03b_motion_test::animate_flying_shadow_test
                         .after(map_s03b_motion_test::sync_flying_shadow_test),
+                    map_s03b_xr_hand_test::sync_xr_hand_shadow_test.after(open_level),
                     desktop_player::update_desktop_level_player
                         .after(EngineInputSet::Collect)
                         .after(frame_asset_level_camera),

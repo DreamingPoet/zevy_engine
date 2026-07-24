@@ -15,9 +15,7 @@ use bevy::{
     window::WindowPlugin,
 };
 use bevy_mod_openxr::resources::OxrSessionConfig;
-use bevy_xr_utils::{
-    tracking_utils::suggest_action_bindings, xr_utils_actions::XRUtilsActionSystemSet,
-};
+use bevy_xr_utils::xr_utils_actions::XRUtilsActionSystemSet;
 
 #[cfg(feature = "render_debug")]
 use crate::render_debug::RenderDebugPlugin;
@@ -88,11 +86,15 @@ pub fn run() {
                 )
                 .add_systems(
                     bevy_mod_openxr::action_binding::OxrSendActionBindings,
-                    suggest_action_bindings,
+                    xr::suggest_grip_pose_bindings,
                 )
                 .add_systems(
                     bevy_mod_xr::session::XrSessionCreated,
                     xr::spawn_anchor_visuals,
+                )
+                .add_systems(
+                    bevy_mod_xr::session::XrPreDestroySession,
+                    xr::cleanup_anchor_visuals,
                 )
                 .add_systems(
                     PostUpdate,

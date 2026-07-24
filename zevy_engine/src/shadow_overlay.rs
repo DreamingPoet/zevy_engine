@@ -6,8 +6,9 @@ use std::{
 use bevy::{
     core_pipeline::core_3d::CORE_3D_DEPTH_FORMAT,
     pbr::{
-        DrawPrepass, ExtractedPointLight, GlobalClusterableObjectMeta, LightEntity,
-        RenderCubemapVisibleEntities, Shadow, ShadowBatchSetKey, ShadowBinKey, ShadowView,
+        DrawPrepass, ExtractedDirectionalLight, ExtractedPointLight, GlobalClusterableObjectMeta,
+        LightEntity, RenderCascadesVisibleEntities, RenderCubemapVisibleEntities,
+        RenderVisibleMeshEntities, Shadow, ShadowBatchSetKey, ShadowBinKey, ShadowView,
         SpecializedShadowMaterialPipelineCache, ViewLightEntities, ViewShadowBindings,
         prepare_lights, queue_shadows, specialize_shadows,
     },
@@ -69,7 +70,7 @@ pub(crate) struct DynamicShadowOverlayState {
     pub(crate) render_view_entities: HashSet<Entity>,
     pub(crate) dynamic_view_by_static: HashMap<Entity, Entity>,
     pub(crate) enabled: bool,
-    last_logged_counts: Option<(usize, usize, usize, usize)>,
+    last_logged_counts: Option<(usize, usize, usize, usize, usize)>,
 }
 
 pub(crate) struct DynamicShadowOverlayPlugin;
@@ -429,7 +430,14 @@ fn queue_dynamic_shadow_overlay(
     gpu_preprocessing_support: Res<GpuPreprocessingSupport>,
     mesh_allocator: Res<MeshAllocator>,
     dynamic_views: Query<(Entity, &DynamicPointShadowView, &ExtractedView)>,
+    view_lights: Query<(Entity, &ViewLightEntities), With<ExtractedView>>,
+    view_light_entities: Query<(&LightEntity, &ExtractedView)>,
     point_light_entities: Query<&RenderCubemapVisibleEntities, With<ExtractedPointLight>>,
+    directional_light_entities: Query<
+        &RenderCascadesVisibleEntities,
+        With<ExtractedDirectionalLight>,
+    >,
+    spot_light_entities: Query<&RenderVisibleMeshEntities, With<ExtractedPointLight>>,
     specialized_pipeline_cache: Res<SpecializedShadowMaterialPipelineCache<StandardMaterial>>,
 ) {
     set_dynamic_shadow_caster_flags(
@@ -452,6 +460,19 @@ fn queue_dynamic_shadow_overlay(
     let draw_shadow_mesh = shadow_draw_functions
         .read()
         .id::<DrawPrepass<StandardMaterial>>();
+    let native_queued_caster_draws = queue_dynamic_casters_into_native_non_point_shadows(
+        &dynamic_casters,
+        draw_shadow_mesh,
+        &render_mesh_instances,
+        &mut shadow_render_phases,
+        &gpu_preprocessing_support,
+        &mesh_allocator,
+        &view_lights,
+        &view_light_entities,
+        &directional_light_entities,
+        &spot_light_entities,
+        &specialized_pipeline_cache,
+    );
     let mut current_active_keys = HashSet::new();
     let mut dynamic_entity_by_key = HashMap::new();
     let mut visible_caster_references = 0;
@@ -537,14 +558,139 @@ fn queue_dynamic_shadow_overlay(
         state.render_view_entities.len(),
         visible_caster_references,
         queued_caster_draws,
+        native_queued_caster_draws,
     );
     if state.last_logged_counts != Some(counts) {
         debug!(
-            "Dynamic point-shadow overlay: {} casters, {} cubemap faces redrawn, {} visible caster-face references, {} queued caster draws",
-            counts.0, counts.1, counts.2, counts.3,
+            "Dynamic point-shadow overlay: {} casters, {} cubemap faces redrawn, {} visible caster-face references, {} queued point-overlay caster draws, {} queued native non-point caster draws",
+            counts.0, counts.1, counts.2, counts.3, counts.4,
         );
         state.last_logged_counts = Some(counts);
     }
+}
+
+/// Dynamic casters are temporarily hidden from Bevy's normal shadow queue so
+/// they cannot become part of a cached point light's static layer. Point-light
+/// views are then handled by Zevy's separate dynamic cubemap overlay. Spot and
+/// directional lights have no such overlay, so add the moving casters back to
+/// their native, fully-updated shadow phases after the static queue completes.
+#[allow(clippy::too_many_arguments)]
+fn queue_dynamic_casters_into_native_non_point_shadows(
+    dynamic_casters: &HashSet<MainEntity>,
+    draw_shadow_mesh: bevy::render::render_phase::DrawFunctionId,
+    render_mesh_instances: &bevy::pbr::RenderMeshInstances,
+    shadow_render_phases: &mut ViewBinnedRenderPhases<Shadow>,
+    gpu_preprocessing_support: &GpuPreprocessingSupport,
+    mesh_allocator: &MeshAllocator,
+    view_lights: &Query<(Entity, &ViewLightEntities), With<ExtractedView>>,
+    view_light_entities: &Query<(&LightEntity, &ExtractedView)>,
+    directional_light_entities: &Query<
+        &RenderCascadesVisibleEntities,
+        With<ExtractedDirectionalLight>,
+    >,
+    spot_light_entities: &Query<&RenderVisibleMeshEntities, With<ExtractedPointLight>>,
+    specialized_pipeline_cache: &SpecializedShadowMaterialPipelineCache<StandardMaterial>,
+) -> usize {
+    let mut queued_caster_draws = 0;
+
+    for (main_view_entity, view_lights) in view_lights.iter() {
+        for shadow_view_entity in view_lights.lights.iter().copied() {
+            let Ok((light_entity, extracted_view)) = view_light_entities.get(shadow_view_entity)
+            else {
+                continue;
+            };
+            if !native_shadow_view_needs_dynamic_requeue(light_entity) {
+                continue;
+            }
+
+            let visible_entities = match light_entity {
+                LightEntity::Directional {
+                    light_entity,
+                    cascade_index,
+                } => {
+                    let Ok(cascades) = directional_light_entities.get(*light_entity) else {
+                        continue;
+                    };
+                    let Some(view_cascades) = cascades.entities.get(&main_view_entity) else {
+                        continue;
+                    };
+                    let Some(cascade) = view_cascades.get(*cascade_index) else {
+                        continue;
+                    };
+                    &cascade.entities
+                }
+                LightEntity::Spot { light_entity } => {
+                    let Ok(visible) = spot_light_entities.get(*light_entity) else {
+                        continue;
+                    };
+                    &visible.entities
+                }
+                LightEntity::Point { .. } => continue,
+            };
+
+            let Some(shadow_phase) =
+                shadow_render_phases.get_mut(&extracted_view.retained_view_entity)
+            else {
+                continue;
+            };
+            let Some(view_pipeline_cache) =
+                specialized_pipeline_cache.get(&extracted_view.retained_view_entity)
+            else {
+                continue;
+            };
+
+            for (entity, main_entity) in visible_entities.iter().copied() {
+                if !dynamic_casters.contains(&main_entity) {
+                    continue;
+                }
+                let Some((current_change_tick, pipeline_id)) =
+                    view_pipeline_cache.get(&main_entity)
+                else {
+                    continue;
+                };
+                if shadow_phase.validate_cached_entity(main_entity, *current_change_tick) {
+                    continue;
+                }
+                let Some(mesh_instance) = render_mesh_instances.render_mesh_queue_data(main_entity)
+                else {
+                    continue;
+                };
+                let (vertex_slab, index_slab) =
+                    mesh_allocator.mesh_slabs(&mesh_instance.mesh_asset_id);
+                shadow_phase.add(
+                    ShadowBatchSetKey {
+                        pipeline: *pipeline_id,
+                        draw_function: draw_shadow_mesh,
+                        material_bind_group_index: Some(
+                            mesh_instance.material_bindings_index.group.0,
+                        ),
+                        vertex_slab: vertex_slab.unwrap_or_default(),
+                        index_slab,
+                    },
+                    ShadowBinKey {
+                        asset_id: mesh_instance.mesh_asset_id.into(),
+                    },
+                    (entity, main_entity),
+                    mesh_instance.current_uniform_index,
+                    BinnedRenderPhaseType::mesh(
+                        mesh_instance.should_batch(),
+                        gpu_preprocessing_support,
+                    ),
+                    *current_change_tick,
+                );
+                queued_caster_draws += 1;
+            }
+        }
+    }
+
+    queued_caster_draws
+}
+
+fn native_shadow_view_needs_dynamic_requeue(light_entity: &LightEntity) -> bool {
+    matches!(
+        light_entity,
+        LightEntity::Directional { .. } | LightEntity::Spot { .. }
+    )
 }
 
 fn overlay_keys_to_render<T: Copy + Eq + std::hash::Hash>(
@@ -595,7 +741,8 @@ mod tests {
     use bevy::prelude::Entity;
 
     use super::{
-        overlay_keys_to_render, point_shadow_cube_capacity, register_dynamic_preprocess_views,
+        native_shadow_view_needs_dynamic_requeue, overlay_keys_to_render,
+        point_shadow_cube_capacity, register_dynamic_preprocess_views,
     };
 
     #[test]
@@ -652,5 +799,27 @@ mod tests {
             view_lights.lights,
             vec![static_a, unrelated, static_b, dynamic_a, dynamic_b]
         );
+    }
+
+    #[test]
+    fn dynamic_casters_rejoin_spot_and_directional_but_not_point_static_views() {
+        let light = Entity::from_raw(1);
+        assert!(native_shadow_view_needs_dynamic_requeue(
+            &bevy::pbr::LightEntity::Spot {
+                light_entity: light,
+            }
+        ));
+        assert!(native_shadow_view_needs_dynamic_requeue(
+            &bevy::pbr::LightEntity::Directional {
+                light_entity: light,
+                cascade_index: 0,
+            }
+        ));
+        assert!(!native_shadow_view_needs_dynamic_requeue(
+            &bevy::pbr::LightEntity::Point {
+                light_entity: light,
+                face_index: 0,
+            }
+        ));
     }
 }

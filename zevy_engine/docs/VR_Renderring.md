@@ -1880,3 +1880,53 @@ Android 官方 [ADPF](https://developer.android.com/games/optimize/adpf)强调�
 ## 24. 一句话版本
 
 > Zevy 不应通过“让移动 GPU 硬算桌面级全部像素、全部灯光和全部阴影”来获得现代感，而应通过双眼共享、tile/cluster 共享、阴影跨帧缓存、感知驱动 foveation，以及关键灯确定性与长尾灯概率化的组合，在固定帧时间与热预算内保留最有价值的光影信息。
+
+---
+
+## 25. XR 手部运动驱动的 Motion Policy 验证夹具（2026-07-24）
+
+Map_S03B 新增了一个只用于验证、不会改变 renderer 通用路线的 XR hand harness：有效左 grip pose 生成固定 `DynamicOverlay` 球，有效右 grip pose 生成固定 `FullyDynamic` shadowed SpotLight。tracking loss 时对象被清理，两个实体都由主世界唯一 pose 驱动，左右眼共享。
+
+这个夹具同时暴露并修复了一处通用 shadow queue 边界：为了保护持久化 PointLight static layer，动态 caster 会在 Bevy 标准 shadow queue 前暂时关闭 caster flag；旧实现因此也把它们错误排除在 SpotLight/DirectionalLight 阴影之外。当前路径为：
+
+1. PointLight：static caster 进入持久化 cubemap；dynamic caster 进入独立动态 cubemap overlay。
+2. SpotLight / DirectionalLight：标准队列完成后，把 dynamic caster 重新加入原生实时 shadow phase。
+3. shadow phase 必须先检查当前 caster flag，再验证旧 cache entry，避免 Static→Dynamic 迁移留下永久旧影。
+
+对一个有阴影的局部灯，SpotLight 使用一个 frustum：
+
+\[
+C_{spot}\approx O(S+D),
+\]
+
+同等 FullyDynamic PointLight 使用六个 cubemap face：
+
+\[
+C_{point}\approx O(6(S+D)).
+\]
+
+因此手电筒、门口灯、舞台聚光和其他有明确方向的灯应优先保留 spot 语义，而不是无理由使用 PointLight。它减少 shadow geometry 的常数倍重复，但不会消除主画面 lighting fragment 成本，也不能替代实机测量。
+
+当前实现使用 OpenXR grip pose 和 Bevy local `-Z`。若 PICO 佩戴测试证明握持方向与光束方向不自然，正确演进是增加独立 `/input/aim/pose` Action Space；禁止写只适配某台设备的欧拉角常量。tracking flags 已在目标设备冷启动中验证，双眼一致、SpotLight 增量 GPU 时间和 thermal 仍标记为待 Android/VR 验证。
+
+### 25.1 Interaction profile 必须由运行时能力裁决
+
+[失败实验/用户实测] 曾依据本地 OpenXR 1.1 注册表，把原有 `/interaction_profiles/bytedance/pico4s_controller` 直接替换为 promoted 的 `/interaction_profiles/bytedance/pico4_controller`，并加入 `pico_neo3_controller`。生成 APK 后，PICO 4 Ultra Enterprise 上手柄完全不识别、按键无响应。规范注册表中的路径存在，只能证明该路径属于某个核心版本或扩展；不能证明当前 app 请求的 API 版本、目标 runtime 和已启用扩展已经允许使用它。
+
+[Android/VR 日志] 目标设备为 PICO 4 Ultra Enterprise、Runtime 2.2.0；当前 Zevy 会话使用 OpenXR 1.0 路径，启用扩展列表没有提供可据以无条件切换 promoted PICO profile 的证据。`xrGetCurrentInteractionProfile` 实际返回：
+
+```text
+/interaction_profiles/bytedance/pico4s_controller
+```
+
+因此目标设备事实优先于离线注册表推断。当前修正为：
+
+1. gameplay input 保留已经工作的 Oculus Touch、Valve Index 和 `pico4s_controller` 建议绑定集合；
+2. 左右 grip pose 同时建议 Oculus Touch fallback 与运行时已验证的 `pico4s_controller`，不再用 OpenXR 1.1 名称替换旧路径；
+3. 每个 profile 独立提交，某个 fallback 返回 `XR_ERROR_PATH_UNSUPPORTED` 时只记录该 profile，不阻断后续支持项；
+4. vendored OpenXR 插件的错误日志必须包含 interaction profile，禁止再把一个 fallback 失败误判为全部控制器绑定失败；
+5. 将来只有在枚举并成功协商 API 版本/对应扩展后，才把 `pico4_controller`、`pico_neo3_controller` 加入该 runtime 的候选集合，同时保留 runtime-proven fallback。
+
+[Android/VR 冷启动验证] 修正 APK 在设备 `PA9410MGJ9260457G` 上安装并进入 `FOCUSED`。日志确认 `pico4s_controller` 为活动 profile，左右 grip 都取得有效 tracking flags，Map_S03B 的左手 `DynamicOverlay` 球和右手 `FullyDynamic` SpotLight 均被创建。当前 runtime 同时明确拒绝 Oculus Touch grip fallback，但这是非致命结果；PICO 原生绑定继续完成 action sync。A/B、摇杆和扳机仍需用户物理按键验证，不能由自动冷启动替代。
+
+这个实验得到一条通用工程规则：**interaction profile 不是静态设备型号表，而是 app API 版本、已启用扩展、runtime 实现和当前连接设备共同决定的协商结果。** 对 Quest、PICO 或未来设备都应使用 capability-driven binding matrix，并把实际活动 profile、每个建议绑定结果和 action-state 可用性纳入启动审计。

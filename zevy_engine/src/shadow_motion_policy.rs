@@ -84,13 +84,16 @@ impl Default for LightShadowAutomaticThresholds {
     }
 }
 
-/// Selects the shadow update path for one PointLight.
+/// Selects the shadow update path for one local light.
 ///
 /// Manual modes are fixed. Automatic mode upgrades immediately when motion
 /// becomes more demanding and downgrades only after the configured settle
 /// interval. Bounded micro motion requires a producer to write
 /// `PointLightShadowMapJitter`; real Transform motion is never silently
-/// reinterpreted as a virtual offset.
+/// reinterpreted as a virtual offset. Persistent cached classes are currently
+/// implemented for PointLight. SpotLight is accepted as a real one-frustum
+/// FullyDynamic path; lower-cost SpotLight classes are promoted until a spot
+/// shadow cache exists.
 #[derive(Component, Clone, Copy, Debug, PartialEq)]
 pub struct LightShadowMotionPolicy {
     pub mode: LightShadowMotionMode,
@@ -295,6 +298,7 @@ impl Plugin for ShadowMotionPolicyPlugin {
                 (
                     begin_policy_telemetry,
                     resolve_light_shadow_motion,
+                    resolve_spot_light_shadow_motion,
                     resolve_shadow_caster_motion,
                     cleanup_removed_motion_policies,
                     ApplyDeferred,
@@ -402,6 +406,82 @@ fn resolve_light_shadow_motion(
         } else {
             entity_commands.remove::<(PointLightShadowMapJitter, PolicyManagedPointShadowJitter)>();
         }
+    }
+}
+
+#[allow(clippy::type_complexity)]
+fn resolve_spot_light_shadow_motion(
+    time: Res<Time>,
+    mut commands: Commands,
+    mut telemetry: ResMut<ShadowMotionPolicyTelemetry>,
+    lights: Query<
+        (
+            Entity,
+            Option<&Name>,
+            &SpotLight,
+            &GlobalTransform,
+            &LightShadowMotionPolicy,
+            Option<&LightShadowMotionState>,
+            Option<&ResolvedLightShadowMotion>,
+            Has<ImportedZevyLight>,
+        ),
+        Without<PointLight>,
+    >,
+) {
+    let dt = policy_delta_seconds(&time);
+    for (
+        entity,
+        name,
+        light,
+        global_transform,
+        policy,
+        previous_state,
+        previous_resolved,
+        imported,
+    ) in &lights
+    {
+        let (mut state, mut resolved) = next_light_motion_state(
+            previous_state.copied(),
+            *policy,
+            global_transform.translation(),
+            light.range,
+            0.0,
+            imported,
+            dt,
+        );
+
+        // Bevy renders a shadowed SpotLight through one live frustum. Zevy's
+        // persistent cache currently stores only PointLight cubemap faces, so
+        // never attach point-cache/jitter components or report a cache class
+        // that the renderer cannot honor.
+        if resolved.class != LightShadowMotionClass::FullyDynamic && previous_resolved.is_none() {
+            warn!(
+                "SpotLight shadow policy '{}' requested {:?}; Zevy P1 has no cached spot-shadow path, so it is promoted to FullyDynamic",
+                name.map(Name::as_str).unwrap_or("unnamed"),
+                resolved.class,
+            );
+        }
+        state.class = LightShadowMotionClass::FullyDynamic;
+        state.lower_cost_candidate = LightShadowMotionClass::FullyDynamic;
+        state.lower_cost_candidate_seconds = 0.0;
+        resolved.class = LightShadowMotionClass::FullyDynamic;
+        resolved.lower_cost_candidate_seconds = 0.0;
+
+        if previous_resolved.is_some_and(|previous| previous.class != resolved.class) {
+            telemetry.transitions_this_frame += 1;
+            debug!(
+                "SpotLight shadow policy '{}' transitioned {:?} -> FullyDynamic",
+                name.map(Name::as_str).unwrap_or("unnamed"),
+                previous_resolved.unwrap().class,
+            );
+        }
+        telemetry.light_fully_dynamic += 1;
+        commands.entity(entity).insert((state, resolved)).remove::<(
+            CachedPointLightShadow,
+            PolicyManagedPointShadowCache,
+            PointLightShadowMapJitter,
+            PolicyManagedPointShadowJitter,
+        )>();
     }
 }
 
@@ -985,6 +1065,41 @@ mod tests {
         let caster = app.world().entity(caster);
         assert!(!caster.contains::<DynamicShadowCaster>());
         assert!(!caster.contains::<ResolvedShadowCasterMotion>());
+    }
+
+    #[test]
+    fn fully_dynamic_spot_light_resolves_without_point_shadow_cache() {
+        let mut app = policy_test_app();
+        let entity = app
+            .world_mut()
+            .spawn((
+                SpotLight {
+                    shadows_enabled: true,
+                    ..default()
+                },
+                Transform::default(),
+                GlobalTransform::default(),
+                CachedPointLightShadow::default(),
+                PointLightShadowMapJitter::default(),
+                LightShadowMotionPolicy::fixed(LightShadowMotionClass::FullyDynamic),
+            ))
+            .id();
+
+        app.update();
+
+        let entity = app.world().entity(entity);
+        assert_eq!(
+            entity.get::<ResolvedLightShadowMotion>().unwrap().class,
+            LightShadowMotionClass::FullyDynamic
+        );
+        assert!(!entity.contains::<CachedPointLightShadow>());
+        assert!(!entity.contains::<PointLightShadowMapJitter>());
+        assert_eq!(
+            app.world()
+                .resource::<ShadowMotionPolicyTelemetry>()
+                .light_fully_dynamic,
+            1
+        );
     }
 
     fn policy_test_app() -> App {

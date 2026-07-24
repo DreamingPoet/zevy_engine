@@ -79,10 +79,14 @@ fn bind_actions(instance: Res<OxrInstance>, mut actions: EventReader<OxrSuggestA
             (instance.fp().suggest_interaction_profile_bindings)(instance.as_raw(), &info)
         } {
             openxr::sys::Result::ERROR_ACTIONSETS_ALREADY_ATTACHED => error!(
-                "Binding Suggested for an Action whith an ActionSet that was already attached!"
+                "Bindings for interaction profile '{profile}' were suggested after its ActionSet was already attached"
             ),
-            openxr::sys::Result::ERROR_PATH_INVALID => error!("Invalid Path Suggested!"),
-            openxr::sys::Result::ERROR_PATH_UNSUPPORTED => error!("Suggested Path Unsupported!"),
+            openxr::sys::Result::ERROR_PATH_INVALID => {
+                error!("Invalid path suggested for interaction profile '{profile}'")
+            }
+            openxr::sys::Result::ERROR_PATH_UNSUPPORTED => {
+                error!("Suggested path unsupported for interaction profile '{profile}'")
+            }
             _ => {}
         }
     }
