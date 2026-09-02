@@ -19,7 +19,7 @@ use bevy::{
         mesh::allocator::MeshAllocator,
         render_phase::{BinnedRenderPhaseType, DrawFunctions, ViewBinnedRenderPhases},
         render_resource::{
-            Extent3d, TextureAspect, TextureDescriptor, TextureDimension, TextureUsages,
+            Extent3d, Texture, TextureAspect, TextureDescriptor, TextureDimension, TextureUsages,
             TextureViewDescriptor, TextureViewDimension,
         },
         sync_world::MainEntity,
@@ -58,6 +58,8 @@ struct DynamicAtlasSignature {
     point_light_count: usize,
     cube_capacity: usize,
     dynamic_overlay_active: bool,
+    dual_atlas_active: bool,
+    transition_pool_size: usize,
     layout: Vec<(PointShadowCacheKey, usize)>,
 }
 
@@ -70,6 +72,10 @@ pub(crate) struct DynamicShadowOverlayState {
     pub(crate) render_view_entities: HashSet<Entity>,
     pub(crate) dynamic_view_by_static: HashMap<Entity, Entity>,
     pub(crate) enabled: bool,
+    pub(crate) atlas_texture: Option<Texture>,
+    pub(crate) point_light_cube_count: usize,
+    pub(crate) transition_pool_size: usize,
+    pub(crate) cube_index_by_light: HashMap<Entity, usize>,
     last_logged_counts: Option<(usize, usize, usize, usize, usize)>,
 }
 
@@ -122,9 +128,11 @@ fn prepare_dynamic_point_shadow_overlay(
 ) {
     state.render_view_entities.clear();
     state.dynamic_view_by_static.clear();
-    state.enabled = frame.dynamic_overlay_enabled();
+    state.cube_index_by_light.clear();
+    state.enabled = frame.combined_atlas_enabled();
     if !state.enabled {
         remove_all_dynamic_views(&mut commands, &mut state);
+        frame.record_effective_transition_slots(0);
         frame.record_dynamic_overlay(0);
         return;
     }
@@ -182,22 +190,27 @@ fn prepare_dynamic_point_shadow_overlay(
 
     if records.is_empty() || point_light_count == 0 {
         remove_all_dynamic_views(&mut commands, &mut state);
+        frame.record_effective_transition_slots(0);
         frame.record_dynamic_overlay(0);
         return;
     }
 
     let dynamic_overlay_active = frame.dynamic_overlay_active();
-    let cube_capacity = point_shadow_cube_capacity(point_light_count, dynamic_overlay_active);
+    let max_texture_cubes = render_device.limits().max_texture_array_layers as usize / 6;
+    let atlas_layout = point_shadow_atlas_layout(
+        point_light_count,
+        dynamic_overlay_active,
+        frame.slow_shadow_transition_slots(),
+        max_texture_cubes,
+    );
+    let cube_capacity = atlas_layout.cube_capacity;
+    frame.record_effective_transition_slots(atlas_layout.transition_pool_size);
     let required_array_layers = cube_capacity * 6;
     assert!(
         required_array_layers <= render_device.limits().max_texture_array_layers as usize,
-        "Zevy dynamic point-shadow overlay needs {required_array_layers} texture-array layers, but this device supports only {}. Set RenderQualityConfig.max_shadowed_point_lights to at most {}.",
+        "Zevy combined point-shadow atlas needs {required_array_layers} texture-array layers, but this device supports only {}. Set RenderQualityConfig.max_shadowed_point_lights to at most {}.",
         render_device.limits().max_texture_array_layers,
-        render_device
-            .limits()
-            .max_texture_array_layers
-            .saturating_sub(6)
-            / 12,
+        max_texture_cubes / 2,
     );
 
     let face_size = frame.point_shadow_map_size();
@@ -214,7 +227,10 @@ fn prepare_dynamic_point_shadow_overlay(
             sample_count: 1,
             dimension: TextureDimension::D2,
             format: CORE_3D_DEPTH_FORMAT,
-            usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
+            usage: TextureUsages::RENDER_ATTACHMENT
+                | TextureUsages::TEXTURE_BINDING
+                | TextureUsages::COPY_SRC
+                | TextureUsages::COPY_DST,
             view_formats: &[],
         },
     );
@@ -241,15 +257,33 @@ fn prepare_dynamic_point_shadow_overlay(
         point_light_count,
         cube_capacity,
         dynamic_overlay_active,
+        dual_atlas_active: atlas_layout.dual_atlas_active,
+        transition_pool_size: atlas_layout.transition_pool_size,
         layout,
     };
     if state.atlas_signature.as_ref() != Some(&signature) {
+        if atlas_layout.transition_pool_size < frame.slow_shadow_transition_slots() {
+            warn!(
+                "Point-shadow transition pool reduced from {} to {} cubes by the device's {} texture-array-layer limit",
+                frame.slow_shadow_transition_slots(),
+                atlas_layout.transition_pool_size,
+                render_device.limits().max_texture_array_layers,
+            );
+        }
         state.atlas_signature = Some(signature);
-        state.clear_all_views = dynamic_overlay_active;
+        state.clear_all_views = atlas_layout.dual_atlas_active;
         state.previous_active_keys.clear();
     }
+    state.atlas_texture = Some(atlas.texture.clone());
+    state.point_light_cube_count = point_light_count;
+    state.transition_pool_size = atlas_layout.transition_pool_size;
+    for record in &records {
+        state
+            .cube_index_by_light
+            .insert(record.key.light, record.cube_index);
+    }
 
-    let live_keys = if dynamic_overlay_active {
+    let live_keys = if atlas_layout.dual_atlas_active {
         records
             .iter()
             .map(|record| record.key)
@@ -284,7 +318,7 @@ fn prepare_dynamic_point_shadow_overlay(
             shadow_view.depth_attachment = DepthAttachment::new(static_face_view, Some(0.0));
         }
 
-        if !dynamic_overlay_active {
+        if !atlas_layout.dual_atlas_active {
             continue;
         }
 
@@ -387,11 +421,39 @@ fn single_depth_layer_view(label: &'static str, layer: usize) -> TextureViewDesc
     }
 }
 
-fn point_shadow_cube_capacity(point_light_count: usize, dynamic_overlay_active: bool) -> usize {
-    if dynamic_overlay_active {
-        point_light_count * 2 + 1
-    } else {
-        point_light_count + point_light_count % 2
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PointShadowAtlasLayout {
+    cube_capacity: usize,
+    dual_atlas_active: bool,
+    transition_pool_size: usize,
+}
+
+fn point_shadow_atlas_layout(
+    point_light_count: usize,
+    dynamic_overlay_active: bool,
+    requested_transition_slots: usize,
+    max_texture_cubes: usize,
+) -> PointShadowAtlasLayout {
+    let dual_atlas_active = dynamic_overlay_active || requested_transition_slots > 0;
+    if !dual_atlas_active {
+        return PointShadowAtlasLayout {
+            cube_capacity: point_light_count + point_light_count % 2,
+            dual_atlas_active: false,
+            transition_pool_size: 0,
+        };
+    }
+
+    // static N + dynamic N. Any remaining device capacity is a sparse pool of
+    // previous static snapshots; it is never N additional cubes by
+    // construction. The shader receives N in each light record, so no atlas
+    // parity/sentinel encoding is required.
+    let base_capacity = point_light_count.saturating_mul(2);
+    let transition_pool_size =
+        requested_transition_slots.min(max_texture_cubes.saturating_sub(base_capacity));
+    PointShadowAtlasLayout {
+        cube_capacity: base_capacity.saturating_add(transition_pool_size),
+        dual_atlas_active: true,
+        transition_pool_size,
     }
 }
 
@@ -403,6 +465,10 @@ fn remove_all_dynamic_views(commands: &mut Commands, state: &mut DynamicShadowOv
     state.previous_active_keys.clear();
     state.render_view_entities.clear();
     state.dynamic_view_by_static.clear();
+    state.atlas_texture = None;
+    state.point_light_cube_count = 0;
+    state.transition_pool_size = 0;
+    state.cube_index_by_light.clear();
     state.clear_all_views = false;
 }
 
@@ -446,33 +512,42 @@ fn queue_dynamic_shadow_overlay(
         true,
     );
     state.render_view_entities.clear();
-    if !frame.dynamic_overlay_active() || !state.enabled {
+    if !state.enabled {
         frame.record_dynamic_overlay(0);
         return;
     }
 
-    let dynamic_casters = frame
-        .dynamic_shadow_casters()
-        .iter()
-        .copied()
-        .map(MainEntity::from)
-        .collect::<HashSet<_>>();
+    let dynamic_overlay_active = frame.dynamic_overlay_active();
+    let dynamic_casters = if dynamic_overlay_active {
+        frame
+            .dynamic_shadow_casters()
+            .iter()
+            .copied()
+            .map(MainEntity::from)
+            .collect::<HashSet<_>>()
+    } else {
+        HashSet::new()
+    };
     let draw_shadow_mesh = shadow_draw_functions
         .read()
         .id::<DrawPrepass<StandardMaterial>>();
-    let native_queued_caster_draws = queue_dynamic_casters_into_native_non_point_shadows(
-        &dynamic_casters,
-        draw_shadow_mesh,
-        &render_mesh_instances,
-        &mut shadow_render_phases,
-        &gpu_preprocessing_support,
-        &mesh_allocator,
-        &view_lights,
-        &view_light_entities,
-        &directional_light_entities,
-        &spot_light_entities,
-        &specialized_pipeline_cache,
-    );
+    let native_queued_caster_draws = if dynamic_overlay_active {
+        queue_dynamic_casters_into_native_non_point_shadows(
+            &dynamic_casters,
+            draw_shadow_mesh,
+            &render_mesh_instances,
+            &mut shadow_render_phases,
+            &gpu_preprocessing_support,
+            &mesh_allocator,
+            &view_lights,
+            &view_light_entities,
+            &directional_light_entities,
+            &spot_light_entities,
+            &specialized_pipeline_cache,
+        )
+    } else {
+        0
+    };
     let mut current_active_keys = HashSet::new();
     let mut dynamic_entity_by_key = HashMap::new();
     let mut visible_caster_references = 0;
@@ -742,7 +817,7 @@ mod tests {
 
     use super::{
         native_shadow_view_needs_dynamic_requeue, overlay_keys_to_render,
-        point_shadow_cube_capacity, register_dynamic_preprocess_views,
+        point_shadow_atlas_layout, register_dynamic_preprocess_views,
     };
 
     #[test]
@@ -758,11 +833,31 @@ mod tests {
     }
 
     #[test]
-    fn atlas_parity_disables_the_second_sample_when_no_dynamic_caster_exists() {
-        assert_eq!(point_shadow_cube_capacity(16, false), 16);
-        assert_eq!(point_shadow_cube_capacity(15, false), 16);
-        assert_eq!(point_shadow_cube_capacity(16, true), 33);
-        assert_eq!(point_shadow_cube_capacity(15, true), 31);
+    fn atlas_layout_reserves_only_a_sparse_transition_pool() {
+        assert_eq!(
+            point_shadow_atlas_layout(16, false, 0, 42).cube_capacity,
+            16
+        );
+        assert_eq!(
+            point_shadow_atlas_layout(15, false, 0, 42).cube_capacity,
+            16
+        );
+
+        let dual = point_shadow_atlas_layout(16, true, 0, 42);
+        assert_eq!(dual.cube_capacity, 32);
+        assert!(dual.dual_atlas_active);
+        assert_eq!(dual.transition_pool_size, 0);
+
+        let transitioning = point_shadow_atlas_layout(18, true, 4, 42);
+        assert_eq!(transitioning.cube_capacity, 40);
+        assert_eq!(transitioning.transition_pool_size, 4);
+    }
+
+    #[test]
+    fn transition_pool_shrinks_before_the_static_dynamic_atlas() {
+        let layout = point_shadow_atlas_layout(20, true, 4, 42);
+        assert_eq!(layout.cube_capacity, 42);
+        assert_eq!(layout.transition_pool_size, 2);
     }
 
     #[test]

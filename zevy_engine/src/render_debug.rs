@@ -27,6 +27,9 @@ use bevy_mod_openxr::resources::OxrCurrentSessionConfig;
 use bevy_mod_xr::camera::XrCamera;
 use bevy_xr_utils::xr_utils_actions::XRUtilsActionState;
 
+#[cfg(target_os = "android")]
+use crate::platform::android_system_property;
+
 use crate::{
     app::{LaunchMode, StartupMode},
     clustered_light_preselection::ClusterLightPreselectionStats,
@@ -34,7 +37,7 @@ use crate::{
     input::{XrDebugHudPageAction, XrDebugHudToggleAction},
     scene::{ImportedZevyEntity, MirrorCamera},
     shadow_cache::{ZevyShadowCacheFrame, is_dynamic_shadow_caster},
-    shadow_motion_policy::ShadowMotionPolicyTelemetry,
+    shadow_motion_policy::{ResolvedShadowCasterMotion, ShadowMotionPolicyTelemetry},
     shadow_overlay::DynamicShadowCaster,
 };
 
@@ -199,6 +202,12 @@ fn android_debug_hud_page_override() -> Option<RenderDebugPage> {
 
 #[cfg(target_os = "android")]
 pub(crate) fn apply_android_render_quality_overrides(config: &mut RenderQualityConfig) {
+    if let Some(value) = android_system_property("debug.zevy.local_lighting")
+        .as_deref()
+        .and_then(crate::config::LocalLightingPipeline::from_debug_label)
+    {
+        config.local_lighting_pipeline = value;
+    }
     if let Some(value) = android_system_property("debug.zevy.point_direct")
         .as_deref()
         .and_then(parse_debug_bool)
@@ -284,34 +293,6 @@ fn parse_debug_bool(value: &str) -> Option<bool> {
     }
 }
 
-#[cfg(target_os = "android")]
-fn android_system_property(name: &str) -> Option<String> {
-    use std::{
-        ffi::{CStr, CString},
-        os::raw::c_char,
-    };
-
-    const PROPERTY_VALUE_MAX: usize = 92;
-    unsafe extern "C" {
-        fn __system_property_get(name: *const c_char, value: *mut c_char) -> i32;
-    }
-
-    let name = CString::new(name).ok()?;
-    let mut value = [0 as c_char; PROPERTY_VALUE_MAX];
-    // SAFETY: `name` is NUL-terminated and `value` is the Bionic-documented
-    // PROPERTY_VALUE_MAX-sized writable output buffer.
-    let length = unsafe { __system_property_get(name.as_ptr(), value.as_mut_ptr()) };
-    if length <= 0 {
-        return None;
-    }
-    // SAFETY: a successful __system_property_get call NUL-terminates `value`.
-    Some(
-        unsafe { CStr::from_ptr(value.as_ptr()) }
-            .to_string_lossy()
-            .into_owned(),
-    )
-}
-
 #[derive(Resource, Default)]
 struct RenderDebugSnapshot {
     overview: String,
@@ -368,6 +349,7 @@ struct RenderDebugSceneData<'w, 's> {
         ),
     >,
     dynamic_shadow_markers: Query<'w, 's, (), With<DynamicShadowCaster>>,
+    resolved_shadow_caster_motion: Query<'w, 's, &'static ResolvedShadowCasterMotion>,
     imported_entities: Query<'w, 's, (), With<ImportedZevyEntity>>,
     parents: Query<'w, 's, &'static ChildOf>,
     point_lights: Query<'w, 's, &'static PointLight>,
@@ -579,6 +561,7 @@ fn update_debug_snapshot(
         &scene_data.images,
         &scene_data.renderables,
         &scene_data.dynamic_shadow_markers,
+        &scene_data.resolved_shadow_caster_motion,
         &scene_data.imported_entities,
         &scene_data.parents,
         &scene_data.point_lights,
@@ -668,6 +651,11 @@ fn update_debug_snapshot(
     );
     let _ = writeln!(
         overview,
+        "Lighting pipeline  {}",
+        quality.local_lighting_pipeline.label(),
+    );
+    let _ = writeln!(
+        overview,
         "PointLight A/B    {}",
         quality.point_light_ab_profile_label()
     );
@@ -739,6 +727,16 @@ fn update_debug_snapshot(
         motion_policy.light_fully_dynamic,
         motion_policy.caster_static,
         motion_policy.caster_dynamic_overlay,
+    );
+    let _ = writeln!(
+        overview,
+        "Slow shadow xfade {:>2}/{:<2} wait {:>2} copy {:>2}",
+        motion_policy.slow_shadow_transitions_active,
+        shadow_cache
+            .effective_transition_slots
+            .unwrap_or(motion_policy.slow_shadow_transition_slot_capacity),
+        motion_policy.slow_shadow_transition_waiting,
+        shadow_cache.transition_copies,
     );
     let _ = writeln!(
         overview,
@@ -1259,6 +1257,19 @@ fn update_debug_snapshot(
     );
     let _ = writeln!(
         material_page,
+        "Slow xfade active/slots     {} / {} ({} start, {} wait)",
+        motion_policy.slow_shadow_transitions_active,
+        motion_policy.slow_shadow_transition_slot_capacity,
+        motion_policy.slow_shadow_transition_starts,
+        motion_policy.slow_shadow_transition_waiting,
+    );
+    let _ = writeln!(
+        material_page,
+        "Snapshot copies / max stale {} / {:.3} m",
+        shadow_cache.transition_copies, motion_policy.slow_shadow_max_stale_distance_m,
+    );
+    let _ = writeln!(
+        material_page,
         "Light policy S/M/K/F        {} / {} / {} / {}",
         motion_policy.light_static,
         motion_policy.light_micro_motion,
@@ -1286,6 +1297,13 @@ fn update_debug_snapshot(
             quality.max_cached_point_shadow_updates_per_frame,
         );
     }
+    let _ = writeln!(
+        material_page,
+        "Slow snapshot policy        {:.1} Hz / {:.3} m / {:.3} s",
+        quality.resolved_slow_moving_shadow_snapshot_hz(),
+        quality.resolved_slow_moving_shadow_snapshot_distance_m(),
+        quality.resolved_slow_moving_shadow_crossfade_seconds(),
+    );
     let _ = writeln!(
         material_page,
         "Cluster grid budget         {} / {} z-slices",
@@ -1522,6 +1540,7 @@ fn collect_scene_stats(
         Option<&NotShadowCaster>,
     )>,
     dynamic_shadow_markers: &Query<(), With<DynamicShadowCaster>>,
+    resolved_shadow_caster_motion: &Query<&ResolvedShadowCasterMotion>,
     imported_entities: &Query<(), With<ImportedZevyEntity>>,
     parents: &Query<&ChildOf>,
     point_lights: &Query<&PointLight>,
@@ -1540,8 +1559,13 @@ fn collect_scene_stats(
         let mesh = meshes.get(mesh_handle.0.id());
         let mesh_triangles = mesh.map(mesh_triangle_count).unwrap_or_default();
         if not_shadow_caster.is_none() {
-            if is_dynamic_shadow_caster(entity, dynamic_shadow_markers, imported_entities, parents)
-            {
+            if is_dynamic_shadow_caster(
+                entity,
+                dynamic_shadow_markers,
+                resolved_shadow_caster_motion,
+                imported_entities,
+                parents,
+            ) {
                 stats.dynamic_shadow_caster_entities += 1;
                 stats.dynamic_shadow_caster_triangles += mesh_triangles;
             } else {

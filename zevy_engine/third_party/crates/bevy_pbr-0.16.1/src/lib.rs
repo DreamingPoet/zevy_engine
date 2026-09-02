@@ -76,7 +76,7 @@ pub mod prelude {
         fog::{DistanceFog, FogFalloff},
         light::{
             light_consts, AmbientLight, DirectionalLight, PointLight, PointLightShadowMapJitter,
-            SpotLight,
+            PointLightShadowMapTransition, SpotLight,
         },
         light_probe::{environment_map::EnvironmentMapLight, LightProbe},
         material::{Material, MaterialPlugin},
@@ -340,6 +340,7 @@ impl Plugin for PbrPlugin {
             .register_type::<NotShadowReceiver>()
             .register_type::<PointLight>()
             .register_type::<PointLightShadowMapJitter>()
+            .register_type::<PointLightShadowMapTransition>()
             .register_type::<PointLightShadowMap>()
             .register_type::<SpotLight>()
             .register_type::<ShadowFilteringMethod>()

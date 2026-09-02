@@ -9,6 +9,7 @@
 #include "Engine/StaticMesh.h"
 #include "Engine/StaticMeshActor.h"
 #include "FileHelpers.h"
+#include "Materials/Material.h"
 #include "Materials/MaterialInterface.h"
 #include "Misc/Parse.h"
 #include "ZevyLevelExporterModule.h"
@@ -36,7 +37,8 @@ bool GenerateValidationFixture(UWorld* World)
     AStaticMeshActor* Parent = World->SpawnActor<AStaticMeshActor>();
     AStaticMeshActor* Child = World->SpawnActor<AStaticMeshActor>();
     AStaticMeshActor* Grandchild = World->SpawnActor<AStaticMeshActor>();
-    if (Parent == nullptr || Child == nullptr || Grandchild == nullptr)
+    AStaticMeshActor* Sky = World->SpawnActor<AStaticMeshActor>();
+    if (Parent == nullptr || Child == nullptr || Grandchild == nullptr || Sky == nullptr)
     {
         UE_LOG(LogTemp, Error, TEXT("Failed to spawn Static Mesh validation fixture"));
         return false;
@@ -67,6 +69,15 @@ bool GenerateValidationFixture(UWorld* World)
     Grandchild->SetActorRelativeLocation(FVector(-60.0, 80.0, 75.0));
     Grandchild->SetActorRelativeRotation(FRotator(-30.0, 5.0, 55.0));
     Grandchild->SetActorRelativeScale3D(FVector(0.35, 0.6, 1.4));
+
+    UMaterial* SkyMaterial = NewObject<UMaterial>(GetTransientPackage(), TEXT("ZevyFixtureSkyMaterial"));
+    SkyMaterial->bIsSky = true;
+    Sky->SetActorLabel(TEXT("ZevyFixtureOmittedSkySphere"));
+    Sky->GetStaticMeshComponent()->SetMobility(EComponentMobility::Movable);
+    Sky->GetStaticMeshComponent()->SetStaticMesh(SphereMesh);
+    Sky->GetStaticMeshComponent()->SetMaterial(0, SkyMaterial);
+    Sky->SetActorLocation(FVector(0.0, 0.0, 500.0));
+    Sky->SetActorScale3D(FVector(10.0));
 
     ADirectionalLight* DirectionalLight = World->SpawnActor<ADirectionalLight>();
     APointLight* PointLight = World->SpawnActor<APointLight>();

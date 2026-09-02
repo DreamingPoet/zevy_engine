@@ -1,151 +1,155 @@
-# 当前任务检查点：Map_S03B XR 双手动态阴影验证夹具
+# 当前任务检查点：P3 Reduced-Rate Local Lighting substrate（Map_S02VR hotfix 已完成）
 
 ## 元数据
 
-- 更新时间：2026-07-24 13:02，Asia/Shanghai
-- 状态：XR hand harness、运行时 profile 修正和左手调试盒隐藏已实现；63 项 Rust 测试通过；profile/grip 已在上一版 APK 真机验证，最新隐藏改动尚未重新安装验收
+- 更新时间：2026-08-13 16:03，Asia/Shanghai
+- 状态：P3 进行中；Map_S02VR UE 导出 hotfix 已完成并通过 PC/runtime 验证
 - 工作区：`G:\zevy_engine`
-- 分支 / HEAD：阶段基线为 `main @ 4d743fb665d5bd3440e49c48e150afebb281bc6a`；本检查点随阶段提交，恢复时以实际 `git rev-parse HEAD` 为准
-- 本阶段历史快照：`Docs/Checkpoints/2026-07-24-xr-hand-shadow-harness-complete.md`
-- Profile 修正快照：`Docs/Checkpoints/2026-07-24-pico4s-runtime-binding-correction.md`
-- 失败前状态快照：`Docs/Checkpoints/2026-07-24-map-s03b-xr-hand-shadow-harness.md`
-- 上一阶段：`Docs/Checkpoints/2026-07-23-shadow-motion-policy-p1.md`
-- 下一恢复入口：本文件
+- 分支 / HEAD：`main @ 0aa98d12f554ef8e92323b4b3b962641797b5087`
+- 上一阶段：`Docs/Checkpoints/2026-07-24-shadow-motion-lab-pico-cost-decomposition.md`
+- 当前设计：`Docs/Design/Reduced_Rate_Local_Lighting.md`
+- 最新已完成阶段：`Docs/Checkpoints/2026-08-13-ue-gltf-sky-material-crash-hotfix.md`
 
-## 最终目标和完成标准
+## 当前紧急任务：Map_S02VR UE 5.5 glTF 导出崩溃
 
-最终目标仍是建立面向 VR 一体机的、高性能、现代、支持大量动态灯光与动态阴影的 Zevy renderer。本阶段用真实 XR 手柄运动为通用 `LightShadowMotionPolicy` / `ShadowCasterMotionPolicy` 增加可观察的 Map_S03B 测试夹具，不把 Map 名称、坐标或固定灯数写进 renderer 算法。
+- 最终目标：在不引入 Map/Actor/固定坐标特判、不静默降质的前提下，让 `Map_S02VR.umap` 可重复导出为 Zevy split manifest，并把无法直接移植的 UE sky 语义显式记录。
+- 完成标准：插件编译通过；正常 SM6 commandlet 完整退出；70 个非天空资产及 1299 个实体写入清单；所有资产引用存在；清单记录 1 个 omitted sky Actor/component 和具体诊断；不得改动安装在 `F:` 的 UE 引擎。
+- [PC 事实] 两次 Editor 导出均在 `SM_S02VR_Ground_A` 成功后的下一资产崩溃，RHI breadcrumb 为 `DrawTileMesh -> CanvasFlush -> FRDGBuilder::Execute`，缺少 `VirtualShadowMap` static UB；失败输出中的下一目录为无内容的 `SM_SkySphere_0e3ddf6d`。
+- [PC 事实] UE 5.5.4 源码显示 glTF `MaterialBaking` 调用 `FRendererModule::DrawTileMesh`，该 RDG pass 未声明 `VirtualShadowMap` UB；`M_SimpleSkyDome` 为触发材质。强制 `-FeatureLevelES31` 在首个普通材质以另一 missing UB 同路径崩溃，已证伪“切低 feature level/关 VSM”方案。
+- [实现，未提交] `ZevyLevelExporterModule.cpp` 按 `UMaterial::bIsSky` 通用识别 sky-material component；纯 sky Actor 不进入 split 资产表；混合 Actor/LevelInstance 导出时临时隐藏相关 component 并恢复；monolithic 路径同样过滤；导出前记录资产/Actor；manifest 新增 omitted sky 计数和 warning。`-GenerateFixture` 已加入 transient sky sphere 回归夹具，`README.md` 已记录语义限制。
+- [PC 已验证] 插件编译；独立与正式 Map_S02VR SM6 导出均 exit 0；正式结果为 70 assets、1299 entities、omitted sky 1/1、1 warning/0 error、0 missing scene/URI。Zevy validator 加载 70 assets 并实例化 1299/1299 scenes，hierarchy/local transforms `ok`。split 与 monolithic 独立 fixture 都验证 sky omission；详见最新历史快照。
+- 当前 hotfix 文件：`M ZevyLevelExporterModule.cpp`、`M ZevyLevelExportCommandlet.cpp`、`M README.md`、本检查点和新历史快照；其余 P2/P3 工作树修改均为既有用户/连续阶段状态，禁止覆盖、回退或混入 hotfix 判断。正式 Map_S02VR 产物和插件 DLL 均被 `.gitignore` 忽略。
+- hotfix 无剩余必做步骤。唯一下一步恢复为 P3：设备恢复后重建并安装最新 profiling APK，取得 capability 矩阵和 Forward/Deferred 真机成本，再写 ReducedRate render node。
 
-本阶段完成标准：
+## 最终目标和当前阶段完成标准
 
-1. 左手位置有效时生成并跟随一个固定 `DynamicOverlay` 球；失去位置追踪后立即移除。
-2. 右手位置和方向都有效时生成并跟随一个固定 `FullyDynamic` 有阴影射灯；任一追踪无效后立即移除。
-3. 两个对象继承 `XrTrackingRoot`，因此共享 Map_S03B 的 XR 起点与玩家移动。
-4. 动态球进入缓存点光源的动态层以及射灯/方向光的原生实时阴影，不污染持久化点光源静态层。
-5. 通过 Rust 全量测试、Android arm64 检查和 APK 构建；PICO 上的追踪方向、阴影、双眼一致和性能必须明确留待真机裁决。
+最终目标仍是建立面向 VR 一体机的、高性能、现代、支持大量动态灯光与动态阴影的 Zevy renderer。当前真机证据表明，仅压低每片元灯样本 $K$ 不足以达到 72 Hz；P3 必须建立能压低昂贵光照片元数 $P$ 的可回退架构。
 
-成本模型：阴影射灯只有一个 shadow frustum，近似为
+当前阶段完成标准：
+
+1. ForwardReference 保持默认和画质 fallback，不改变灯 range、residency、双眼状态或 motion policy。
+2. 建立同一 StandardMaterial/灯光/阴影 shader 的 full-resolution DeferredReference，并在 PC/Pico 验证正确性与成本。
+3. 明确区分 OpenXR runtime available、app enabled、swapchain 实际 FDM 和 PICO system policy；能力探针不得写持久属性。
+4. 在 Deferred substrate 上实现首个 half/quarter-rate local direct-light buffer 与可视化 raw 输出，证明实际执行量约随 $rP$ 缩放。
+5. 加 depth/normal/material-ID edge-aware reconstruction；转头、灯交界、阴影边缘、薄几何和运动 caster 不得出现块状亮度、漏光、漂浮或左右眼不一致。
+6. Pico 同条件 A/B 的 GPU P95 至少优于 ForwardReference 25%，否则触发 kill criterion，改走 tile-local/subpass、quad/subgroup 或 backend FDM。
+
+成本模型：
 
 \[
-C_{spot}\approx O(S+D),
+C_{reduced}\approx PC_{gbuffer}+rPK(C_{BRDF}+C_{visibility})+PC_{reconstruct}+C_{attachment}+C_{fixed}.
 \]
-
-而同等 FullyDynamic PointLight cubemap 近似为 \(O(6(S+D))\)。左手球作为动态 overlay 只向可见点光源 face 提交自身几何，静态场景不会因此每帧重画；主画面的逐片元射灯成本仍需在 PICO GPU 上测量。
 
 ## 已完成内容
 
-### [实现] XR 追踪与生命周期
+### [上一阶段，已实现/Android-VR 验证，未提交]
 
-- `xr.rs` 使用现有 `bevy_mod_openxr`、`bevy_mod_xr` 和 `bevy_xr_utils`，没有引入新 XR 插件。
-- 为左右 grip pose 创建直接 OpenXR Action Space，并暴露 `XrSpaceLocationFlags`，避免把失去追踪后的旧 Transform 当成有效手位。
-- Action Space 带 `XrTracker`，由现有关系钩子自动成为 `XrTrackingRoot` 子级。
-- 纠正 interaction profile 策略：目标 PICO 4 Ultra Enterprise Runtime 2.2.0 通过 `xrGetCurrentInteractionProfile` 实际激活 `/interaction_profiles/bytedance/pico4s_controller`。输入动作恢复 Oculus Touch、Valve Index、`pico4s_controller` 的原有列表；grip pose 同时建议 Oculus Touch fallback 与运行时已验证的 `pico4s_controller`。
-- OpenXR 1.1 注册表中的 `/interaction_profiles/bytedance/pico4_controller` 与 `pico_neo3_controller` 不能在当前 OpenXR 1.0 会话中无条件替换运行时活动路径。未来只有在 API/扩展能力协商成功后才启用这些 promoted profile。
-- vendored `bevy_mod_openxr` 的绑定错误现在记录具体 interaction profile，避免把一个非致命 fallback 失败误判为所有手柄绑定失败。
-- XR session 销毁前清理 Zevy anchor；头/手调试几何标记为 `NotShadowCaster` / `NotShadowReceiver`，不会意外进入动态阴影成本。
+- P2 sparse SlowMoving cross-fade、DynamicOverlay、ShadowMotionLab 16/32/64 与四档/K 下界成本分解。
+- 16 灯 full GPU 约 52.07 ms；固定 4/2/1 个完整 shadowed samples 后约 51.55/41.36/31.49 ms，证实必须同时攻击 $K$ 与 $P$。
+- `scripts/profile_shadow_motion_lab.ps1` 已支持 repeatable cold-start profile。
+- 默认 XR hand debug gizmo 已移除。
 
-### [实现] Map_S03B 测试夹具
+### [本阶段已实现]
 
-- 新增 `scene/map_s03b_xr_hand_test.rs`，只负责生成测试内容，不修改导入 Level 数据，也不实现 renderer 特例。
-- 左手：半径 `0.04 m` 的蓝色 PBR 球，固定 `ShadowCasterMotionPolicy::DynamicOverlay`，作为左 grip anchor 子实体。
-- 左 grip anchor 现在是不可见的纯 Action Space/追踪父节点，不再携带调试 `Mesh3d` / `MeshMaterial3d`；没有使用会连带隐藏子球的 `Visibility::Hidden`。右 grip 调试盒暂时保留。
-- 右手：暖白 `SpotLight`，`120,000 lm`、`20 m` range、内角 `16°`、外角 `28°`、开启阴影，固定 `LightShadowMotionPolicy::FullyDynamic`，作为右 grip anchor 子实体。
-- 射灯沿 Bevy local `-Z`，当前使用 grip pose；若真机握持方向不自然，应新增独立 OpenXR aim pose，禁止使用设备专属欧拉角补丁。
-- 离开 Map_S03B、追踪丢失、anchor 变化或 XR session 结束时都会清理对应运行时实体。
+- 新增公开 `LocalLightingPipeline::{Forward, DeferredReference}` 与 `RenderQualityConfig.local_lighting_pipeline`；默认仍为 Forward。
+- DeferredReference 自动切换 Bevy default opaque renderer、给 3D camera 增加 G-buffer prepass，并显式使用有效 MSAA 1x。
+- 用 `ZevyDeferredLightingCamera` 记录 camera 之前的 prepass 状态；切回 Forward 只撤销 Zevy 自己添加的组件。
+- profiling-only Android property `debug.zevy.local_lighting=forward|deferred`，HUD 显示实际 pipeline；Shipping 不读取该 override。
+- profiler script 新增 `-LightingPipeline forward|deferred`。
+- vendored Bevy deferred fullscreen position 增加 `@invariant`，消除 Equal depth comparison 的跨 GPU 精度风险。
+- vendored OpenXR 新增独立 `OxrAvailableExtensions` resource，不再把 advertised 与 enabled 混为一谈。
+- 新增只读 Android foveation capability log：FB swapchain/foveation/config/vulkan、META eye-tracked 的 available/enabled 矩阵，以及 vendor-opaque PICO property；不写系统属性，不启用新扩展。
+- 新增 `Docs/Design/Reduced_Rate_Local_Lighting.md`，记录数学模型、重建约束、实验顺序和 kill criteria。
 
-### [实现] 通用 SpotLight 与动态 caster 阴影路径
+### [PC 已验证]
 
-- `shadow_motion_policy.rs` 支持 SpotLight policy。P1 尚无 spot cache，因此非 FullyDynamic 类会显式提升到真实单 frustum FullyDynamic，且不会错误挂载 PointLight cache/jitter 组件。
-- 修复 dynamic caster 全局遮罩过宽的问题：缓存点光源继续使用 static + dynamic cubemap 双层；SpotLight 和 DirectionalLight 则在静态队列后重新加入动态 caster 的原生阴影 phase。
-- vendor `bevy_pbr::queue_shadows` 先检查当前 `SHADOW_CASTER` 标志，再验证旧 phase cache，避免实体从 Static 迁移到 DynamicOverlay 后旧投影永久残留在静态层。
-- 新增回归测试确认 Spot/Directional 会重入、Point static view 不会重入。
+- 临时将默认切到 DeferredReference，实际运行 `shadow-motion-16` 两次并恢复 Forward。
+- 16 灯、96 resident shadow views、4 DynamicOverlay caster、4/4 SlowMoving transitions 正常；截图：`target/shadow_motion_lab/pc_16_deferred_invariant.png`。
+- shader/runtime 无 panic/wgpu validation failure；修复后不再出现 fullscreen position invariant warning。
+- 画面、点灯和阴影结构正常；该截图只证明正确性，不代表真机性能。
+
+### [Android 状态]
+
+- foveation 探针版 release profiling APK 已完成构建、4K alignment 和签名。
+- 安装尝试失败：ADB 找不到 `PA9410MGJ9260457G`；已立即通知用户，未自行排查设备。
+- 该 APK 构建发生在 DeferredReference 最终代码之前；设备恢复后必须重建最新 APK，不能把旧包当 P3 验证包。
+- 旧只读日志曾看到 `persist.pvr.foveation.level=12` 和 system event level 12；这不是 Zevy swapchain 使用 FDM 的证明。
 
 ## 当前文件和修改状态
 
-本阶段开始时工作区 clean，基线为上述 HEAD。以下功能与文档改动组成当前阶段提交：
-
-```text
- M zevy_engine/src/app.rs
- M zevy_engine/src/scene.rs
- M zevy_engine/src/shadow_motion_policy.rs
- M zevy_engine/src/shadow_overlay.rs
- M zevy_engine/src/xr.rs
- M zevy_engine/third_party/crates/bevy_mod_openxr-0.3.0/src/openxr/action_binding.rs
- M zevy_engine/third_party/crates/bevy_pbr-0.16.1/src/render/light.rs
-?? zevy_engine/src/scene/map_s03b_xr_hand_test.rs
- M Docs/Checkpoints/CURRENT.md
-?? Docs/Checkpoints/2026-07-24-map-s03b-xr-hand-shadow-harness.md
-?? Docs/Checkpoints/2026-07-24-pico4s-runtime-binding-correction.md
-?? Docs/Checkpoints/2026-07-24-xr-hand-shadow-harness-complete.md
- M zevy_engine/docs/VR_Renderring.md
-```
-
-另有用户独立调参 `M zevy_engine/src/config.rs`：`xr_render_scale 0.8 -> 1.0`，明确排除在本次功能提交之外并保留在工作区。`target/release/apk/zevy_engine.apk` 是 ignored 构建产物，不进入提交。
+- 当前分支 `main`，HEAD 未变化；无 staged 文件，无本阶段 commit。
+- 工作树同时包含 P2、ShadowMotionLab 和 P3 的连续未提交修改，不得拆错、覆盖或回退。
+- P3 新增/修改重点：
+  - `Docs/Design/Reduced_Rate_Local_Lighting.md`
+  - `Docs/Design/Shadow_Motion_Lab.md`
+  - `Docs/render_debug.md`
+  - `zevy_engine/docs/VR_Renderring.md`
+  - `zevy_engine/src/config.rs`
+  - `zevy_engine/src/app.rs`
+  - `zevy_engine/src/lib.rs`
+  - `zevy_engine/src/platform.rs`
+  - `zevy_engine/src/render_debug.rs`
+  - `zevy_engine/scripts/profile_shadow_motion_lab.ps1`
+  - `zevy_engine/third_party/crates/bevy_mod_openxr-0.3.0/src/openxr/{exts,init}.rs`
+  - `zevy_engine/third_party/crates/bevy_pbr-0.16.1/src/deferred/deferred_lighting.wgsl`
+- `zevy_engine/src/config.rs` 的 `xr_render_scale: 1.0` 是用户明确保留的配置；当前 `local_lighting_pipeline` 已恢复为 `Forward`。
+- ignored 工件：`target/shadow_motion_lab/*.png` 与 `target/release/apk/zevy_engine.apk`。
 
 ## 关键决定、产品不变量和禁止事项
 
-- Map_S03B 只是 harness；追踪有效性、SpotLight policy 和 shadow phase 修复均为通用机制。
-- `DynamicOverlay` 球和 `FullyDynamic` 射灯使用 fixed/manual policy，手停止时也不能自动降级。
-- 灯光照射 `range` 与相机可见性继续分离；不得为解决可见性或阴影剔除问题扩大手电筒 range。
-- 左右眼共享主世界手柄 pose、policy、灯和 caster 实体；禁止 per-eye 分类或随机状态。
-- 失去追踪时移除对象，不得继续使用 stale pose。
-- 射灯使用单 frustum 是结构性成本优势，但不能把理论成本写成 PICO 实测收益。
-- 若 grip 朝向不符合手电筒语义，下一步使用 OpenXR `/input/aim/pose`；不得写只对当前 PICO 有效的旋转常量。
-- 规范注册表只描述可用标准，不代表目标 runtime 已经支持、启用或激活对应 profile。interaction profile 必须由 API 版本、扩展枚举/启用与 `xrGetCurrentInteractionProfile` 的实机证据裁决。
-- `pico4s_controller` 是当前目标运行时的产品事实，不得再次仅因 OpenXR 1.1 注册表命名而删除。Oculus/其他 profile 的 `XR_ERROR_PATH_UNSUPPORTED` 必须保持非致命，不能阻止后续已支持 profile 的建议绑定。
-- 不引入第二套 XR 插件，不改 VR Camera/XR 起点，不改变导入器格式。
+- DeferredReference 是 substrate/cost reference，不是 reduced-rate 优化结果，不得写成已提升性能。
+- 不统一降低 render scale 代替局部光照结构优化；目标是只降低昂贵 local-light work 的空间采样率。
+- raw 2×2/4×4、screen supercluster 或 world-reservoir block 不得直接输出到双眼；必须 edge-aware reconstruct，并保留低置信度 full-rate fallback。
+- 两眼共享灯 ID、shadow residency、随机 epoch、质量环和历史调度；每眼使用自己的 depth/world position/radiance。
+- runtime advertised extension、instance enabled extension、Vulkan device feature、swapchain FDM attachment和 vendor FFR 策略必须分开记录。
+- 不写 `persist.pvr.foveation.level`；若最终需要修改设备持久策略，必须先获得明确授权并建立恢复值。
+- Map_S03B/ShadowMotionLab 只作为 fixture；产品路径不查询 Level/Actor 名称。
+- 灯物理 range 与相机可见/驻留分离，不按相机距离突然关闭灯/影。
+- 未经用户明确要求不提交。设备安装失败立即通知用户，设备可用性由用户处理。
 
 ## 测试结果
 
-### 已执行并通过
+### 已执行
 
-- `cargo fmt`
-- `cargo test --lib`：63 passed，0 failed。
-- 新增 3 项手柄夹具测试：正确父级与 fixed policy、tracking loss 清理、方向有效性与 Map scope。
-- 新增 SpotLight policy 测试和动态 caster 非 Point shadow 重入测试。
-- `cargo check --target aarch64-linux-android --message-format=short`。
-- `cargo check --no-default-features --target aarch64-linux-android --message-format=short`：Shipping feature 组合通过。
-- release + `render_debug` APK：编译、打包、4K alignment 和 debug keystore v3 签名验证通过。
-- 修正后最终 APK：`G:\zevy_engine\zevy_engine\target\release\apk\zevy_engine.apk`，737,278,005 bytes，2026-07-24 11:17:44。
-- APK SHA-256：`E4AD277D86C73407F36E366065F1BA2460D305086CED91BBB42BB13A14A59157`；APK v3 签名验证通过。
-- ADB 设备 `PA9410MGJ9260457G` 在线；`adb install -r` 完成 incremental/streamed install，结果 `Success`。
-- 冷启动成功，进程 PID `9217`，OpenXR session 进入 `FOCUSED`，Map_S03B 加载完成，无 panic、fatal shader error 或 Vulkan validation fatal。
-- Runtime 日志确认设备为 PICO 4 Ultra Enterprise、Runtime 2.2.0，活动 profile 为 `/interaction_profiles/bytedance/pico4s_controller`。
-- 左右 grip 都获得有效 tracking flags：日志确认生成左手 fixed `DynamicOverlay` 球和右手 fixed `FullyDynamic` shadowed SpotLight。
-- 新增错误诊断确认当前运行时拒绝的是 Oculus Touch fallback：`Suggested path unsupported for interaction profile '/interaction_profiles/oculus/touch_controller'`；该错误非致命，后续 `pico4s_controller` 建议绑定和 action sync 正常工作。
-- 左手调试盒隐藏后重新执行 `cargo fmt` 与 `cargo test --lib`：63 passed，0 failed。
-
-唯一编译 warning 是既有 `bevy_mod_openxr` 的 elided lifetime 提示，与本阶段逻辑无关。
+- `cargo fmt --all -- --check`：最终工作树通过。
+- `cargo test --lib`：75/75 通过；包含 Deferred camera prepass 状态恢复测试。
+- `cargo check --target aarch64-linux-android`：通过。
+- `cargo check --no-default-features --target aarch64-linux-android`：最终工作树通过，无 Zevy 新 warning。
+- `scripts/profile_shadow_motion_lab.ps1`：PowerShell parser 通过。
+- PC DeferredReference 两次实际启动/截图：通过；第二次确认 `@invariant` warning 消失。
+- foveation probe profiling APK：构建、alignment、签名通过；安装失败（设备未找到），未做 Android runtime 验证。
+- 既有无关警告：vendored `bevy_mod_openxr` mismatched lifetime syntax；Cargo bin/lib PDB filename collision。
 
 ### 未执行
 
-- 用户按键验收：右手 A/B、摇杆、扳机等动作必须实际按下确认；自动冷启动无法代替物理输入。
-- PICO 佩戴视觉验证：左球位置/跟手、右灯握持方向、墙地面实时阴影、tracking loss 清理、左右眼一致。
-- 最新“左 grip anchor 不渲染”源码尚未完成可确认的 APK 构建/安装；被用户中断的构建等待不能记为已通过。上一版已安装 APK 仍可能显示左调试盒。
-- GPU P50/P95/P99、额外 SpotLight shadow pass 成本和 thermal soak。
-- 第二独立场景或合成 XR hand fixture；Map_S03B 结果不能决定全局默认值。
+- 最新 P3 源码的 release APK 重建、安装。
+- Pico capability log、Forward vs Deferred 四档 A/B、左右眼视觉与 GPU P95。
+- ReducedRateDeferred pass/reconstruction（尚未实现）。
+- GPU capture、误差图、固定相机路径和 thermal soak。
+
+### 设备残留风险
+
+设备断开前 profiling properties 不是默认值；最后运行过 direct-only/K=1 实验。设备恢复后必须先显式设置本次所需矩阵，阶段结束再清空 `debug.zevy.level`、`hud_page`、`point_direct`、`point_shadows`、`local_lighting`、`exact_lights`、`world_reservoir`、`cluster_preselection`、`hero_samples`、`tail_samples`。
 
 ## 未完成步骤、风险和唯一下一步
 
-1. 从本阶段提交重新生成 APK 并安装，确认左手只显示 4 cm 球、不再显示 grip 调试盒。
-2. 用户佩戴设备并验证 A/B、摇杆、扳机等按键已恢复，左球跟手、右手电筒存在且方向自然。
-3. 验证左球在墙/地面投射连续动态阴影、tracking loss 无旧灯/旧影、左右眼一致。
-4. 若只有光束方向不符合握持语义，建立独立 right aim Action Space 后重测；禁止靠 PICO 专属旋转常量修图。
-5. 视觉正确后记录新增 SpotLight 的 GPU 成本，再决定是否需要 spot shadow cache、分辨率/更新预算或 flashlight priority。
-6. 后续把 profile 选择演进为 API 版本/扩展能力协商；OpenXR 1.1 promoted PICO profile 只能在 runtime 明确支持后进入建议绑定集合。
+1. 设备恢复后重建最新 profiling APK；安装失败立即通知用户。
+2. 冷启动读取 foveation available/enabled/system-policy 三层日志，不能仅依据 property 12 下结论。
+3. 使用同一最新 APK、16 灯、相同频率/热状态分别测 Forward/Deferred 的 geometry/direct/shadow/full。
+4. 根据 Deferred 固定成本决定 ReducedRate pass 是基于普通 texture + bilateral composite，还是直接 fork tile-local/subpass/backend FDM。
+5. 实现 quarter-rate diffuse local-light raw buffer，先证明 $rP$，再加入重建。
 
-唯一明确的下一步：**提交后从新 HEAD 生成并安装 APK，先确认左手调试盒消失且 4 cm DynamicOverlay 球仍可见/投影，再继续按键与手电筒 aim 验收。**
+唯一明确下一步：**完成最终 clean checks；设备恢复后重建并安装最新 APK，先取得 capability 矩阵和 Forward/Deferred 真机成本，再写 ReducedRate render node。**
 
 ## 恢复时首先读取
 
 1. `G:\zevy_engine\AGENTS.md`
 2. `G:\zevy_engine\Docs\Checkpoints\CURRENT.md`
-3. `G:\zevy_engine\Docs\Design\Shadow_Motion_Policies.md`
-4. `G:\zevy_engine\zevy_engine\src\scene\map_s03b_xr_hand_test.rs`
-5. `G:\zevy_engine\zevy_engine\src\xr.rs`
-6. `G:\zevy_engine\zevy_engine\src\input.rs`
-7. `G:\zevy_engine\zevy_engine\src\shadow_motion_policy.rs`
-8. `G:\zevy_engine\zevy_engine\src\shadow_overlay.rs`
-9. `G:\zevy_engine\zevy_engine\third_party\crates\bevy_mod_openxr-0.3.0\src\openxr\action_binding.rs`
-10. `G:\zevy_engine\zevy_engine\third_party\crates\bevy_pbr-0.16.1\src\render\light.rs`
-11. 实际 `git status --short`、branch/HEAD、最新测试与 ADB 状态
+3. `G:\zevy_engine\Docs\Design\Reduced_Rate_Local_Lighting.md`
+4. `G:\zevy_engine\Docs\Design\Shadow_Motion_Lab.md`
+5. `G:\zevy_engine\zevy_engine\src\config.rs`
+6. `G:\zevy_engine\zevy_engine\src\app.rs`
+7. `G:\zevy_engine\zevy_engine\src\platform.rs`
+8. `G:\zevy_engine\zevy_engine\third_party\crates\bevy_mod_openxr-0.3.0\src\openxr\{exts,init}.rs`
+9. `G:\zevy_engine\zevy_engine\third_party\crates\bevy_pbr-0.16.1\src\deferred\deferred_lighting.wgsl`
+10. 实际 branch/HEAD、`git status --short`、`git diff --check` 与最新测试输出。

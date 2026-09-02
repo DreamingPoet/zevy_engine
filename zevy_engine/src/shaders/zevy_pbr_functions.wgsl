@@ -73,6 +73,7 @@ const ZEVY_POINT_LIGHT_EXACT_THRESHOLD: u32 = 8u;
 const ZEVY_TEMPORAL_LIGHT_SAMPLING: bool = false;
 const ZEVY_LIGHT_SAMPLE_PERIOD_FRAMES: u32 = 4u;
 const ZEVY_DYNAMIC_SHADOW_OVERLAY: bool = true;
+const ZEVY_SLOW_MOVING_SHADOW_CROSSFADE: bool = true;
 const ZEVY_POINT_LIGHT_DIRECT_LIGHTING: bool = true;
 const ZEVY_CLUSTERED_LIGHT_PRESELECTION: bool = true;
 const ZEVY_WORLD_SPACE_LIGHT_RESERVOIR: bool = true;
@@ -156,15 +157,11 @@ fn zevy_point_shadow_map_jitter(flags: u32) -> vec3<f32> {
 fn zevy_fetch_point_shadow_cube(
     light_id: u32,
     cube_index: u32,
+    shadow_sample_origin: vec3<f32>,
     world_position: vec4<f32>,
     world_normal: vec3<f32>,
 ) -> f32 {
     let light = &view_bindings::clusterable_objects.data[light_id];
-    // The cubemap remains rendered at position_radius.xyz. For sub-centimeter
-    // candle motion, sample it from a continuously moving virtual origin. The
-    // bounded reprojection error replaces six real depth redraws per update.
-    let shadow_sample_origin = (*light).position_radius.xyz +
-        zevy_point_shadow_map_jitter((*light).flags);
     let surface_to_light = shadow_sample_origin - world_position.xyz;
     let surface_to_light_abs = abs(surface_to_light);
     let distance_to_light = max(
@@ -207,30 +204,63 @@ fn zevy_fetch_point_shadow_combined(
     world_position: vec4<f32>,
     world_normal: vec3<f32>,
 ) -> f32 {
-    let static_visibility = zevy_fetch_point_shadow_cube(
-        light_id, light_id, world_position, world_normal
+    let light = &view_bindings::clusterable_objects.data[light_id];
+    // The resident static cubemap may intentionally lag the physical light.
+    // Bounded micro motion adds its tiny virtual offset on top; SlowMoving
+    // lights instead provide an exact keyframe position here.
+    let current_static_origin = (*light).shadow_map_position_blend.xyz +
+        zevy_point_shadow_map_jitter((*light).flags);
+    var static_visibility = zevy_fetch_point_shadow_cube(
+        light_id, light_id, current_static_origin, world_position, world_normal
     );
 #ifdef NO_CUBE_ARRAY_TEXTURES_SUPPORT
     return static_visibility;
 #else
-    if (!ZEVY_DYNAMIC_SHADOW_OVERLAY) {
-        return static_visibility;
-    }
     let total_cubes = textureNumLayers(view_bindings::point_shadow_textures);
-    // Even cube counts are static-only. A live overlay uses 2*N+1 cubes: N
-    // static, N dynamic, and one sentinel cube that makes runtime detection
-    // possible without adding another view uniform or bind group.
-    if ((total_cubes & 1u) == 0u) {
-        return static_visibility;
+    let static_cube_count = (*light).shadow_map_cube_count;
+    let dual_atlas_cube_count = static_cube_count * 2u;
+    let has_dual_atlas = static_cube_count > 0u &&
+        total_cubes >= dual_atlas_cube_count;
+
+    if (ZEVY_SLOW_MOVING_SHADOW_CROSSFADE && has_dual_atlas) {
+        let transition_slot_plus_one = u32(max(
+            (*light).previous_shadow_map_position_slot.w,
+            0.0
+        ));
+        let transition_pool_size = total_cubes - dual_atlas_cube_count;
+        if (transition_slot_plus_one > 0u) {
+            let transition_slot = transition_slot_plus_one - 1u;
+            if (transition_slot < transition_pool_size) {
+                let previous_visibility = zevy_fetch_point_shadow_cube(
+                    light_id,
+                    dual_atlas_cube_count + transition_slot,
+                    (*light).previous_shadow_map_position_slot.xyz,
+                    world_position,
+                    world_normal
+                );
+                let blend = smoothstep(
+                    0.0,
+                    1.0,
+                    clamp((*light).shadow_map_position_blend.w, 0.0, 1.0)
+                );
+                static_visibility = mix(previous_visibility, static_visibility, blend);
+            }
+        }
     }
-    let dynamic_cube_offset = (total_cubes - 1u) / 2u;
-    let dynamic_visibility = zevy_fetch_point_shadow_cube(
-        light_id,
-        light_id + dynamic_cube_offset,
-        world_position,
-        world_normal
-    );
-    return static_visibility * dynamic_visibility;
+
+    if (ZEVY_DYNAMIC_SHADOW_OVERLAY && has_dual_atlas) {
+        // Dynamic caster depth is rendered every frame from the physical light
+        // transform, independently of the static snapshot timeline.
+        let dynamic_visibility = zevy_fetch_point_shadow_cube(
+            light_id,
+            light_id + static_cube_count,
+            (*light).position_radius.xyz,
+            world_position,
+            world_normal
+        );
+        return static_visibility * dynamic_visibility;
+    }
+    return static_visibility;
 #endif
 }
 

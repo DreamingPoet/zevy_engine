@@ -1371,7 +1371,7 @@ C_{tail\ shade}\approx C_{2T}-C_{1T}=1.46\text{ ms/sample}
 为蜡烛类小幅运动引入三档投影策略：
 
 1. **`ContinuousProxy`（已实现、移动端默认候选）**：静态深度固定在 nominal light origin；强度和 emissive 每帧变化，真实 PointLight transform/range 固定；shadow shader 使用不超过数毫米的虚拟 origin 连续重投影持久化 cubemap。视觉投影连续，但不使静态 cubemap 失效。
-2. **`KeyframedCrossFade`（仅设计、质量档）**：保存前后两个低频阴影快照与各自 light transform，在两次真实更新之间采样 `V0`、`V1` 并连续混合。它用额外 atlas/一次 shadow compare 换取时间连续性，需评估双影和漏光。
+2. **`KeyframedCrossFade`（P2 已实现、待移动端裁决）**：保存前后两个低频阴影快照与各自 light transform，在两次真实更新之间采样 `V0`、`V1` 并连续混合。它用稀疏旧快照 atlas/过渡片元的一次额外 shadow compare 换取时间连续性，仍需在 PICO 评估双影、漏光和片元成本。
 3. **`TrueMovingShadow`（已保留参考路径）**：真实移动 light projection 并按频率/灯数预算重画，作为正确性参考和关键交互灯路径。
 
 动态 caster overlay 继续独立更新，不因静态火光代理而被冻结。当前 Map_S03B 为 16 盏 Movable 蜡烛 + 2 盏 Static 灯，因此静态层目标更新为稳定场景 `0 redraw / 108 reuse`；阴影仍需在实机确认具有连续火光感且没有漏光，Hero 真动态灯仍应保持几何正确。
@@ -1408,7 +1408,7 @@ C_{tail\ shade}\approx C_{2T}-C_{1T}=1.46\text{ ms/sample}
 
 - `Static`：持久静态 cache，无虚拟偏移；
 - `BoundedMicroMotion`：持久 cache + `PointLightShadowMapJitter`；
-- `SlowMoving`：cache-on-dirty，真实 transform/range 改变会重画；
+- `SlowMoving`：P1 为 cache-on-dirty；P2 已升级为低频真实快照 + 稀疏旧 cubemap shadow-term cross-fade；
 - `FullyDynamic`：退出持久 cache，保留真实 moving-light redraw。
 
 自动灯每帧以 (O(L)) 测量世界线速度和 range 变化率的指数平滑值。向更动态类别立即升级；降级必须让同一低成本候选连续满足 `settle_seconds`，防止阈值附近抖动。导入灯以低成本静态假设启动，实际发生运动后立即升级；运行时未知灯 correctness-first 地从全动态启动。真实 Transform 的小幅位移不会被偷偷解释为旧 cubemap 的虚拟偏移，微动类别必须有明确的 jitter motion signal。
@@ -1421,7 +1421,27 @@ Caster 路径为 `Static` 或 `DynamicOverlay`。自动模式测量 root 的世�
 
 [Android 构建] `cargo check --target aarch64-linux-android` 与 release/render-debug APK 构建、4K 对齐、签名均通过。设备在线，但 ADB incremental install 在读取 APK 时返回 `Bad file descriptor`，因此本版尚未安装、冷启动或完成 Android/VR 视觉验证。
 
-[P1 边界] `SlowMoving` 目前只是 cache-on-dirty；连续慢移仍可能频繁重画，并不等于双快照无阶梯重建。尚未实现 KeyframedCrossFade、priority/stale-time/GPU-ms 调度、局部 face/page invalidation、UE 可编辑 policy schema，以及第二独立场景的 16→32→64 斜率实验。完整状态、公式与 kill criterion 见 [`Shadow_Motion_Policies.md`](../../Docs/Design/Shadow_Motion_Policies.md)。
+[P1 历史边界] P1 的 `SlowMoving` 只是 cache-on-dirty；该限制已由下述 P2 双快照替换。priority/stale-time/GPU-ms 调度、局部 face/page invalidation、UE 可编辑 policy schema，以及第二独立场景的 16→32→64 斜率实验仍未实现。完整状态、公式与 kill criterion 见 [`Shadow_Motion_Policies.md`](../../Docs/Design/Shadow_Motion_Policies.md)。
+
+#### 20.3.3 已实现：SlowMoving 稀疏双快照 P2（2026-07-24）
+
+P2 把物理灯位、当前静态阴影快照位和旧快照位拆成三个语义。直接光照与 dynamic caster overlay 继续跟随真实 PointLight；静态 shadow term 在 8 Hz/4 cm 默认关键帧触发条件下重画，并在默认 0.12 秒内用 `smoothstep` 混合旧/新 visibility。非过渡灯没有第二次静态 shadow sample。
+
+atlas 从“为每灯复制第三份 cube”改成固定小容量稀疏池：
+
+\[
+K_{eff}=\min\left(K_{config},\max\left(0,\left\lfloor A/6\right\rfloor-2N\right)\right),
+\]
+
+其中 (A) 是设备 array-layer 上限，(N) 是当前 shadowed PointLight 数。布局为 `N static + N dynamic + K_eff previous`。128² D32 的一个 cube 约 0.375 MiB，4 槽约 1.5 MiB。当前 Map_S03B 加通用飞行测试灯后有 20 个 shadowed PointLight；256-layer 设备只能提供 2 槽，RenderWorld 会把该有效容量反馈给主世界 scheduler，不能让配置的 4 槽越界或长期占用无效 slot。
+
+候选按 world-space stale error 降序、Entity 稳定 tie-break 取槽；槽满时保持旧快照排队。左右眼共享主世界 snapshot/slot/blend；RenderGraph 的 cubemap copy 使用跨眼 atomic claim，避免第二眼把旧 cube 覆盖成新 cube。动态 caster 仍乘到重建后的静态 visibility 上，并从真实灯位投影。
+
+为传输两个 snapshot origin、blend、slot 和 shadow cube count，Zevy `GpuClusterableObject` 从 80 bytes 扩展到 112 bytes，16 KiB uniform fallback 从 204 调整为 146 个对象。该容量高于当前 64-light 目标，但必须纳入 64/128 灯 ABI/带宽 A/B；不能把它当成零成本。
+
+[PC 验证] 68/68 Rust tests 通过；Map_S03B 正常截图无 shader/Vulkan fatal。临时把两盏测试飞行灯固定为 `SlowMoving` 后，HUD 显示 2 个 active cross-fade，GPU texture copy 与扩展 WGSL 路径没有 wgpu validation error；随后已恢复 Automatic，未留下 Map 产品特例。
+
+[Android 编译] default 与 shipping（`--no-default-features`）的 `aarch64-linux-android` 检查通过。[尚未 Android/VR 裁决] APK 安装后的双眼连续性、双影/disocclusion、GPU P50/P95/P99 和 thermal soak 尚未完成。当前 stock volumetric-fog point-shadow sampling 尚未接入 snapshot reconstruction；SpotLight 仍是单 frustum FullyDynamic。
 
 ### 20.4 P2：把每片元 \(O(N)\) 选灯搬到双眼共享 tile
 
@@ -1930,3 +1950,33 @@ C_{point}\approx O(6(S+D)).
 [Android/VR 冷启动验证] 修正 APK 在设备 `PA9410MGJ9260457G` 上安装并进入 `FOCUSED`。日志确认 `pico4s_controller` 为活动 profile，左右 grip 都取得有效 tracking flags，Map_S03B 的左手 `DynamicOverlay` 球和右手 `FullyDynamic` SpotLight 均被创建。当前 runtime 同时明确拒绝 Oculus Touch grip fallback，但这是非致命结果；PICO 原生绑定继续完成 action sync。A/B、摇杆和扳机仍需用户物理按键验证，不能由自动冷启动替代。
 
 这个实验得到一条通用工程规则：**interaction profile 不是静态设备型号表，而是 app API 版本、已启用扩展、runtime 实现和当前连接设备共同决定的协商结果。** 对 Quest、PICO 或未来设备都应使用 capability-driven binding matrix，并把实际活动 profile、每个建议绑定结果和 action-state 可用性纳入启动审计。
+
+---
+
+## 26. 真机成本裁决：Top-K 之后必须降低着色片元基数（2026-07-24）
+
+ShadowMotionLab 在 PICO 上给出了关键反例：16 灯完整路径约 52.07 ms GPU；把 overflow 固定为 4、2、1 个完整 shadowed light sample 后，GPU 仍分别约 51.55、41.36、31.49 ms。即使 $K=1$ 仍远超 72 Hz 的 13.89 ms，因此“只优化选灯”不能成为 Zevy 的最终多灯架构。
+
+当前 forward 成本近似：
+
+\[
+C\approx P(C_{material}+K(C_{BRDF}+C_{shadow}))+C_{shadow\_gen}+C_{fixed}.
+\]
+
+Top-K、reservoir 和 cluster list 主要控制 $K$ 及其随灯数增长的斜率；foveation、VRS、reduced-rate deferred/tile lighting 才能控制昂贵项实际覆盖的 $P$。下一阶段必须同时攻击两者：
+
+- $K$：双眼共享 deterministic Hero/Top-K、稳定 tail reconstruction、按材质/灯类型选择 cheap visibility；
+- $P$：中央 full-rate、外围 half/quarter-rate，或完整 G-buffer + 低分辨率局部光照 + depth/normal/material-ID edge-aware reconstruction；
+- 固定成本：tile-local attachment、subpass/input attachment、减少 store/load/barrier，防止移动 tiler 的带宽抵消算术收益。
+
+已加入 `ForwardReference` 与 `DeferredReference` 可配置基线。后者已经在 PC 真实运行 ShadowMotionLab 16，使用全分辨率 G-buffer、相同灯光/阴影 shader，并显式关闭不兼容的 MSAA；它不是优化结果，而是 low-resolution lighting 的可证伪 substrate。详细公式、重建权重、实验顺序和 kill criteria 见 `Docs/Design/Reduced_Rate_Local_Lighting.md`。
+
+### 26.1 Foveation 的三层事实必须分开
+
+1. runtime advertised 某个 OpenXR extension；
+2. Zevy 创建 instance 时实际 enabled；
+3. swapchain/render pass 真实使用 Fragment Density Map 或其他硬件 shading-rate attachment。
+
+三者不是同一件事。当前只读探针会同时打印 runtime available、app enabled，以及 vendor-opaque 的 `persist.pvr.foveation.level`，但不会写设备持久属性。旧 PICO 日志中的 level 12/event 只能说明系统策略存在，不能证明当前 Zevy swapchain 已用 FDM。
+
+按 `XR_FB_foveation` / `XR_FB_foveation_vulkan`，应用路径需要在 swapchain create/enumerate 链接 foveation/FDM 结构，并让 Vulkan device/render pass 支持 fragment density map。当前 wgpu 24 本地源码没有暴露该 backend 能力；若目标设备 capability 与 A/B 证明值得做，就 fork wgpu-hal/OpenXR swapchain，而不是以“API 没暴露”为理由放弃。反之，如果 PICO 系统 FFR 已经提供相同硬件收益，则优先把工程投入到引擎自身 reduced-rate local lighting，避免重复外围降采样。

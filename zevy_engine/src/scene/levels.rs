@@ -32,7 +32,10 @@ pub(super) struct MovingShadowTestCaster {
 pub(super) fn level_fog(level: &super::LevelId) -> Option<DistanceFog> {
     match level {
         super::LevelId::FogPyramid => Some(fog_pyramid_fog()),
-        super::LevelId::PerformanceLab | super::LevelId::Empty | super::LevelId::Asset(_) => None,
+        super::LevelId::PerformanceLab
+        | super::LevelId::ShadowMotionLab { .. }
+        | super::LevelId::Empty
+        | super::LevelId::Asset(_) => None,
     }
 }
 
@@ -411,7 +414,12 @@ pub(super) fn move_xr_level_player(
 ) {
     if !matches!(
         current_level.0.as_ref(),
-        Some(LevelId::FogPyramid | LevelId::PerformanceLab | LevelId::Asset(_))
+        Some(
+            LevelId::FogPyramid
+                | LevelId::PerformanceLab
+                | LevelId::ShadowMotionLab { .. }
+                | LevelId::Asset(_)
+        )
     ) {
         return;
     }

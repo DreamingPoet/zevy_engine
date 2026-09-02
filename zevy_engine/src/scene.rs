@@ -3,6 +3,7 @@ mod levels;
 mod map_s03b_motion_test;
 mod map_s03b_xr_hand_test;
 mod mip_texture;
+mod shadow_motion_lab;
 mod zevy_level;
 
 use std::env;
@@ -70,6 +71,8 @@ impl Plugin for ScenePlugin {
                         .after(apply_map_s03b_xr_start),
                     levels::animate_orbiting_lights,
                     levels::animate_shadow_test_caster,
+                    shadow_motion_lab::animate_lights.after(open_level),
+                    shadow_motion_lab::animate_dynamic_casters.after(open_level),
                 ),
             );
     }
@@ -81,6 +84,9 @@ pub enum LevelId {
     FogPyramid,
     #[allow(dead_code)]
     PerformanceLab,
+    ShadowMotionLab {
+        light_count: usize,
+    },
     #[allow(dead_code)]
     Empty,
     Asset(String),
@@ -253,6 +259,9 @@ fn spawn_level(
         }
         LevelId::PerformanceLab => {
             levels::spawn_performance_lab(launch_mode, commands, meshes, materials);
+        }
+        LevelId::ShadowMotionLab { light_count } => {
+            shadow_motion_lab::spawn(launch_mode, *light_count, commands, meshes, materials);
         }
         LevelId::Empty => {
             let _ = levels::spawn_empty(launch_mode, commands);
@@ -928,16 +937,45 @@ fn startup_level_from_args() -> LevelId {
         }
     }
 
+    // Android NativeActivity has no ordinary desktop argv. Profiling builds
+    // may select the same built-in lab through an ADB property; Shipping never
+    // reads this test override because `render_debug` is absent.
+    #[cfg(all(target_os = "android", feature = "render_debug"))]
+    if let Some(value) = crate::platform::android_system_property("debug.zevy.level")
+        .filter(|value| !value.trim().is_empty())
+    {
+        let level = level_id_from_argument(&value);
+        info!("Android profiling level override: {value} -> {level:?}");
+        return level;
+    }
+
     LevelId::asset("levels/Map_S03B/Map_S03B.zevy-level.json")
 }
 
 fn level_id_from_argument(value: &str) -> LevelId {
-    match value.trim().to_ascii_lowercase().as_str() {
+    let normalized = value.trim().to_ascii_lowercase();
+    if let Some(light_count) = shadow_motion_lab_light_count(&normalized) {
+        return LevelId::ShadowMotionLab { light_count };
+    }
+    match normalized.as_str() {
         "performance" | "performance-lab" => LevelId::PerformanceLab,
         "fog" | "fog-pyramid" => LevelId::FogPyramid,
         "empty" => LevelId::Empty,
         _ => LevelId::asset(value),
     }
+}
+
+fn shadow_motion_lab_light_count(value: &str) -> Option<usize> {
+    match value {
+        "shadow-motion" | "shadow-motion-lab" => return Some(16),
+        _ => {}
+    }
+
+    ["shadow-motion-lab-", "shadow-motion-"]
+        .into_iter()
+        .find_map(|prefix| value.strip_prefix(prefix))
+        .and_then(|count| count.parse::<usize>().ok())
+        .filter(|count| (1..=shadow_motion_lab::MAX_LIGHT_COUNT).contains(count))
 }
 
 fn apply_active_level_fog_to_cameras(
@@ -993,6 +1031,24 @@ mod tests {
             level_id_from_argument("levels/Test/Test.zevy-level.json"),
             LevelId::asset("levels/Test/Test.zevy-level.json")
         );
+    }
+
+    #[test]
+    fn recognizes_shadow_motion_lab_profiles_without_map_specific_paths() {
+        assert_eq!(
+            level_id_from_argument("shadow-motion"),
+            LevelId::ShadowMotionLab { light_count: 16 }
+        );
+        assert_eq!(
+            level_id_from_argument("shadow-motion-lab-32"),
+            LevelId::ShadowMotionLab { light_count: 32 }
+        );
+        assert_eq!(
+            level_id_from_argument("SHADOW-MOTION-64"),
+            LevelId::ShadowMotionLab { light_count: 64 }
+        );
+        assert_eq!(shadow_motion_lab_light_count("shadow-motion-0"), None);
+        assert_eq!(shadow_motion_lab_light_count("shadow-motion-65"), None);
     }
 
     #[test]

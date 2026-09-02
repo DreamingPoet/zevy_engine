@@ -26,7 +26,9 @@ mod ambient_light;
 pub use ambient_light::AmbientLight;
 
 mod point_light;
-pub use point_light::{PointLight, PointLightShadowMapJitter};
+pub use point_light::{
+    PointLight, PointLightShadowMapJitter, PointLightShadowMapTransition,
+};
 mod spot_light;
 pub use spot_light::SpotLight;
 mod directional_light;

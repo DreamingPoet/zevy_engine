@@ -19,15 +19,16 @@ $$
 分层后的目标为：
 
 $$
-C_{policy}\approx O(I_sL_sFS)+O(I_mL_mFS)+O(U_kL_kFS)+O(L_fF(S+D))+O((L_s+L_m+L_k)FD),
+C_{policy}\approx O(I_sL_sFS)+O(I_mL_mFS)+O(U_kL_kFS)+O(L_fF(S+D))+O((L_s+L_m+L_k)FD)+O(P_t),
 $$
 
 其中：
 
 - $I_s$：静态内容失效事件，稳定时趋近 0；
 - $I_m$：微运动代理超界或静态内容变化事件，稳定时趋近 0；
-- $U_k$：慢移/关键帧真实更新率，P1 由真实 Transform 改变触发；
+- $U_k$：慢移/关键帧真实更新率；P2 由时间上限或投影位移误差触发，通常远小于每帧 1 次；
 - 最后一项是 dynamic caster overlay，只绘制 $D$，不使静态层整层失效。
+- $P_t$：当前正在 cross-fade 的灯覆盖的片元；这些片元增加一次旧静态 shadow sample，非过渡灯不支付该采样。
 
 P1 的自动分类每帧每实体只做常数次向量/标量运算，CPU 成本为 $O(L+B)$，其中 $B$ 是带策略的 caster root 数。策略切换只在状态改变时增删 ECS 组件。
 
@@ -38,16 +39,16 @@ P1 的自动分类每帧每实体只做常数次向量/标量运算，CPU 成本
 - `Automatic`：引擎测量世界位移速度、range 变化率和虚拟原点 offset，并用迟滞选择 resolved class。
 - `Static`、`BoundedMicroMotion`、`SlowMoving`、`FullyDynamic`：人工固定 resolved class；不会因观测结果自动改变。
 
-### Resolved class 与 P1 路由
+### Resolved class 与当前路由
 
-| Class | 持久 shadow cache | `PointLightShadowMapJitter` | P1 行为 |
+| Class | 持久 shadow cache | `PointLightShadowMapJitter` | 当前行为 |
 | --- | --- | --- | --- |
 | `Static` | 是 | 否 | 静态深度只在几何/投影失效时重画 |
 | `BoundedMicroMotion` | 是 | 是 | 真实投影保持稳定，虚拟原点连续偏移 |
-| `SlowMoving` | 是 | 否 | Transform/range 改变时真实重画，静止帧复用 |
+| `SlowMoving` | 是 | 否 | P2 低频真实快照；稀疏旧 cubemap 与新 cubemap 做 shadow-term cross-fade |
 | `FullyDynamic` | 否 | 否 | 保留 Bevy 原生真实 moving-light redraw |
 
-`SlowMoving` 的双快照 `KeyframedCrossFade`、稀疏 pages 和 GPU-ms 调度尚未在 P1 实现。P1 不能把“cache-on-dirty”写成已经完成低频无阶梯重建。
+P2 已替换 P1 的 `SlowMoving cache-on-dirty`。稀疏 shadow pages、Hero priority、最大 stale time 和 GPU-ms 调度仍未实现，不能把当前固定槽池写成完整的预算调度器。
 
 ### 自动分类
 
@@ -119,11 +120,85 @@ Kill criterion：若自动迁移在同一帧无法保证静态旧影清除，则
 
 当前手动策略可由 Rust/ECS 在运行时设置；UE manifest 中可编辑的 per-light/per-actor policy 与阈值仍属于下一阶段。不能把 UE mobility 的默认映射误写成完整 authoring schema。
 
+## P2：SlowMoving 稀疏双快照（2026-07-24）
+
+### 数学与调度
+
+每盏 `SlowMoving` PointLight 保存物理位置 $p(t)$、当前静态阴影快照位置 $s_1$ 和旧快照位置 $s_0$。只有满足以下任一条件且灯确实发生了投影变化时才请求新关键帧：
+
+$$
+\lVert p(t)-s_1\rVert\ge d_{max}
+\quad\lor\quad
+t-t_{snapshot}\ge \frac{1}{f_{snapshot}}.
+$$
+
+默认值是 $d_{max}=0.04\,m$、$f_{snapshot}=8\,Hz$。新快照开始前，将 resident static cubemap 的六层复制到稀疏槽；随后 resident cube 从真实新灯位重画。片元可见度为：
+
+$$
+V_{static}=\operatorname{mix}(V(s_0),V(s_1),\operatorname{smoothstep}(0,1,\tau)),
+$$
+
+$$
+V=V_{static}\,V_{dynamic}(p(t)),
+$$
+
+其中 $\tau$ 默认在 0.12 秒内从 0 到 1。直接光照继续使用物理位置 $p(t)$；静态 shadow reconstruction 使用 $s_0/s_1$；动态 caster overlay 始终从真实灯位 $p(t)$ 更新。三者不能混为一个 Transform。
+
+当过渡槽不足时，候选按 shadow snapshot 的 world-space stale error 从大到小排序，再以 Entity 作为稳定 tie-break；没有槽的灯保持旧快照等待，不会按眼睛、相机距离或随机数抢占。一个正在进行的过渡完成后才允许同一灯开始下一次快照，避免有限两状态在中途被第三状态覆盖。
+
+`shadow_map_near_z` 改变会改变深度编码，旧/新图不能直接数值混合，因此当前实现执行一次真实重画并立即 settle。range/位置变化可以进入关键帧路径。运动超过 automatic slow threshold 时仍立即升级 `FullyDynamic`。
+
+### 稀疏 atlas 与设备上限
+
+设 shadowed PointLight 数为 $N$，设备最多允许 $A$ 个 texture-array layers；每 cube 占 6 layers。当前组合 atlas 为：
+
+```text
+[ N static cubes ][ N dynamic cubes ][ K_eff previous-snapshot cubes ]
+```
+
+$$
+K_{eff}=\min\left(K_{config},\max\left(0,\left\lfloor\frac{A}{6}\right\rfloor-2N\right)\right).
+$$
+
+它不会为每盏灯永久分配第三份 cube。以 128×128 D32 为例，一份 PointLight cube 约为 $6\times128^2\times4=393216$ bytes（约 0.375 MiB）；4 个槽约 1.5 MiB。Map_S03B 当前运行时含 20 个 shadowed PointLight 时，256-layer 设备只能提供 2 个旧快照槽。RenderWorld 会把实际 $K_{eff}$ 通过共享原子状态反馈给主世界调度器，下一帧开始只分配设备真正可采样的槽。
+
+shader 不再用 atlas 奇偶性猜布局；每个 GPU light record 携带 shadowed cube count、当前/旧 snapshot position、blend 和 slot。`GpuClusterableObject` 因此从 80 bytes 增至 112 bytes；16 KiB uniform fallback 上限从 204 个调整为 146 个 clusterable objects，仍高于当前 64-light 目标，但这是需要在 64/128-light 压力场景测量的明确 trade-off。
+
+### 双眼与 RenderGraph 正确性
+
+- snapshot 分类、槽、时间和 blend 只在主世界更新一次，左右眼共享同一组件数据。
+- shadow node 可能为左右眼分别运行；cubemap copy 使用跨眼 `AtomicBool` claim，每帧每批 copy 只提交一次。否则第二只眼会把旧槽覆盖成已经重画的新 cube。
+- shader 仅在 `transition_slot` 有效且小于 RenderWorld 的实际 pool size 时采样旧 cube；设备反馈延迟或运行时 atlas 变化不会导致越界采样。
+- transition-only atlas 会把未使用的 dynamic layer 清为 fully lit；关闭 dynamic overlay 时不会重复提交 dynamic caster。
+
+### 配置与遥测
+
+`RenderQualityConfig` 新增：
+
+- `slow_moving_shadow_crossfade`；
+- `slow_moving_shadow_transition_slots`；
+- `slow_moving_shadow_snapshot_hz`；
+- `slow_moving_shadow_snapshot_distance_m`；
+- `slow_moving_shadow_crossfade_seconds`。
+
+HUD 显示 active/effective slots、waiting、snapshot starts、实际 cubemap copies 和最大 world-space stale distance。配置槽数只是请求值，HUD 的 effective slots 才是设备/当前灯数下可用值。
+
+### P2 已验证与边界
+
+- [实现] 通用主世界 scheduler、确定性稀疏槽池、RenderWorld capacity feedback、六层 texture copy、扩展 GPU ABI、shadow-term cross-fade、真实灯位 dynamic overlay 和 HUD telemetry。
+- [PC 验证] 68 项 Rust 单元测试通过；Map_S03B 正常路径截图无 shader/Vulkan fatal；临时把两个测试飞行灯固定为 `SlowMoving` 后，HUD 显示 2 个 active cross-fade，GPU copy/渲染路径无 wgpu validation error。临时场景修改已恢复，产品源码没有 Map 专属分类。
+- [Android 编译] default 与 `--no-default-features` 的 `aarch64-linux-android` 检查通过。
+- [尚未 Android/VR 验证] PICO 上的视觉连续性、左右眼一致、实际有效槽反馈、GPU P50/P95/P99、20～30 分钟 thermal soak 尚未裁决；PC 无错误不等于移动端性能胜出。
+- [边界] 当前 cross-fade 接入 Zevy scalable StandardMaterial direct-shadow 路径；stock volumetric-fog shadow sampling 尚未重建。SpotLight 仍只有真实单-frustum `FullyDynamic` 路径。
+- [边界] 运行时增删 shadowed lights 导致 atlas 重排时，当前依赖下一帧 capacity feedback 与 cache 全失效；需要增加显式 atlas generation，确保正在过渡的旧槽不会跨 generation 使用。
+
+P2 kill criterion：若真机观察到双影、半透明式 shadow 淡化不可接受、disocclusion 错误大于完整动态参考，或额外旧 shadow sample 的片元成本高于节省的六面重画，则按灯/材质回退 `FullyDynamic`，并进入 edge-aware reconstruction / temporal confidence，而不是缩短物理 range 或突然关影。
+
 ## 后续阶段
 
-1. `SlowMoving` 双快照 atlas + cross-fade / shadow-term reconstruction；
-2. priority、最大 stale time、GPU-ms 预算和 Hero 抢占；
+1. priority、最大 stale time、GPU-ms 预算和 Hero 抢占；
+2. atlas generation、运行时增删灯安全迁移，以及旧/新 snapshot 的 edge-aware confidence reconstruction；
 3. dirty caster/light 的局部 face/page invalidation，替代全静态 atlas 失效；
 4. UE schema 导出 per-light/per-actor policy、阈值、误差和优先级；
-5. HUD policy 数量、迁移次数、stale time 与每类 GPU 成本；
+5. 每类 shadow GPU timestamp、copy bytes、stale P50/P95/P99 和 thermal telemetry；
 6. Map_S03B 之外的合成 Static/Micro/Slow/FullyDynamic 压力场景和 16→32→64 斜率实验。

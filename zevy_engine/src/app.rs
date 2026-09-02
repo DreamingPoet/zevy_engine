@@ -5,7 +5,7 @@ use std::{
 };
 
 use bevy::{
-    pbr::PointLightShadowMap,
+    pbr::{DefaultOpaqueRendererMethod, PointLightShadowMap},
     prelude::*,
     render::{
         render_resource::TextureFormat,
@@ -79,10 +79,12 @@ pub fn run() {
             app.add_plugins(xr::plugins())
                 .add_plugins(bevy_xr_utils::tracking_utils::TrackingUtilitiesPlugin)
                 .add_plugins(bevy_xr_utils::xr_utils_actions::XRUtilsActionsPlugin)
-                .add_plugins(bevy_mod_xr::hand_debug_gizmos::HandGizmosPlugin)
                 .add_systems(
                     Startup,
-                    input::setup_xr_actions.before(XRUtilsActionSystemSet::CreateEvents),
+                    (
+                        platform::log_android_xr_foveation_capabilities,
+                        input::setup_xr_actions.before(XRUtilsActionSystemSet::CreateEvents),
+                    ),
                 )
                 .add_systems(
                     bevy_mod_openxr::action_binding::OxrSendActionBindings,
@@ -137,6 +139,16 @@ pub fn run() {
 
     app.insert_resource(StartupMode(launch_mode))
         .insert_resource(render_quality)
+        .insert_resource(
+            if render_quality
+                .local_lighting_pipeline
+                .uses_deferred_prepass()
+            {
+                DefaultOpaqueRendererMethod::deferred()
+            } else {
+                DefaultOpaqueRendererMethod::forward()
+            },
+        )
         .insert_resource(PointLightShadowMap {
             size: render_quality.resolved_point_shadow_map_size(),
         })

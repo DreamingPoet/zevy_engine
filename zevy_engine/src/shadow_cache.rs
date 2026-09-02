@@ -1,15 +1,18 @@
 use std::{
     any::type_name,
     collections::{HashMap, HashSet},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
 };
-
-#[cfg(feature = "render_debug")]
-use std::sync::{Arc, atomic::AtomicU64};
 
 use bevy::{
     core_pipeline::core_3d::graph::Core3d,
-    pbr::{LightEntity, NotShadowCaster, Shadow, ShadowView, ViewLightEntities, graph::NodePbr},
+    pbr::{
+        LightEntity, NotShadowCaster, PointLightShadowMapTransition, Shadow, ShadowView,
+        ViewLightEntities, graph::NodePbr,
+    },
     prelude::*,
     render::{
         RenderApp,
@@ -18,7 +21,10 @@ use bevy::{
         extract_resource::{ExtractResource, ExtractResourcePlugin},
         render_graph::{Node, NodeRunError, RenderGraph, RenderGraphContext},
         render_phase::{TrackedRenderPass, ViewBinnedRenderPhases},
-        render_resource::{CommandEncoderDescriptor, RenderPassDescriptor, StoreOp},
+        render_resource::{
+            CommandEncoderDescriptor, Extent3d, Origin3d, RenderPassDescriptor, StoreOp,
+            TexelCopyTextureInfo, TextureAspect,
+        },
         renderer::RenderContext,
         sync_world::MainEntity,
         view::ExtractedView,
@@ -29,14 +35,18 @@ use bevy::{
 use crate::shadow_overlay::{
     DynamicPointShadowView, DynamicShadowCaster, DynamicShadowOverlayState,
 };
-use crate::{config::RenderQualityConfig, scene::ImportedZevyEntity};
+use crate::{
+    config::RenderQualityConfig,
+    scene::ImportedZevyEntity,
+    shadow_motion_policy::{ResolvedShadowCasterMotion, ShadowCasterMotionClass},
+};
 
 #[derive(Component, Debug, Default)]
 pub(crate) struct CachedPointLightShadow {
     pub(crate) last_update_seconds: Option<f32>,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct ShadowCacheTelemetry {
     #[cfg(feature = "render_debug")]
     rendered_views: Arc<AtomicU64>,
@@ -50,6 +60,33 @@ struct ShadowCacheTelemetry {
     dynamic_views_rendered: Arc<AtomicU64>,
     #[cfg(feature = "render_debug")]
     dynamic_casters: Arc<AtomicU64>,
+    #[cfg(feature = "render_debug")]
+    transition_copies: Arc<AtomicU64>,
+    /// Shared by the main and render worlds. `u64::MAX` means that the render
+    /// device has not published an atlas capacity yet.
+    effective_transition_slots: Arc<AtomicU64>,
+}
+
+impl Default for ShadowCacheTelemetry {
+    fn default() -> Self {
+        Self {
+            #[cfg(feature = "render_debug")]
+            rendered_views: Arc::default(),
+            #[cfg(feature = "render_debug")]
+            reused_views: Arc::default(),
+            #[cfg(feature = "render_debug")]
+            resident_views: Arc::default(),
+            #[cfg(feature = "render_debug")]
+            invalidated_lights: Arc::default(),
+            #[cfg(feature = "render_debug")]
+            dynamic_views_rendered: Arc::default(),
+            #[cfg(feature = "render_debug")]
+            dynamic_casters: Arc::default(),
+            #[cfg(feature = "render_debug")]
+            transition_copies: Arc::default(),
+            effective_transition_slots: Arc::new(AtomicU64::new(u64::MAX)),
+        }
+    }
 }
 
 #[cfg(feature = "render_debug")]
@@ -61,6 +98,8 @@ pub(crate) struct ShadowCacheTelemetrySnapshot {
     pub(crate) invalidated_lights: u64,
     pub(crate) dynamic_views_rendered: u64,
     pub(crate) dynamic_casters: u64,
+    pub(crate) transition_copies: u64,
+    pub(crate) effective_transition_slots: Option<usize>,
 }
 
 impl ShadowCacheTelemetry {
@@ -88,6 +127,8 @@ impl ShadowCacheTelemetry {
             invalidated_lights: self.invalidated_lights.load(Ordering::Relaxed),
             dynamic_views_rendered: self.dynamic_views_rendered.load(Ordering::Relaxed),
             dynamic_casters: self.dynamic_casters.load(Ordering::Relaxed),
+            transition_copies: self.transition_copies.load(Ordering::Relaxed),
+            effective_transition_slots: self.effective_transition_slots(),
         }
     }
 
@@ -102,6 +143,30 @@ impl ShadowCacheTelemetry {
         #[cfg(not(feature = "render_debug"))]
         let _ = (rendered_views, caster_count);
     }
+
+    fn store_transition_copies(&self, copies: usize) {
+        #[cfg(feature = "render_debug")]
+        self.transition_copies
+            .store(copies as u64, Ordering::Relaxed);
+        #[cfg(not(feature = "render_debug"))]
+        let _ = copies;
+    }
+
+    fn store_effective_transition_slots(&self, slots: usize) {
+        self.effective_transition_slots
+            .store(slots as u64, Ordering::Release);
+    }
+
+    fn effective_transition_slots(&self) -> Option<usize> {
+        let slots = self.effective_transition_slots.load(Ordering::Acquire);
+        (slots != u64::MAX).then_some(slots as usize)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PointShadowTransitionCopyRequest {
+    pub(crate) light: Entity,
+    pub(crate) slot: u32,
 }
 
 #[derive(Resource, Clone, ExtractResource)]
@@ -110,9 +175,11 @@ pub(crate) struct ZevyShadowCacheFrame {
     warmup_frames: u8,
     point_shadow_map_size: usize,
     dynamic_overlay_enabled: bool,
+    slow_shadow_transition_slots: usize,
     cacheable_point_lights: Vec<Entity>,
     dynamic_shadow_casters: Vec<Entity>,
     invalidated_point_lights: Vec<Entity>,
+    transition_copy_requests: Vec<PointShadowTransitionCopyRequest>,
     invalidate_all: bool,
     telemetry: ShadowCacheTelemetry,
 }
@@ -131,9 +198,15 @@ impl FromWorld for ZevyShadowCacheFrame {
                 && quality.persistent_point_shadow_cache
                 && quality.scalable_point_lighting
                 && quality.dynamic_shadow_caster_overlay,
+            slow_shadow_transition_slots: if quality.slow_moving_shadow_crossfade_enabled() {
+                quality.resolved_slow_moving_shadow_transition_slots()
+            } else {
+                0
+            },
             cacheable_point_lights: Vec::new(),
             dynamic_shadow_casters: Vec::new(),
             invalidated_point_lights: Vec::new(),
+            transition_copy_requests: Vec::new(),
             invalidate_all: true,
             telemetry: ShadowCacheTelemetry::default(),
         }
@@ -144,6 +217,17 @@ impl ZevyShadowCacheFrame {
     pub(crate) fn invalidate_point_light(&mut self, entity: Entity) {
         if !self.invalidated_point_lights.contains(&entity) {
             self.invalidated_point_lights.push(entity);
+        }
+    }
+
+    pub(crate) fn request_transition_copy(&mut self, light: Entity, slot: u32) {
+        if !self
+            .transition_copy_requests
+            .iter()
+            .any(|request| request.light == light)
+        {
+            self.transition_copy_requests
+                .push(PointShadowTransitionCopyRequest { light, slot });
         }
     }
 
@@ -160,6 +244,26 @@ impl ZevyShadowCacheFrame {
         self.dynamic_overlay_enabled() && !self.dynamic_shadow_casters.is_empty()
     }
 
+    pub(crate) fn combined_atlas_enabled(&self) -> bool {
+        self.dynamic_overlay_enabled() || self.slow_shadow_transition_slots > 0
+    }
+
+    pub(crate) fn slow_shadow_transition_slots(&self) -> usize {
+        self.slow_shadow_transition_slots
+    }
+
+    pub(crate) fn effective_transition_slots(&self) -> Option<usize> {
+        self.telemetry.effective_transition_slots()
+    }
+
+    pub(crate) fn record_effective_transition_slots(&self, slots: usize) {
+        self.telemetry.store_effective_transition_slots(slots);
+    }
+
+    pub(crate) fn transition_copy_requests(&self) -> &[PointShadowTransitionCopyRequest] {
+        &self.transition_copy_requests
+    }
+
     pub(crate) fn point_shadow_map_size(&self) -> usize {
         self.point_shadow_map_size
     }
@@ -171,6 +275,10 @@ impl ZevyShadowCacheFrame {
     pub(crate) fn record_dynamic_overlay(&self, rendered_views: usize) {
         self.telemetry
             .store_dynamic(rendered_views, self.dynamic_shadow_casters.len());
+    }
+
+    pub(crate) fn record_transition_copies(&self, copies: usize) {
+        self.telemetry.store_transition_copies(copies);
     }
 }
 
@@ -220,16 +328,31 @@ fn begin_shadow_cache_frame(
         && quality.persistent_point_shadow_cache
         && quality.scalable_point_lighting
         && quality.dynamic_shadow_caster_overlay;
+    frame.slow_shadow_transition_slots = if quality.slow_moving_shadow_crossfade_enabled() {
+        quality.resolved_slow_moving_shadow_transition_slots()
+    } else {
+        0
+    };
     frame.cacheable_point_lights.clear();
     frame.dynamic_shadow_casters.clear();
     frame.invalidated_point_lights.clear();
+    frame.transition_copy_requests.clear();
     frame.invalidate_all = false;
+    frame.record_transition_copies(0);
 }
 
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn finalize_shadow_cache_frame(
     mut frame: ResMut<ZevyShadowCacheFrame>,
-    cacheable_lights: Query<(Entity, &PointLight, &GlobalTransform), With<CachedPointLightShadow>>,
+    cacheable_lights: Query<
+        (
+            Entity,
+            &PointLight,
+            &GlobalTransform,
+            Has<PointLightShadowMapTransition>,
+        ),
+        With<CachedPointLightShadow>,
+    >,
     imported_actor_changes: Query<
         Entity,
         (
@@ -248,22 +371,26 @@ fn finalize_shadow_cache_frame(
     >,
     shadow_casters: Query<Entity, (With<Mesh3d>, Without<NotShadowCaster>)>,
     dynamic_markers: Query<(), With<DynamicShadowCaster>>,
+    resolved_caster_motion: Query<&ResolvedShadowCasterMotion>,
     imported_entities: Query<(), With<ImportedZevyEntity>>,
     parents: Query<&ChildOf>,
     mut previous_shadow_caster_count: Local<Option<usize>>,
     mut previous_light_projection: Local<HashMap<Entity, PointShadowProjectionState>>,
 ) {
     let mut active_cacheable_lights = HashSet::new();
-    for (entity, light, global_transform) in &cacheable_lights {
+    for (entity, light, global_transform, snapshot_managed) in &cacheable_lights {
         frame.cacheable_point_lights.push(entity);
         active_cacheable_lights.insert(entity);
 
         let projection = PointShadowProjectionState::new(light, global_transform);
-        if previous_light_projection
-            .insert(entity, projection)
-            .is_some_and(|previous| previous != projection)
+        if !snapshot_managed
+            && previous_light_projection
+                .insert(entity, projection)
+                .is_some_and(|previous| previous != projection)
         {
             frame.invalidate_point_light(entity);
+        } else if snapshot_managed {
+            previous_light_projection.insert(entity, projection);
         }
     }
     previous_light_projection.retain(|entity, _| active_cacheable_lights.contains(entity));
@@ -275,7 +402,13 @@ fn finalize_shadow_cache_frame(
     let mut static_caster_count = 0;
     let separate_dynamic_overlay = frame.dynamic_overlay_enabled();
     for entity in &shadow_casters {
-        if is_dynamic_shadow_caster(entity, &dynamic_markers, &imported_entities, &parents) {
+        if is_dynamic_shadow_caster(
+            entity,
+            &dynamic_markers,
+            &resolved_caster_motion,
+            &imported_entities,
+            &parents,
+        ) {
             dynamic_casters.insert(entity);
             if !separate_dynamic_overlay {
                 static_caster_count += 1;
@@ -325,6 +458,7 @@ fn has_dynamic_shadow_marker(
 pub(crate) fn is_dynamic_shadow_caster(
     entity: Entity,
     dynamic_markers: &Query<(), With<DynamicShadowCaster>>,
+    resolved_caster_motion: &Query<&ResolvedShadowCasterMotion>,
     imported_entities: &Query<(), With<ImportedZevyEntity>>,
     parents: &Query<&ChildOf>,
 ) -> bool {
@@ -334,6 +468,13 @@ pub(crate) fn is_dynamic_shadow_caster(
         let Some(entity) = current else {
             break;
         };
+        // The nearest explicit motion policy is authoritative, including for
+        // runtime-created geometry. Without this check, the correctness-first
+        // fallback below would silently classify a manually fixed Static
+        // runtime mesh as dynamic forever.
+        if let Ok(resolved) = resolved_caster_motion.get(entity) {
+            return resolved.class == ShadowCasterMotionClass::DynamicOverlay;
+        }
         if dynamic_markers.contains(entity) {
             return true;
         }
@@ -394,6 +535,7 @@ struct ZevyCachedEarlyShadowPassNode {
     cache_entries: HashMap<PointShadowCacheKey, u8>,
     atlas_light_layout: Vec<Entity>,
     atlas_size: usize,
+    transition_copy_claimed: AtomicBool,
 }
 
 impl FromWorld for ZevyCachedEarlyShadowPassNode {
@@ -411,6 +553,7 @@ impl FromWorld for ZevyCachedEarlyShadowPassNode {
             cache_entries: HashMap::new(),
             atlas_light_layout: Vec::new(),
             atlas_size: 0,
+            transition_copy_claimed: AtomicBool::new(false),
         }
     }
 }
@@ -426,6 +569,7 @@ impl Node for ZevyCachedEarlyShadowPassNode {
         self.point_render_claims.clear();
         self.dynamic_view_by_static.clear();
         self.render_dynamic_view_entities.clear();
+        self.transition_copy_claimed.store(false, Ordering::Release);
 
         if let Some(overlay_state) = world.get_resource::<DynamicShadowOverlayState>() {
             self.render_dynamic_view_entities
@@ -574,6 +718,59 @@ impl Node for ZevyCachedEarlyShadowPassNode {
             return Ok(());
         };
 
+        if !self.transition_copy_claimed.swap(true, Ordering::AcqRel)
+            && let Some(frame) = world.get_resource::<ZevyShadowCacheFrame>()
+        {
+            let mut copied_transitions = 0;
+            if let Some(overlay_state) = world.get_resource::<DynamicShadowOverlayState>()
+                && let Some(atlas_texture) = overlay_state.atlas_texture.as_ref()
+            {
+                for request in frame.transition_copy_requests() {
+                    let Some(&source_cube) = overlay_state.cube_index_by_light.get(&request.light)
+                    else {
+                        continue;
+                    };
+                    let slot = request.slot as usize;
+                    if slot >= overlay_state.transition_pool_size {
+                        continue;
+                    }
+                    let destination_cube = overlay_state
+                        .point_light_cube_count
+                        .saturating_mul(2)
+                        .saturating_add(slot);
+                    render_context.command_encoder().copy_texture_to_texture(
+                        TexelCopyTextureInfo {
+                            texture: atlas_texture,
+                            mip_level: 0,
+                            origin: Origin3d {
+                                x: 0,
+                                y: 0,
+                                z: (source_cube * 6) as u32,
+                            },
+                            aspect: TextureAspect::All,
+                        },
+                        TexelCopyTextureInfo {
+                            texture: atlas_texture,
+                            mip_level: 0,
+                            origin: Origin3d {
+                                x: 0,
+                                y: 0,
+                                z: (destination_cube * 6) as u32,
+                            },
+                            aspect: TextureAspect::All,
+                        },
+                        Extent3d {
+                            width: frame.point_shadow_map_size() as u32,
+                            height: frame.point_shadow_map_size() as u32,
+                            depth_or_array_layers: 6,
+                        },
+                    );
+                    copied_transitions += 1;
+                }
+            }
+            frame.record_transition_copies(copied_transitions);
+        }
+
         if let Ok(view_lights) = self.main_view_query.get_manual(world, graph.view_entity()) {
             for view_light_entity in view_lights.lights.iter().copied() {
                 let static_view_claimed = self
@@ -721,5 +918,56 @@ mod tests {
         light.shadow_map_near_z -= 0.05;
         let moved = GlobalTransform::from(Transform::from_translation(Vec3::new(1.1, 2.0, 3.0)));
         assert_ne!(baseline, PointShadowProjectionState::new(&light, &moved));
+    }
+
+    #[test]
+    fn explicit_runtime_static_policy_overrides_correctness_first_fallback() {
+        #[derive(Resource)]
+        struct TestEntities {
+            fixed_static: Entity,
+            unclassified_runtime: Entity,
+        }
+
+        fn assert_routes(
+            entities: Res<TestEntities>,
+            dynamic_markers: Query<(), With<DynamicShadowCaster>>,
+            resolved: Query<&ResolvedShadowCasterMotion>,
+            imported: Query<(), With<ImportedZevyEntity>>,
+            parents: Query<&ChildOf>,
+        ) {
+            assert!(!is_dynamic_shadow_caster(
+                entities.fixed_static,
+                &dynamic_markers,
+                &resolved,
+                &imported,
+                &parents,
+            ));
+            assert!(is_dynamic_shadow_caster(
+                entities.unclassified_runtime,
+                &dynamic_markers,
+                &resolved,
+                &imported,
+                &parents,
+            ));
+        }
+
+        let mut app = App::new();
+        let fixed_static = app
+            .world_mut()
+            .spawn(ResolvedShadowCasterMotion {
+                class: ShadowCasterMotionClass::Static,
+                translation_delta_m: 0.0,
+                rotation_delta_radians: 0.0,
+                scale_delta: 0.0,
+                stationary_seconds: 1.0,
+            })
+            .id();
+        let unclassified_runtime = app.world_mut().spawn_empty().id();
+        app.insert_resource(TestEntities {
+            fixed_static,
+            unclassified_runtime,
+        })
+        .add_systems(Update, assert_routes)
+        .update();
     }
 }

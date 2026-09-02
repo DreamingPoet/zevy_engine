@@ -9,6 +9,8 @@ const EXACT_LIGHT_THRESHOLD_TEMPLATE: &str = "const ZEVY_POINT_LIGHT_EXACT_THRES
 const TEMPORAL_SAMPLING_TEMPLATE: &str = "const ZEVY_TEMPORAL_LIGHT_SAMPLING: bool = false;";
 const SAMPLE_PERIOD_TEMPLATE: &str = "const ZEVY_LIGHT_SAMPLE_PERIOD_FRAMES: u32 = 4u;";
 const DYNAMIC_SHADOW_OVERLAY_TEMPLATE: &str = "const ZEVY_DYNAMIC_SHADOW_OVERLAY: bool = true;";
+const SLOW_SHADOW_CROSSFADE_TEMPLATE: &str =
+    "const ZEVY_SLOW_MOVING_SHADOW_CROSSFADE: bool = true;";
 const POINT_LIGHT_DIRECT_TEMPLATE: &str = "const ZEVY_POINT_LIGHT_DIRECT_LIGHTING: bool = true;";
 const CLUSTERED_LIGHT_PRESELECTION_TEMPLATE: &str =
     "const ZEVY_CLUSTERED_LIGHT_PRESELECTION: bool = true;";
@@ -42,6 +44,7 @@ fn install_scalable_pbr_shader(
     let dynamic_shadow_overlay = quality.point_light_shadows
         && quality.persistent_point_shadow_cache
         && quality.dynamic_shadow_caster_overlay;
+    let slow_shadow_crossfade = quality.slow_moving_shadow_crossfade_enabled();
     let source = PBR_FUNCTIONS_TEMPLATE
         .replace(
             HERO_SAMPLES_TEMPLATE,
@@ -69,6 +72,10 @@ fn install_scalable_pbr_shader(
         .replace(
             DYNAMIC_SHADOW_OVERLAY_TEMPLATE,
             &format!("const ZEVY_DYNAMIC_SHADOW_OVERLAY: bool = {dynamic_shadow_overlay};"),
+        )
+        .replace(
+            SLOW_SHADOW_CROSSFADE_TEMPLATE,
+            &format!("const ZEVY_SLOW_MOVING_SHADOW_CROSSFADE: bool = {slow_shadow_crossfade};"),
         )
         .replace(
             POINT_LIGHT_DIRECT_TEMPLATE,
@@ -112,6 +119,9 @@ fn install_scalable_pbr_shader(
         "const ZEVY_DYNAMIC_SHADOW_OVERLAY: bool = {dynamic_shadow_overlay};"
     )));
     debug_assert!(source.contains(&format!(
+        "const ZEVY_SLOW_MOVING_SHADOW_CROSSFADE: bool = {slow_shadow_crossfade};"
+    )));
+    debug_assert!(source.contains(&format!(
         "const ZEVY_POINT_LIGHT_DIRECT_LIGHTING: bool = {};",
         quality.point_light_direct_lighting
     )));
@@ -129,7 +139,7 @@ fn install_scalable_pbr_shader(
     );
 
     info!(
-        "Installed Zevy scalable point lighting: direct shading {}, {} highest-contribution Hero lights + {} importance-sampled shadowed tail lights per shading point, exact through {} local lights, {}, selection {}, dynamic shadow overlay {}",
+        "Installed Zevy scalable point lighting: direct shading {}, {} highest-contribution Hero lights + {} importance-sampled shadowed tail lights per shading point, exact through {} local lights, {}, selection {}, dynamic shadow overlay {}, SlowMoving shadow cross-fade {}",
         if quality.point_light_direct_lighting {
             "on"
         } else {
@@ -145,6 +155,7 @@ fn install_scalable_pbr_shader(
         },
         quality.point_light_selection_mode_label(),
         if dynamic_shadow_overlay { "on" } else { "off" },
+        if slow_shadow_crossfade { "on" } else { "off" },
     );
 }
 
@@ -160,6 +171,7 @@ mod tests {
         assert!(PBR_FUNCTIONS_TEMPLATE.contains(TEMPORAL_SAMPLING_TEMPLATE));
         assert!(PBR_FUNCTIONS_TEMPLATE.contains(SAMPLE_PERIOD_TEMPLATE));
         assert!(PBR_FUNCTIONS_TEMPLATE.contains(DYNAMIC_SHADOW_OVERLAY_TEMPLATE));
+        assert!(PBR_FUNCTIONS_TEMPLATE.contains(SLOW_SHADOW_CROSSFADE_TEMPLATE));
         assert!(PBR_FUNCTIONS_TEMPLATE.contains(POINT_LIGHT_DIRECT_TEMPLATE));
         assert!(PBR_FUNCTIONS_TEMPLATE.contains(CLUSTERED_LIGHT_PRESELECTION_TEMPLATE));
         assert!(PBR_FUNCTIONS_TEMPLATE.contains(WORLD_SPACE_LIGHT_RESERVOIR_TEMPLATE));
@@ -170,6 +182,8 @@ mod tests {
         assert!(PBR_FUNCTIONS_TEMPLATE.contains("zevy_point_shadow_map_jitter"));
         assert!(PBR_FUNCTIONS_TEMPLATE.contains("POINT_LIGHT_FLAGS_SHADOW_MAP_JITTER_BIT"));
         assert!(PBR_FUNCTIONS_TEMPLATE.contains("static_visibility * dynamic_visibility"));
+        assert!(PBR_FUNCTIONS_TEMPLATE.contains("previous_shadow_map_position_slot"));
+        assert!(PBR_FUNCTIONS_TEMPLATE.contains("mix(previous_visibility, static_visibility"));
     }
 
     #[test]

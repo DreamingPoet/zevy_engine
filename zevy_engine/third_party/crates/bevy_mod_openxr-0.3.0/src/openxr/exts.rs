@@ -4,6 +4,15 @@ use openxr::ExtensionSet;
 #[derive(Clone, Debug, Eq, PartialEq, Deref, DerefMut, Resource)]
 pub struct OxrEnabledExtensions(pub OxrExtensions);
 
+/// Extensions advertised by the active OpenXR runtime before the application
+/// chooses which ones to enable.
+///
+/// Keeping this separate from [`OxrEnabledExtensions`] is important for
+/// capability negotiation: an advertised extension is not proof that the
+/// application's instance, graphics device, or swapchain actually uses it.
+#[derive(Clone, Debug, Eq, PartialEq, Deref, DerefMut, Resource)]
+pub struct OxrAvailableExtensions(pub OxrExtensions);
+
 #[derive(Clone, Debug, Eq, PartialEq, Deref, DerefMut)]
 pub struct OxrExtensions(ExtensionSet);
 impl OxrExtensions {

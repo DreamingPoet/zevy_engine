@@ -3,6 +3,8 @@ use std::time::Duration;
 
 #[cfg(target_os = "android")]
 use bevy::{prelude::*, window::ExitCondition};
+#[cfg(all(target_os = "android", feature = "render_debug"))]
+use bevy_mod_openxr::exts::OxrAvailableExtensions;
 #[cfg(not(target_os = "android"))]
 use bevy_mod_openxr::init::OxrInitPlugin;
 #[cfg(target_os = "android")]
@@ -45,6 +47,37 @@ pub fn log_android_context(stage: &str) {
 
 #[cfg(not(target_os = "android"))]
 pub fn log_android_context(_stage: &str) {}
+
+/// Reads one Android system property without depending on Java or an Activity
+/// lifecycle callback. Profiling-only callers use this for deterministic A/B
+/// selection before Bevy resources and render pipelines are created.
+#[cfg(all(target_os = "android", feature = "render_debug"))]
+pub(crate) fn android_system_property(name: &str) -> Option<String> {
+    use std::{
+        ffi::{CStr, CString},
+        os::raw::c_char,
+    };
+
+    const PROPERTY_VALUE_MAX: usize = 92;
+    unsafe extern "C" {
+        fn __system_property_get(name: *const c_char, value: *mut c_char) -> i32;
+    }
+
+    let name = CString::new(name).ok()?;
+    let mut value = [0 as c_char; PROPERTY_VALUE_MAX];
+    // SAFETY: `name` is NUL-terminated and `value` is the Bionic-documented
+    // PROPERTY_VALUE_MAX-sized writable output buffer.
+    let length = unsafe { __system_property_get(name.as_ptr(), value.as_mut_ptr()) };
+    if length <= 0 {
+        return None;
+    }
+    // SAFETY: a successful __system_property_get call NUL-terminates `value`.
+    Some(
+        unsafe { CStr::from_ptr(value.as_ptr()) }
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
 
 #[cfg(target_os = "android")]
 fn ack_android_activity_startup(android_app: &bevy::window::android_activity::AndroidApp) {
@@ -189,6 +222,54 @@ pub fn configure_android_display_refresh_rate(
 
     commands.insert_resource(AndroidDisplayRefreshConfigured);
 }
+
+/// Reports the three distinct layers involved in XR foveated rendering:
+/// runtime availability, application-enabled OpenXR extensions, and the
+/// vendor's current system policy. This is intentionally read-only; in
+/// particular it never writes PICO's persistent foveation property.
+#[cfg(all(target_os = "android", feature = "render_debug"))]
+pub fn log_android_xr_foveation_capabilities(
+    available: Option<Res<OxrAvailableExtensions>>,
+    enabled: Option<Res<OxrEnabledExtensions>>,
+) {
+    let Some(available) = available else {
+        warn!("OpenXR foveation capability probe: runtime extension set unavailable");
+        return;
+    };
+    let available = available.raw();
+    let enabled = enabled.as_deref().map(|extensions| extensions.raw());
+    let enabled_flag = |read: fn(&openxr::ExtensionSet) -> bool| enabled.map(read).unwrap_or(false);
+
+    info!(
+        "OpenXR foveation capability probe: available [swapchain_update_state={}, foveation={}, configuration={}, vulkan={}, eye_tracked={}] enabled [swapchain_update_state={}, foveation={}, configuration={}, vulkan={}, eye_tracked={}]",
+        available.fb_swapchain_update_state,
+        available.fb_foveation,
+        available.fb_foveation_configuration,
+        available.fb_foveation_vulkan,
+        available.meta_foveation_eye_tracked,
+        enabled_flag(|extensions| extensions.fb_swapchain_update_state),
+        enabled_flag(|extensions| extensions.fb_foveation),
+        enabled_flag(|extensions| extensions.fb_foveation_configuration),
+        enabled_flag(|extensions| extensions.fb_foveation_vulkan),
+        enabled_flag(|extensions| extensions.meta_foveation_eye_tracked),
+    );
+
+    match android_system_property("persist.pvr.foveation.level") {
+        Some(value) => info!(
+            "PICO system foveation policy (vendor-opaque, not proof of application shading rate): persist.pvr.foveation.level={value}"
+        ),
+        None => info!("PICO system foveation policy property is not present or not readable"),
+    }
+
+    if available.fb_foveation_vulkan && !enabled_flag(|extensions| extensions.fb_foveation_vulkan) {
+        info!(
+            "XR_FB_foveation_vulkan is advertised but not enabled by Zevy; the current swapchain therefore cannot be claimed as Fragment Density Map backed"
+        );
+    }
+}
+
+#[cfg(not(all(target_os = "android", feature = "render_debug")))]
+pub fn log_android_xr_foveation_capabilities() {}
 
 #[cfg(not(target_os = "android"))]
 pub fn configure_android_display_refresh_rate() {}

@@ -28,7 +28,7 @@ use crate::session::OxrSessionCreateNextChain;
 use crate::types::Result as OxrResult;
 use crate::types::*;
 
-use super::exts::OxrEnabledExtensions;
+use super::exts::{OxrAvailableExtensions, OxrEnabledExtensions};
 use super::poll_events::OxrEventHandlerExt;
 use super::poll_events::OxrEventIn;
 
@@ -86,10 +86,12 @@ impl Plugin for OxrInitPlugin {
                 instance,
                 system_id,
                 WgpuGraphics(device, queue, adapter_info, adapter, wgpu_instance),
+                available_exts,
                 enabled_exts,
                 graphics_info,
             )) => {
-                app.insert_resource(enabled_exts)
+                app.insert_resource(available_exts.clone())
+                    .insert_resource(enabled_exts)
                     .add_plugins((
                         RenderPlugin {
                             render_creation: RenderCreation::manual(
@@ -153,6 +155,7 @@ impl Plugin for OxrInitPlugin {
 
                 render_app
                     .add_systems(ExtractSchedule, transfer_xr_resources)
+                    .insert_resource(available_exts)
                     .insert_resource(instance)
                     .insert_resource(system_id)
                     .insert_resource(XrState::Available)
@@ -207,6 +210,7 @@ impl OxrInitPlugin {
         OxrInstance,
         OxrSystemId,
         WgpuGraphics,
+        OxrAvailableExtensions,
         OxrEnabledExtensions,
         SessionGraphicsCreateInfo,
     )> {
@@ -244,7 +248,7 @@ impl OxrInitPlugin {
         }
         .ok_or(OxrError::NoAvailableBackend)?;
 
-        let exts = self.exts.clone() & available_exts;
+        let exts = self.exts.clone() & available_exts.clone();
 
         let instance = entry.create_instance(
             self.app_info.clone(),
@@ -278,6 +282,7 @@ impl OxrInitPlugin {
             instance,
             OxrSystemId(system_id),
             graphics,
+            OxrAvailableExtensions(available_exts),
             OxrEnabledExtensions(exts),
             graphics_info,
         ))

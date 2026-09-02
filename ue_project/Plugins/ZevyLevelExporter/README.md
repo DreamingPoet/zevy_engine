@@ -38,11 +38,17 @@ exports:
 
 Add `-GenerateFixture` only for exporter validation. It temporarily spawns
 three attached Engine basic-shape meshes, two materials with baked textures,
-and Directional/Point/Spot lights without saving them back into the source Map.
+Directional/Point/Spot lights, and one sky-material sphere that must be omitted
+with a diagnostic, without saving them back into the source Map.
 
 ## Current limitations
 
 - Complex UE-only shaders are baked or degraded to glTF PBR.
+- Static-mesh components that use an Unreal `Is Sky` material are omitted and
+  reported in manifest diagnostics. These view-dependent procedural skies are
+  not portable glTF materials; omitting them also avoids a UE 5.5
+  `DrawTileMesh` static-uniform-buffer crash during material baking. A future
+  Zevy environment/sky metadata path must replace them explicitly.
 - Non-uniform parent scale combined with child rotation can differ after TRS
   decomposition; the exporter records a warning in the manifest.
 - Rect Light, Sky Light, IES, Light Function, advanced shadow settings,

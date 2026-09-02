@@ -13,7 +13,7 @@ mod shadow_overlay;
 mod xr;
 
 pub use app::{main, run};
-pub use config::RenderQualityConfig;
+pub use config::{LocalLightingPipeline, RenderQualityConfig};
 pub use scene::{
     ImportedZevyEntity, ImportedZevyLevel, ImportedZevyLight, ZevyBevyLightParameters,
     ZevyLevelAsset, ZevyLevelAssetLoader, ZevyLevelEntityDefinition, ZevyLevelPlugin,

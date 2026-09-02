@@ -1,8 +1,15 @@
-use bevy::{pbr::PointLightShadowMapJitter, prelude::*, transform::TransformSystem};
+use std::collections::HashSet;
+
+use bevy::{
+    pbr::{PointLightShadowMapJitter, PointLightShadowMapTransition},
+    prelude::*,
+    transform::TransformSystem,
+};
 
 use crate::{
+    config::RenderQualityConfig,
     scene::{ImportedZevyEntity, ImportedZevyLight},
-    shadow_cache::{CachedPointLightShadow, ShadowCacheSet},
+    shadow_cache::{CachedPointLightShadow, ShadowCacheSet, ZevyShadowCacheFrame},
     shadow_overlay::DynamicShadowCaster,
 };
 
@@ -266,6 +273,66 @@ struct PolicyManagedPointShadowCache;
 struct PolicyManagedPointShadowJitter;
 
 #[derive(Component)]
+struct PolicyManagedPointShadowTransition;
+
+#[derive(Component, Clone, Copy, Debug)]
+struct SlowMovingPointShadowState {
+    current_position: Vec3,
+    previous_position: Vec3,
+    current_range: f32,
+    current_near_z: f32,
+    last_snapshot_seconds: f32,
+    transition_start_seconds: f32,
+    transition_slot: Option<u32>,
+}
+
+#[derive(Resource, Debug, Default)]
+struct SlowMovingShadowSlotPool {
+    owners: Vec<Option<Entity>>,
+}
+
+impl SlowMovingShadowSlotPool {
+    fn configure(&mut self, capacity: usize, live_entities: &HashSet<Entity>) {
+        self.owners.resize(capacity, None);
+        for owner in &mut self.owners {
+            if owner.is_some_and(|entity| !live_entities.contains(&entity)) {
+                *owner = None;
+            }
+        }
+    }
+
+    fn claim(&mut self, entity: Entity) -> Option<u32> {
+        if let Some((slot, _)) = self
+            .owners
+            .iter()
+            .enumerate()
+            .find(|(_, owner)| **owner == Some(entity))
+        {
+            return Some(slot as u32);
+        }
+        let (slot, owner) = self
+            .owners
+            .iter_mut()
+            .enumerate()
+            .find(|(_, owner)| owner.is_none())?;
+        *owner = Some(entity);
+        Some(slot as u32)
+    }
+
+    fn release(&mut self, entity: Entity) {
+        for owner in &mut self.owners {
+            if *owner == Some(entity) {
+                *owner = None;
+            }
+        }
+    }
+
+    fn capacity(&self) -> usize {
+        self.owners.len()
+    }
+}
+
+#[derive(Component)]
 struct PolicyManagedDynamicShadowCaster;
 
 #[derive(Resource, Clone, Copy, Debug, Default)]
@@ -277,6 +344,11 @@ pub struct ShadowMotionPolicyTelemetry {
     pub caster_static: usize,
     pub caster_dynamic_overlay: usize,
     pub transitions_this_frame: usize,
+    pub slow_shadow_transitions_active: usize,
+    pub slow_shadow_transition_starts: usize,
+    pub slow_shadow_transition_waiting: usize,
+    pub slow_shadow_transition_slot_capacity: usize,
+    pub slow_shadow_max_stale_distance_m: f32,
 }
 
 #[derive(SystemSet, Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -287,6 +359,9 @@ pub(crate) struct ShadowMotionPolicyPlugin;
 impl Plugin for ShadowMotionPolicyPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<ShadowMotionPolicyTelemetry>()
+            .init_resource::<RenderQualityConfig>()
+            .init_resource::<ZevyShadowCacheFrame>()
+            .init_resource::<SlowMovingShadowSlotPool>()
             .configure_sets(
                 PostUpdate,
                 ShadowMotionPolicySet
@@ -300,6 +375,8 @@ impl Plugin for ShadowMotionPolicyPlugin {
                     resolve_light_shadow_motion,
                     resolve_spot_light_shadow_motion,
                     resolve_shadow_caster_motion,
+                    ApplyDeferred,
+                    update_slow_moving_point_shadow_snapshots,
                     cleanup_removed_motion_policies,
                     ApplyDeferred,
                 )
@@ -481,8 +558,235 @@ fn resolve_spot_light_shadow_motion(
             PolicyManagedPointShadowCache,
             PointLightShadowMapJitter,
             PolicyManagedPointShadowJitter,
+            PointLightShadowMapTransition,
+            PolicyManagedPointShadowTransition,
+            SlowMovingPointShadowState,
         )>();
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SlowMovingShadowWork {
+    entity: Entity,
+    position: Vec3,
+    range: f32,
+    near_z: f32,
+    state: SlowMovingPointShadowState,
+}
+
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn update_slow_moving_point_shadow_snapshots(
+    time: Res<Time>,
+    quality: Res<RenderQualityConfig>,
+    mut commands: Commands,
+    mut shadow_cache_frame: ResMut<ZevyShadowCacheFrame>,
+    mut slot_pool: ResMut<SlowMovingShadowSlotPool>,
+    mut telemetry: ResMut<ShadowMotionPolicyTelemetry>,
+    lights: Query<(
+        Entity,
+        &PointLight,
+        &GlobalTransform,
+        &ResolvedLightShadowMotion,
+        Option<&SlowMovingPointShadowState>,
+        Has<PolicyManagedPointShadowTransition>,
+    )>,
+) {
+    let now = time.elapsed_secs();
+    let crossfade_enabled = quality.slow_moving_shadow_crossfade_enabled();
+    let requested_slots = if crossfade_enabled {
+        quality.resolved_slow_moving_shadow_transition_slots()
+    } else {
+        0
+    };
+    let configured_slots = requested_slots.min(
+        shadow_cache_frame
+            .effective_transition_slots()
+            .unwrap_or(requested_slots),
+    );
+    let live_entities = lights.iter().map(|(entity, ..)| entity).collect();
+    slot_pool.configure(configured_slots, &live_entities);
+    telemetry.slow_shadow_transition_slot_capacity = slot_pool.capacity();
+
+    let transition_seconds = quality.resolved_slow_moving_shadow_crossfade_seconds();
+    let snapshot_hz = quality.resolved_slow_moving_shadow_snapshot_hz();
+    let snapshot_interval = if snapshot_hz > 0.0 {
+        Some(1.0 / snapshot_hz)
+    } else {
+        None
+    };
+    let distance_threshold = quality.resolved_slow_moving_shadow_snapshot_distance_m();
+    let mut work = Vec::new();
+
+    for (entity, light, transform, resolved, previous_state, managed_transition) in &lights {
+        if resolved.class != LightShadowMotionClass::SlowMoving || !light.shadows_enabled {
+            if previous_state.is_some() || managed_transition {
+                slot_pool.release(entity);
+                commands.entity(entity).remove::<(
+                    SlowMovingPointShadowState,
+                    PointLightShadowMapTransition,
+                    PolicyManagedPointShadowTransition,
+                )>();
+                // A cached class entered or left the snapshot-managed path.
+                // Re-align its resident cubemap with the real projection once.
+                shadow_cache_frame.invalidate_point_light(entity);
+            }
+            continue;
+        }
+
+        let position = transform.translation();
+        let mut state = previous_state
+            .copied()
+            .unwrap_or(SlowMovingPointShadowState {
+                current_position: position,
+                previous_position: position,
+                current_range: light.range,
+                current_near_z: light.shadow_map_near_z,
+                last_snapshot_seconds: now,
+                transition_start_seconds: now,
+                transition_slot: None,
+            });
+
+        if previous_state.is_none() {
+            shadow_cache_frame.invalidate_point_light(entity);
+        }
+        if state
+            .transition_slot
+            .is_some_and(|slot| slot as usize >= slot_pool.capacity())
+        {
+            slot_pool.release(entity);
+            state.transition_slot = None;
+            state.previous_position = state.current_position;
+        }
+
+        if state.transition_slot.is_some()
+            && (transition_seconds <= 0.0
+                || now - state.transition_start_seconds >= transition_seconds)
+        {
+            slot_pool.release(entity);
+            state.transition_slot = None;
+            state.previous_position = state.current_position;
+        }
+
+        // A near-plane change alters depth encoding, so old and new maps are
+        // not numerically blend-compatible. Perform one real redraw and settle
+        // immediately; transform/range motion continues through keyframes.
+        if light.shadow_map_near_z.to_bits() != state.current_near_z.to_bits() {
+            slot_pool.release(entity);
+            state.current_position = position;
+            state.previous_position = position;
+            state.current_range = light.range;
+            state.current_near_z = light.shadow_map_near_z;
+            state.last_snapshot_seconds = now;
+            state.transition_start_seconds = now;
+            state.transition_slot = None;
+            shadow_cache_frame.invalidate_point_light(entity);
+        }
+
+        work.push(SlowMovingShadowWork {
+            entity,
+            position,
+            range: light.range,
+            near_z: light.shadow_map_near_z,
+            state,
+        });
+    }
+
+    let mut candidates = work
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| {
+            if item.state.transition_slot.is_some() {
+                return None;
+            }
+            let position_delta = item.position.distance(item.state.current_position);
+            let range_delta = (item.range - item.state.current_range).abs();
+            let elapsed = (now - item.state.last_snapshot_seconds).max(0.0);
+            shadow_snapshot_is_due(
+                position_delta,
+                range_delta,
+                elapsed,
+                snapshot_interval,
+                distance_threshold,
+            )
+            .then_some((index, position_delta.max(range_delta)))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_unstable_by(|(left_index, left_stale), (right_index, right_stale)| {
+        right_stale.total_cmp(left_stale).then_with(|| {
+            work[*left_index]
+                .entity
+                .index()
+                .cmp(&work[*right_index].entity.index())
+        })
+    });
+
+    for (index, _) in candidates {
+        let item = &mut work[index];
+        if crossfade_enabled {
+            let Some(slot) = slot_pool.claim(item.entity) else {
+                telemetry.slow_shadow_transition_waiting += 1;
+                continue;
+            };
+            item.state.previous_position = item.state.current_position;
+            item.state.current_position = item.position;
+            item.state.current_range = item.range;
+            item.state.current_near_z = item.near_z;
+            item.state.last_snapshot_seconds = now;
+            item.state.transition_start_seconds = now;
+            item.state.transition_slot = Some(slot);
+            shadow_cache_frame.request_transition_copy(item.entity, slot);
+            telemetry.slow_shadow_transition_starts += 1;
+        } else {
+            item.state.current_position = item.position;
+            item.state.previous_position = item.position;
+            item.state.current_range = item.range;
+            item.state.current_near_z = item.near_z;
+            item.state.last_snapshot_seconds = now;
+            item.state.transition_start_seconds = now;
+            item.state.transition_slot = None;
+        }
+        shadow_cache_frame.invalidate_point_light(item.entity);
+    }
+
+    for item in work {
+        let blend = item.state.transition_slot.map_or(1.0, |_| {
+            if transition_seconds > 0.0 {
+                ((now - item.state.transition_start_seconds) / transition_seconds).clamp(0.0, 1.0)
+            } else {
+                1.0
+            }
+        });
+        telemetry.slow_shadow_transitions_active +=
+            usize::from(item.state.transition_slot.is_some());
+        telemetry.slow_shadow_max_stale_distance_m = telemetry
+            .slow_shadow_max_stale_distance_m
+            .max(item.position.distance(item.state.current_position));
+        commands.entity(item.entity).insert((
+            item.state,
+            PointLightShadowMapTransition {
+                current_position: item.state.current_position,
+                previous_position: item.state.previous_position,
+                blend,
+                transition_slot: item.state.transition_slot,
+            },
+            PolicyManagedPointShadowTransition,
+        ));
+    }
+}
+
+fn shadow_snapshot_is_due(
+    position_delta_m: f32,
+    range_delta_m: f32,
+    elapsed_seconds: f32,
+    snapshot_interval_seconds: Option<f32>,
+    distance_threshold_m: f32,
+) -> bool {
+    let moved = position_delta_m > 0.000_01 || range_delta_m > 0.000_01;
+    moved
+        && (position_delta_m >= distance_threshold_m
+            || range_delta_m >= distance_threshold_m
+            || snapshot_interval_seconds
+                .is_some_and(|interval| elapsed_seconds >= interval.max(0.0)))
 }
 
 fn next_light_motion_state(
@@ -756,6 +1060,7 @@ fn policy_delta_seconds(time: &Time) -> f32 {
 
 fn cleanup_removed_motion_policies(
     mut commands: Commands,
+    mut slot_pool: ResMut<SlowMovingShadowSlotPool>,
     orphaned_light_cache: Query<
         Entity,
         (
@@ -770,12 +1075,20 @@ fn cleanup_removed_motion_policies(
             Without<LightShadowMotionPolicy>,
         ),
     >,
+    orphaned_light_transition: Query<
+        Entity,
+        (
+            With<PolicyManagedPointShadowTransition>,
+            Without<LightShadowMotionPolicy>,
+        ),
+    >,
     orphaned_light_state: Query<
         Entity,
         (
             Or<(
                 With<LightShadowMotionState>,
                 With<ResolvedLightShadowMotion>,
+                With<SlowMovingPointShadowState>,
             )>,
             Without<LightShadowMotionPolicy>,
         ),
@@ -808,10 +1121,20 @@ fn cleanup_removed_motion_policies(
             .entity(entity)
             .remove::<(PointLightShadowMapJitter, PolicyManagedPointShadowJitter)>();
     }
+    for entity in &orphaned_light_transition {
+        slot_pool.release(entity);
+        commands.entity(entity).remove::<(
+            PointLightShadowMapTransition,
+            PolicyManagedPointShadowTransition,
+            SlowMovingPointShadowState,
+        )>();
+    }
     for entity in &orphaned_light_state {
-        commands
-            .entity(entity)
-            .remove::<(LightShadowMotionState, ResolvedLightShadowMotion)>();
+        commands.entity(entity).remove::<(
+            LightShadowMotionState,
+            ResolvedLightShadowMotion,
+            SlowMovingPointShadowState,
+        )>();
     }
     for entity in &orphaned_caster_marker {
         commands
@@ -1100,6 +1423,137 @@ mod tests {
                 .light_fully_dynamic,
             1
         );
+    }
+
+    #[test]
+    fn slow_moving_light_starts_and_finishes_a_sparse_snapshot_transition() {
+        let mut app = policy_test_app();
+        let entity = app
+            .world_mut()
+            .spawn((
+                PointLight {
+                    shadows_enabled: true,
+                    ..default()
+                },
+                Transform::default(),
+                GlobalTransform::default(),
+                LightShadowMotionPolicy::fixed(LightShadowMotionClass::SlowMoving),
+            ))
+            .id();
+
+        app.update();
+        let settled = app
+            .world()
+            .entity(entity)
+            .get::<PointLightShadowMapTransition>()
+            .copied()
+            .unwrap();
+        assert_eq!(settled.transition_slot, None);
+        assert_eq!(settled.current_position, Vec3::ZERO);
+
+        app.world_mut()
+            .entity_mut(entity)
+            .insert(GlobalTransform::from_translation(Vec3::new(0.05, 0.0, 0.0)));
+        advance_and_update(&mut app, 0.016);
+        let transition = app
+            .world()
+            .entity(entity)
+            .get::<PointLightShadowMapTransition>()
+            .copied()
+            .unwrap();
+        assert_eq!(transition.transition_slot, Some(0));
+        assert_eq!(transition.previous_position, Vec3::ZERO);
+        assert_eq!(transition.current_position, Vec3::new(0.05, 0.0, 0.0));
+        assert_eq!(transition.blend, 0.0);
+        assert_eq!(
+            app.world()
+                .resource::<ZevyShadowCacheFrame>()
+                .transition_copy_requests(),
+            &[crate::shadow_cache::PointShadowTransitionCopyRequest {
+                light: entity,
+                slot: 0,
+            }]
+        );
+
+        advance_and_update(&mut app, 0.13);
+        let settled = app
+            .world()
+            .entity(entity)
+            .get::<PointLightShadowMapTransition>()
+            .copied()
+            .unwrap();
+        assert_eq!(settled.transition_slot, None);
+        assert_eq!(settled.blend, 1.0);
+    }
+
+    #[test]
+    fn sparse_slot_contention_prefers_the_most_stale_light() {
+        let mut app = policy_test_app();
+        app.world_mut()
+            .resource::<ZevyShadowCacheFrame>()
+            .record_effective_transition_slots(1);
+        let first = app
+            .world_mut()
+            .spawn((
+                PointLight {
+                    shadows_enabled: true,
+                    ..default()
+                },
+                Transform::default(),
+                GlobalTransform::default(),
+                LightShadowMotionPolicy::fixed(LightShadowMotionClass::SlowMoving),
+            ))
+            .id();
+        let second = app
+            .world_mut()
+            .spawn((
+                PointLight {
+                    shadows_enabled: true,
+                    ..default()
+                },
+                Transform::default(),
+                GlobalTransform::default(),
+                LightShadowMotionPolicy::fixed(LightShadowMotionClass::SlowMoving),
+            ))
+            .id();
+        app.update();
+
+        app.world_mut()
+            .entity_mut(first)
+            .insert(GlobalTransform::from_translation(Vec3::X * 0.05));
+        app.world_mut()
+            .entity_mut(second)
+            .insert(GlobalTransform::from_translation(Vec3::X * 0.08));
+        advance_and_update(&mut app, 0.016);
+
+        assert_eq!(
+            app.world()
+                .entity(first)
+                .get::<PointLightShadowMapTransition>()
+                .unwrap()
+                .transition_slot,
+            None
+        );
+        assert_eq!(
+            app.world()
+                .entity(second)
+                .get::<PointLightShadowMapTransition>()
+                .unwrap()
+                .transition_slot,
+            Some(0)
+        );
+        let telemetry = app.world().resource::<ShadowMotionPolicyTelemetry>();
+        assert_eq!(telemetry.slow_shadow_transition_waiting, 1);
+        assert_eq!(telemetry.slow_shadow_transitions_active, 1);
+        assert_eq!(telemetry.slow_shadow_transition_slot_capacity, 1);
+    }
+
+    #[test]
+    fn snapshot_due_combines_time_and_projection_error() {
+        assert!(!shadow_snapshot_is_due(0.01, 0.0, 0.05, Some(0.125), 0.04,));
+        assert!(shadow_snapshot_is_due(0.04, 0.0, 0.05, Some(0.125), 0.04,));
+        assert!(shadow_snapshot_is_due(0.01, 0.0, 0.125, Some(0.125), 0.04,));
+        assert!(!shadow_snapshot_is_due(0.0, 0.0, 1.0, Some(0.125), 0.04,));
     }
 
     fn policy_test_app() -> App {

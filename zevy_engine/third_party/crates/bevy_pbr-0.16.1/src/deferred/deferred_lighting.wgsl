@@ -14,7 +14,11 @@
 #endif
 
 struct FullscreenVertexOutput {
-    @builtin(position)
+    // This pass uses CompareFunction::Equal against the lighting-ID depth
+    // attachment. Vulkan implementations are allowed to vary an otherwise
+    // equivalent position expression unless it is invariant, which can leave
+    // one-pixel lighting holes on mobile GPUs.
+    @builtin(position) @invariant
     position: vec4<f32>,
     @location(0)
     uv: vec2<f32>,
@@ -85,4 +89,3 @@ fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
 
     return output_color;
 }
-

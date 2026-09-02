@@ -23,6 +23,7 @@
 #include "HAL/FileManager.h"
 #include "IDesktopPlatform.h"
 #include "LevelInstance/LevelInstanceActor.h"
+#include "Materials/Material.h"
 #include "Materials/MaterialInterface.h"
 #include "Misc/App.h"
 #include "Misc/DateTime.h"
@@ -57,6 +58,8 @@ struct FContentSummary
     int32 PointLights = 0;
     int32 SpotLights = 0;
     int32 UnsupportedLights = 0;
+    int32 OmittedSkyMaterialActors = 0;
+    int32 OmittedSkyMaterialComponents = 0;
 };
 
 struct FSplitAssetRecord
@@ -66,6 +69,12 @@ struct FSplitAssetRecord
     FString FolderName;
     FString RelativeScenePath;
     AActor* RepresentativeActor = nullptr;
+};
+
+struct FSkyComponentVisibilityState
+{
+    TWeakObjectPtr<UStaticMeshComponent> Component;
+    bool bWasHiddenInGame = false;
 };
 
 FString GetLevelName(const UWorld* World)
@@ -168,6 +177,95 @@ bool HasSupportedLight(const AActor* Actor)
     return false;
 }
 
+bool UsesSkyMaterial(const UStaticMeshComponent* Component)
+{
+    if (!IsValid(Component) || Component->GetStaticMesh() == nullptr)
+    {
+        return false;
+    }
+
+    for (int32 MaterialIndex = 0; MaterialIndex < Component->GetNumMaterials(); ++MaterialIndex)
+    {
+        const UMaterialInterface* MaterialInterface = Component->GetMaterial(MaterialIndex);
+        const UMaterial* Material = IsValid(MaterialInterface) ? MaterialInterface->GetMaterial() : nullptr;
+        if (IsValid(Material) && Material->bIsSky)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool HasSkyMaterialMesh(const AActor* Actor)
+{
+    TArray<UStaticMeshComponent*> StaticMeshComponents;
+    Actor->GetComponents<UStaticMeshComponent>(StaticMeshComponents);
+    for (const UStaticMeshComponent* Component : StaticMeshComponents)
+    {
+        if (IsValid(Component) && !Component->IsEditorOnly() && UsesSkyMaterial(Component))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+void HideSkyMaterialComponents(
+    const TSet<AActor*>& Actors,
+    TArray<FSkyComponentVisibilityState>& OutVisibilityStates)
+{
+    for (AActor* Actor : Actors)
+    {
+        if (!IsValid(Actor))
+        {
+            continue;
+        }
+
+        TArray<UStaticMeshComponent*> StaticMeshComponents;
+        Actor->GetComponents<UStaticMeshComponent>(StaticMeshComponents);
+        for (UStaticMeshComponent* Component : StaticMeshComponents)
+        {
+            if (!IsValid(Component) || Component->IsEditorOnly() || !UsesSkyMaterial(Component))
+            {
+                continue;
+            }
+
+            FSkyComponentVisibilityState& State = OutVisibilityStates.AddDefaulted_GetRef();
+            State.Component = Component;
+            State.bWasHiddenInGame = Component->bHiddenInGame;
+            Component->SetHiddenInGame(true);
+        }
+    }
+}
+
+void RestoreSkyMaterialComponents(const TArray<FSkyComponentVisibilityState>& VisibilityStates)
+{
+    for (const FSkyComponentVisibilityState& State : VisibilityStates)
+    {
+        if (State.Component.IsValid())
+        {
+            State.Component->SetHiddenInGame(State.bWasHiddenInGame);
+        }
+    }
+}
+
+void AppendSkyComponentWarnings(
+    FGLTFExportMessages& Messages,
+    const TArray<FSkyComponentVisibilityState>& VisibilityStates)
+{
+    for (const FSkyComponentVisibilityState& State : VisibilityStates)
+    {
+        if (!State.Component.IsValid())
+        {
+            continue;
+        }
+
+        Messages.Warnings.Add(FString::Printf(
+            TEXT("Omitted UE sky-material component '%s'; procedural sky rendering is not portable to glTF and UE 5.5 material baking can crash in DrawTileMesh."),
+            *State.Component->GetPathName()));
+    }
+}
+
 bool HasExportableContent(const AActor* Actor)
 {
     if (!IsMainLevelActor(Actor))
@@ -185,7 +283,7 @@ bool HasExportableContent(const AActor* Actor)
     for (const UStaticMeshComponent* Component : StaticMeshComponents)
     {
         if (IsValid(Component) && !Component->IsEditorOnly() &&
-            Component->GetStaticMesh() != nullptr)
+            Component->GetStaticMesh() != nullptr && !UsesSkyMaterial(Component))
         {
             return true;
         }
@@ -234,7 +332,7 @@ FString BuildActorContentSignature(const AActor* Actor)
     for (const UStaticMeshComponent* Component : Components)
     {
         if (!IsValid(Component) || Component->IsEditorOnly() ||
-            Component->GetStaticMesh() == nullptr)
+            Component->GetStaticMesh() == nullptr || UsesSkyMaterial(Component))
         {
             continue;
         }
@@ -563,10 +661,18 @@ FContentSummary CollectContentSummary(UWorld* World)
         Actor->GetComponents<UStaticMeshComponent>(StaticMeshComponents);
 
         bool bHasExportableStaticMesh = false;
+        bool bHasOmittedSkyMaterialMesh = false;
         for (UStaticMeshComponent* Component : StaticMeshComponents)
         {
             if (!IsValid(Component) || Component->IsEditorOnly() || Component->GetStaticMesh() == nullptr)
             {
+                continue;
+            }
+
+            if (UsesSkyMaterial(Component))
+            {
+                bHasOmittedSkyMaterialMesh = true;
+                ++Summary.OmittedSkyMaterialComponents;
                 continue;
             }
 
@@ -585,6 +691,10 @@ FContentSummary CollectContentSummary(UWorld* World)
         if (bHasExportableStaticMesh)
         {
             ++Summary.StaticMeshActors;
+        }
+        if (bHasOmittedSkyMaterialMesh)
+        {
+            ++Summary.OmittedSkyMaterialActors;
         }
 
         TArray<ULightComponent*> LightComponents;
@@ -677,6 +787,8 @@ bool WriteManifest(
     Content->SetNumberField(TEXT("point_lights"), Summary.PointLights);
     Content->SetNumberField(TEXT("spot_lights"), Summary.SpotLights);
     Content->SetNumberField(TEXT("unsupported_lights"), Summary.UnsupportedLights);
+    Content->SetNumberField(TEXT("omitted_sky_material_actors"), Summary.OmittedSkyMaterialActors);
+    Content->SetNumberField(TEXT("omitted_sky_material_components"), Summary.OmittedSkyMaterialComponents);
     Root->SetObjectField(TEXT("content"), Content);
 
     TSharedRef<FJsonObject> Export = MakeShared<FJsonObject>();
@@ -744,7 +856,25 @@ bool ExportWorld(UWorld* World, const FString& RequestedGlbPath, FString& OutMan
     TStrongObjectPtr<UGLTFExportOptions> Options(NewObject<UGLTFExportOptions>());
     ConfigureExportOptions(Options.Get());
 
-    const TSet<AActor*> ActorsToExport;
+    TSet<AActor*> ActorsToExport;
+    for (TActorIterator<AActor> ActorIterator(World); ActorIterator; ++ActorIterator)
+    {
+        AActor* Actor = *ActorIterator;
+        if (IsValid(Actor) && !Actor->IsEditorOnly())
+        {
+            ActorsToExport.Add(Actor);
+        }
+    }
+
+    TArray<FSkyComponentVisibilityState> SkyVisibilityStates;
+    HideSkyMaterialComponents(ActorsToExport, SkyVisibilityStates);
+    UE_LOG(
+        LogZevyLevelExporter,
+        Display,
+        TEXT("Exporting monolithic World to %s (omitted sky-material components=%d)"),
+        *GlbPath,
+        SkyVisibilityStates.Num());
+
     FGLTFExportMessages Messages;
     const bool bExported = UGLTFExporter::ExportToGLTF(
         World,
@@ -752,6 +882,8 @@ bool ExportWorld(UWorld* World, const FString& RequestedGlbPath, FString& OutMan
         Options.Get(),
         ActorsToExport,
         Messages);
+    RestoreSkyMaterialComponents(SkyVisibilityStates);
+    AppendSkyComponentWarnings(Messages, SkyVisibilityStates);
     LogExportMessages(Messages);
 
     if (!bExported)
@@ -811,6 +943,9 @@ bool ExportActorAsset(
     TSet<AActor*> ActorsToExport;
     AddLevelInstanceActorsRecursive(Actor, ActorsToExport);
 
+    TArray<FSkyComponentVisibilityState> SkyVisibilityStates;
+    HideSkyMaterialComponents(ActorsToExport, SkyVisibilityStates);
+
     const FTransform OriginalWorldTransform = Actor->GetActorTransform();
     const FTransform OriginalRelativeTransform = RootComponent->GetRelativeTransform();
     const TWeakObjectPtr<USceneComponent> OriginalAttachParent = RootComponent->GetAttachParent();
@@ -819,6 +954,16 @@ bool ExportActorAsset(
     Actor->DetachFromActor(FDetachmentTransformRules::KeepWorldTransform);
     Actor->SetActorTransform(FTransform::Identity, false, nullptr, ETeleportType::TeleportPhysics);
 
+    UE_LOG(
+        LogZevyLevelExporter,
+        Display,
+        TEXT("Exporting asset %s (%s) from Actor %s: selected Actors=%d, omitted sky-material components=%d"),
+        *Asset.Id,
+        *Asset.RelativeScenePath,
+        *Actor->GetPathName(),
+        ActorsToExport.Num(),
+        SkyVisibilityStates.Num());
+
     FGLTFExportMessages Messages;
     const bool bExported = UGLTFExporter::ExportToGLTF(
         World,
@@ -826,6 +971,9 @@ bool ExportActorAsset(
         Options,
         ActorsToExport,
         Messages);
+
+    RestoreSkyMaterialComponents(SkyVisibilityStates);
+    AppendSkyComponentWarnings(Messages, SkyVisibilityStates);
 
     Actor->SetActorTransform(
         OriginalWorldTransform,
@@ -900,6 +1048,8 @@ bool WriteSplitManifest(
     Content->SetNumberField(TEXT("point_lights"), Summary.PointLights);
     Content->SetNumberField(TEXT("spot_lights"), Summary.SpotLights);
     Content->SetNumberField(TEXT("unsupported_lights"), Summary.UnsupportedLights);
+    Content->SetNumberField(TEXT("omitted_sky_material_actors"), Summary.OmittedSkyMaterialActors);
+    Content->SetNumberField(TEXT("omitted_sky_material_components"), Summary.OmittedSkyMaterialComponents);
     Content->SetNumberField(TEXT("exported_assets"), Assets.Num());
     Content->SetNumberField(TEXT("exported_entities"), RelevantActors.Num());
     Root->SetObjectField(TEXT("content"), Content);
@@ -1107,12 +1257,17 @@ bool ExportWorldSplit(
     }
 
     TArray<AActor*> ExportableActors;
+    TArray<AActor*> OmittedSkyMaterialActors;
     for (TActorIterator<AActor> ActorIterator(World); ActorIterator; ++ActorIterator)
     {
         AActor* Actor = *ActorIterator;
         if (HasExportableContent(Actor))
         {
             ExportableActors.Add(Actor);
+        }
+        else if (IsMainLevelActor(Actor) && HasSkyMaterialMesh(Actor))
+        {
+            OmittedSkyMaterialActors.Add(Actor);
         }
     }
     ExportableActors.Sort([](const AActor& Left, const AActor& Right)
@@ -1199,6 +1354,14 @@ bool ExportWorldSplit(
     ConfigureExportOptions(Options.Get());
 
     FGLTFExportMessages CombinedMessages;
+    for (const AActor* Actor : OmittedSkyMaterialActors)
+    {
+        const FString Warning = FString::Printf(
+            TEXT("Omitted sky-material-only Actor '%s'; procedural sky rendering is not portable to glTF and UE 5.5 material baking can crash in DrawTileMesh."),
+            *Actor->GetPathName());
+        CombinedMessages.Warnings.Add(Warning);
+        UE_LOG(LogZevyLevelExporter, Warning, TEXT("%s"), *Warning);
+    }
     for (const FSplitAssetRecord& Asset : Assets)
     {
         if (!ExportActorAsset(

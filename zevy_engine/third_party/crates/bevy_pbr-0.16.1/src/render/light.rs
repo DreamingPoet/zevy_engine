@@ -67,6 +67,14 @@ pub struct ExtractedPointLight {
     /// Small world-space virtual translation used only by Zevy's cached
     /// point-shadow sampling path. It never changes the shadow render views.
     pub shadow_map_jitter: Vec3,
+    /// World-space origin of the resident static point-shadow cubemap.
+    pub shadow_map_position: Vec3,
+    /// World-space origin of the copied older static cubemap.
+    pub previous_shadow_map_position: Vec3,
+    /// Visibility cross-fade from the previous snapshot to the resident one.
+    pub shadow_map_transition_blend: f32,
+    /// Sparse transition-pool slot, if an older cubemap is resident.
+    pub shadow_map_transition_slot: Option<u32>,
     /// whether this point light contributes diffuse light to lightmapped meshes
     pub affects_lightmapped_mesh_diffuse: bool,
 }
@@ -274,6 +282,7 @@ pub fn extract_lights(
             &CubemapFrusta,
             Option<&VolumetricLight>,
             Option<&PointLightShadowMapJitter>,
+            Option<&PointLightShadowMapTransition>,
         )>,
     >,
     spot_lights: Extract<
@@ -356,6 +365,7 @@ pub fn extract_lights(
             frusta,
             volumetric_light,
             shadow_map_jitter,
+            shadow_map_transition,
         )) = point_lights.get(entity)
         else {
             continue;
@@ -372,6 +382,10 @@ pub fn extract_lights(
                 .unwrap(),
         };
 
+        let physical_position = transform.translation();
+        let shadow_map_transition = shadow_map_transition.copied().unwrap_or_else(|| {
+            PointLightShadowMapTransition::settled(physical_position)
+        });
         let extracted_point_light = ExtractedPointLight {
             color: point_light.color.into(),
             // NOTE: Map from luminous power in lumens to luminous intensity in lumens per steradian
@@ -393,6 +407,10 @@ pub fn extract_lights(
             shadow_map_jitter: shadow_map_jitter.map_or(Vec3::ZERO, |jitter| {
                 transform.affine().transform_vector3(jitter.local_offset)
             }),
+            shadow_map_position: shadow_map_transition.current_position,
+            previous_shadow_map_position: shadow_map_transition.previous_position,
+            shadow_map_transition_blend: shadow_map_transition.blend.clamp(0.0, 1.0),
+            shadow_map_transition_slot: shadow_map_transition.transition_slot,
             affects_lightmapped_mesh_diffuse: point_light.affects_lightmapped_mesh_diffuse,
             #[cfg(feature = "experimental_pbr_pcss")]
             soft_shadows_enabled: point_light.soft_shadows_enabled,
@@ -459,6 +477,10 @@ pub fn extract_lights(
                         spot_light_angles: Some((spot_light.inner_angle, spot_light.outer_angle)),
                         volumetric: volumetric_light.is_some(),
                         shadow_map_jitter: Vec3::ZERO,
+                        shadow_map_position: transform.translation(),
+                        previous_shadow_map_position: transform.translation(),
+                        shadow_map_transition_blend: 1.0,
+                        shadow_map_transition_slot: None,
                         affects_lightmapped_mesh_diffuse: spot_light
                             .affects_lightmapped_mesh_diffuse,
                         #[cfg(feature = "experimental_pbr_pcss")]
@@ -1026,6 +1048,9 @@ pub fn prepare_lights(
         } else {
             0
         };
+        let transition_slot_plus_one = light
+            .shadow_map_transition_slot
+            .map_or(0.0, |slot| slot.saturating_add(1) as f32);
 
         gpu_point_lights.push(GpuClusterableObject {
             light_custom_data,
@@ -1036,13 +1061,19 @@ pub fn prepare_lights(
                 .xyz()
                 .extend(1.0 / (light.range * light.range)),
             position_radius: light.transform.translation().extend(light.radius),
+            shadow_map_position_blend: light
+                .shadow_map_position
+                .extend(light.shadow_map_transition_blend.clamp(0.0, 1.0)),
+            previous_shadow_map_position_slot: light
+                .previous_shadow_map_position
+                .extend(transition_slot_plus_one),
             flags: flags.bits() | shadow_map_jitter_flags,
             shadow_depth_bias: light.shadow_depth_bias,
             shadow_normal_bias: light.shadow_normal_bias,
             shadow_map_near_z: light.shadow_map_near_z,
             spot_light_tan_angle,
-            pad_a: 0.0,
-            pad_b: 0.0,
+            shadow_map_cube_count: point_light_shadow_maps_count as u32,
+            pad: 0.0,
             soft_shadow_size: if light.soft_shadows_enabled {
                 light.radius
             } else {

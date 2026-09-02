@@ -6,6 +6,10 @@ struct ClusterableObject {
     light_custom_data: vec4<f32>,
     color_inverse_square_range: vec4<f32>,
     position_radius: vec4<f32>,
+    // Zevy cached-shadow snapshots. The physical light position remains in
+    // position_radius; these origins are shared by both XR eyes.
+    shadow_map_position_blend: vec4<f32>,
+    previous_shadow_map_position_slot: vec4<f32>,
     // 'flags' is a bit field indicating various options. u32 is 32 bits so we have up to 32 options.
     flags: u32,
     shadow_depth_bias: f32,
@@ -13,7 +17,7 @@ struct ClusterableObject {
     spot_light_tan_angle: f32,
     soft_shadow_size: f32,
     shadow_map_near_z: f32,
-    texture_index: u32,
+    shadow_map_cube_count: u32,
     pad: f32,
 };
 

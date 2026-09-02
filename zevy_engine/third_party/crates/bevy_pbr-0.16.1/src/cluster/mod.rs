@@ -38,11 +38,14 @@ mod test;
 
 // NOTE: this must be kept in sync with the same constants in
 // `mesh_view_types.wgsl`.
-pub const MAX_UNIFORM_BUFFER_CLUSTERABLE_OBJECTS: usize = 204;
+// Zevy adds two vec4s for cached point-shadow snapshot reconstruction. At
+// 112 bytes per object, 146 entries remain below WebGL 2's 16 KiB UBO floor.
+pub const MAX_UNIFORM_BUFFER_CLUSTERABLE_OBJECTS: usize = 146;
 // Make sure that the clusterable object buffer doesn't overflow the maximum
 // size of a UBO on WebGL 2.
 const _: () =
     assert!(size_of::<GpuClusterableObject>() * MAX_UNIFORM_BUFFER_CLUSTERABLE_OBJECTS <= 16384);
+const _: () = assert!(size_of::<GpuClusterableObject>() == 112);
 
 // NOTE: Clustered-forward rendering requires 3 storage buffer bindings so check that
 // at least that many are supported using this constant and SupportedBindingType::from_device()
@@ -166,14 +169,19 @@ pub struct GpuClusterableObject {
     pub(crate) light_custom_data: Vec4,
     pub(crate) color_inverse_square_range: Vec4,
     pub(crate) position_radius: Vec4,
+    /// xyz: resident static-shadow snapshot origin; w: transition blend.
+    pub(crate) shadow_map_position_blend: Vec4,
+    /// xyz: previous static-shadow snapshot origin; w: sparse slot + 1.
+    pub(crate) previous_shadow_map_position_slot: Vec4,
     pub(crate) flags: u32,
     pub(crate) shadow_depth_bias: f32,
     pub(crate) shadow_normal_bias: f32,
     pub(crate) spot_light_tan_angle: f32,
     pub(crate) soft_shadow_size: f32,
     pub(crate) shadow_map_near_z: f32,
-    pub(crate) pad_a: f32,
-    pub(crate) pad_b: f32,
+    /// Number of shadowed PointLight cubes in the static atlas section.
+    pub(crate) shadow_map_cube_count: u32,
+    pub(crate) pad: f32,
 }
 
 pub enum GpuClusterableObjects {

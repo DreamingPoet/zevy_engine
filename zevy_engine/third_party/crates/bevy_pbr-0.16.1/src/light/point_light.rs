@@ -23,6 +23,38 @@ pub struct PointLightShadowMapJitter {
     pub local_offset: Vec3,
 }
 
+/// World-space positions used to reconstruct a cached point-light shadow
+/// between two real cubemap snapshots.
+///
+/// `current_position` is the origin from which the resident static cubemap was
+/// rendered. While a transition is active, `previous_position` addresses a
+/// copied older cubemap in Zevy's sparse transition pool and `blend` advances
+/// from zero to one. A missing `transition_slot` means that only the current
+/// snapshot is sampled.
+///
+/// This component deliberately does not move the physical [`PointLight`]. It
+/// only describes cached shadow data, allowing direct lighting and dynamic
+/// caster shadows to keep following the real light transform.
+#[derive(Component, Debug, Clone, Copy, Reflect)]
+#[reflect(Component, Debug, Clone)]
+pub struct PointLightShadowMapTransition {
+    pub current_position: Vec3,
+    pub previous_position: Vec3,
+    pub blend: f32,
+    pub transition_slot: Option<u32>,
+}
+
+impl PointLightShadowMapTransition {
+    pub fn settled(position: Vec3) -> Self {
+        Self {
+            current_position: position,
+            previous_position: position,
+            blend: 1.0,
+            transition_slot: None,
+        }
+    }
+}
+
 /// A light that emits light in all directions from a central point.
 ///
 /// Real-world values for `intensity` (luminous power in lumens) based on the electrical power

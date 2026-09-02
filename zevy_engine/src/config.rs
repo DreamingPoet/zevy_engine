@@ -1,4 +1,43 @@
-use bevy::{prelude::*, render::view::Msaa};
+use bevy::{
+    core_pipeline::prepass::{DeferredPrepass, DepthPrepass},
+    prelude::*,
+    render::view::Msaa,
+};
+
+/// Main opaque local-lighting architecture.
+///
+/// `DeferredReference` is deliberately a full-resolution correctness and cost
+/// baseline. It does not claim reduced-rate shading; it establishes the
+/// G-buffer path needed by Zevy's later low-resolution lighting and
+/// edge-aware reconstruction experiments.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum LocalLightingPipeline {
+    #[default]
+    Forward,
+    DeferredReference,
+}
+
+impl LocalLightingPipeline {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Forward => "forward reference",
+            Self::DeferredReference => "full-resolution deferred reference",
+        }
+    }
+
+    pub(crate) fn uses_deferred_prepass(self) -> bool {
+        self == Self::DeferredReference
+    }
+
+    #[cfg(any(test, all(target_os = "android", feature = "render_debug")))]
+    pub(crate) fn from_debug_label(label: &str) -> Option<Self> {
+        match label.trim().to_ascii_lowercase().as_str() {
+            "forward" | "forward-reference" => Some(Self::Forward),
+            "deferred" | "deferred-reference" => Some(Self::DeferredReference),
+            _ => None,
+        }
+    }
+}
 
 /// Central rendering-quality settings for desktop and XR.
 ///
@@ -12,7 +51,12 @@ pub struct RenderQualityConfig {
     /// `1.0` uses the full recommended resolution; `0.8` renders 64% as many
     /// pixels per eye.
     pub xr_render_scale: f32,
+    /// Selects the main local-lighting architecture. Keep `Forward` as the
+    /// product reference while the deferred/reconstruction path is measured.
+    pub local_lighting_pipeline: LocalLightingPipeline,
     /// Supported values are 1 (off), 2, 4, and 8 samples.
+    /// Full-resolution deferred forces this to 1 because Bevy's G-buffer path
+    /// is single-sampled; the effective value is reported explicitly.
     pub msaa_samples: u32,
     /// Width and height of each of the six point-light shadow cubemap faces.
     /// Bevy's default is 1024; 128 is the current multi-light VR test tier.
@@ -97,12 +141,29 @@ pub struct RenderQualityConfig {
     /// scheduled oldest-first so an overloaded frame budget cannot starve a
     /// subset of lights. Each point-light update redraws six cubemap faces.
     pub max_cached_point_shadow_updates_per_frame: usize,
+    /// Enables sparse two-snapshot reconstruction for PointLights resolved as
+    /// `SlowMoving`. The static cubemap updates at keyframes while the shader
+    /// cross-fades old and new shadow visibility in a shared XR timeline.
+    pub slow_moving_shadow_crossfade: bool,
+    /// Maximum number of old PointLight cubemaps kept concurrently. This is a
+    /// sparse pool, not a third cubemap allocated for every shadowed light.
+    pub slow_moving_shadow_transition_slots: usize,
+    /// Maximum cadence at which a slow-moving light may create a new static
+    /// shadow snapshot. Zero disables time-driven updates; distance can still
+    /// trigger one.
+    pub slow_moving_shadow_snapshot_hz: f32,
+    /// World-space displacement that forces a new slow-moving shadow snapshot
+    /// even before the cadence interval expires.
+    pub slow_moving_shadow_snapshot_distance_m: f32,
+    /// Time used to blend old and new static shadow visibility.
+    pub slow_moving_shadow_crossfade_seconds: f32,
 }
 
 impl Default for RenderQualityConfig {
     fn default() -> Self {
         Self {
             xr_render_scale: 0.8,
+            local_lighting_pipeline: LocalLightingPipeline::Forward,
             msaa_samples: 2,
             point_shadow_map_size: 128,
             max_shadowed_point_lights: 0,
@@ -127,6 +188,11 @@ impl Default for RenderQualityConfig {
             point_shadow_cache_warmup_frames: 3,
             cached_point_shadow_update_hz: 8.0,
             max_cached_point_shadow_updates_per_frame: 8,
+            slow_moving_shadow_crossfade: true,
+            slow_moving_shadow_transition_slots: 4,
+            slow_moving_shadow_snapshot_hz: 8.0,
+            slow_moving_shadow_snapshot_distance_m: 0.04,
+            slow_moving_shadow_crossfade_seconds: 0.12,
         }
     }
 }
@@ -140,13 +206,21 @@ impl RenderQualityConfig {
         }
     }
 
-    pub(crate) fn resolved_msaa(self) -> Msaa {
+    fn resolved_requested_msaa(self) -> Msaa {
         match self.msaa_samples {
             1 => Msaa::Off,
             2 => Msaa::Sample2,
             4 => Msaa::Sample4,
             8 => Msaa::Sample8,
             _ => Msaa::Sample2,
+        }
+    }
+
+    pub(crate) fn resolved_msaa(self) -> Msaa {
+        if self.local_lighting_pipeline.uses_deferred_prepass() {
+            Msaa::Off
+        } else {
+            self.resolved_requested_msaa()
         }
     }
 
@@ -261,16 +335,99 @@ impl RenderQualityConfig {
             8.0
         }
     }
+
+    pub(crate) fn slow_moving_shadow_crossfade_enabled(self) -> bool {
+        self.point_light_shadows
+            && self.scalable_point_lighting
+            && self.persistent_point_shadow_cache
+            && self.slow_moving_shadow_crossfade
+            && self.resolved_slow_moving_shadow_transition_slots() > 0
+            && self.resolved_slow_moving_shadow_crossfade_seconds() > 0.0
+    }
+
+    pub(crate) fn resolved_slow_moving_shadow_transition_slots(self) -> usize {
+        self.slow_moving_shadow_transition_slots.min(16)
+    }
+
+    pub(crate) fn resolved_slow_moving_shadow_snapshot_hz(self) -> f32 {
+        if self.slow_moving_shadow_snapshot_hz.is_finite() {
+            self.slow_moving_shadow_snapshot_hz.clamp(0.0, 60.0)
+        } else {
+            8.0
+        }
+    }
+
+    pub(crate) fn resolved_slow_moving_shadow_snapshot_distance_m(self) -> f32 {
+        if self.slow_moving_shadow_snapshot_distance_m.is_finite() {
+            self.slow_moving_shadow_snapshot_distance_m
+                .clamp(0.001, 2.0)
+        } else {
+            0.04
+        }
+    }
+
+    pub(crate) fn resolved_slow_moving_shadow_crossfade_seconds(self) -> f32 {
+        if self.slow_moving_shadow_crossfade_seconds.is_finite() {
+            self.slow_moving_shadow_crossfade_seconds.clamp(0.0, 2.0)
+        } else {
+            0.12
+        }
+    }
+}
+
+/// Tracks only the prepass components inserted by Zevy so switching the
+/// experiment back to Forward can restore a camera's prior state instead of
+/// deleting components owned by another renderer feature.
+#[derive(Component, Clone, Copy, Debug)]
+pub(crate) struct ZevyDeferredLightingCamera {
+    had_depth_prepass: bool,
+    had_deferred_prepass: bool,
 }
 
 pub(crate) fn apply_render_quality_to_cameras(
     config: Res<RenderQualityConfig>,
-    mut cameras: Query<&mut Msaa, With<Camera3d>>,
+    mut commands: Commands,
+    mut cameras: Query<
+        (
+            Entity,
+            &mut Msaa,
+            Has<DepthPrepass>,
+            Has<DeferredPrepass>,
+            Option<&ZevyDeferredLightingCamera>,
+        ),
+        With<Camera3d>,
+    >,
 ) {
     let configured_msaa = config.resolved_msaa();
-    for mut msaa in &mut cameras {
+    let use_deferred = config.local_lighting_pipeline.uses_deferred_prepass();
+    for (entity, mut msaa, has_depth, has_deferred, zevy_deferred) in &mut cameras {
         if *msaa != configured_msaa {
             *msaa = configured_msaa;
+        }
+
+        if use_deferred {
+            let mut camera = commands.entity(entity);
+            if zevy_deferred.is_none() {
+                camera.insert(ZevyDeferredLightingCamera {
+                    had_depth_prepass: has_depth,
+                    had_deferred_prepass: has_deferred,
+                });
+            }
+            if !has_depth {
+                camera.insert(DepthPrepass);
+            }
+            if !has_deferred {
+                camera.insert(DeferredPrepass);
+            }
+        } else if let Some(previous) = zevy_deferred {
+            let mut camera = commands.entity(entity);
+            camera.remove::<ZevyDeferredLightingCamera>();
+            if !previous.had_depth_prepass {
+                camera.remove::<DepthPrepass>();
+            }
+            if !previous.had_deferred_prepass {
+                camera.remove::<DeferredPrepass>();
+            }
         }
     }
 }
@@ -278,6 +435,7 @@ pub(crate) fn apply_render_quality_to_cameras(
 pub(crate) fn log_render_quality_config(config: Res<RenderQualityConfig>) {
     let resolved_scale = config.resolved_xr_render_scale();
     let resolved_msaa = config.resolved_msaa();
+    let requested_msaa = config.resolved_requested_msaa();
     let point_shadow_policy = if !config.point_light_shadows {
         "disabled by fixed A/B profile".to_owned()
     } else if config.max_shadowed_point_lights == 0 {
@@ -290,11 +448,19 @@ pub(crate) fn log_render_quality_config(config: Res<RenderQualityConfig>) {
         && config.scalable_point_lighting
         && config.dynamic_shadow_caster_overlay;
 
-    if config.msaa_samples != resolved_msaa.samples() {
+    if config.msaa_samples != requested_msaa.samples() {
         warn!(
             "Unsupported RenderQualityConfig.msaa_samples={}; using {}x",
             config.msaa_samples,
-            resolved_msaa.samples()
+            requested_msaa.samples()
+        );
+    }
+    if config.local_lighting_pipeline.uses_deferred_prepass() && requested_msaa != resolved_msaa {
+        info!(
+            "{} disables MSAA: requested {}x, effective {}x",
+            config.local_lighting_pipeline.label(),
+            requested_msaa.samples(),
+            resolved_msaa.samples(),
         );
     }
     if (config.xr_render_scale - resolved_scale).abs() > f32::EPSILON {
@@ -315,8 +481,9 @@ pub(crate) fn log_render_quality_config(config: Res<RenderQualityConfig>) {
     }
 
     info!(
-        "Render quality: XR scale {:.2}, MSAA {}x, A/B {}, point shadow eligibility {} at {}px, clusters {}/{}z to {:.1}m, scalable point lights {} ({} Hero + {} tail samples, exact through {} lights, {}, selection {}), persistent shadow cache {} + dynamic overlay {}, continuous projection proxy {} at {:.2}x (redraw reference {} Hz, {} light/frame)",
+        "Render quality: XR scale {:.2}, {} with MSAA {}x, A/B {}, point shadow eligibility {} at {}px, clusters {}/{}z to {:.1}m, scalable point lights {} ({} Hero + {} tail samples, exact through {} lights, {}, selection {}), persistent shadow cache {} + dynamic overlay {}, continuous projection proxy {} at {:.2}x (redraw reference {} Hz, {} light/frame)",
         resolved_scale,
+        config.local_lighting_pipeline.label(),
         resolved_msaa.samples(),
         config.point_light_ab_profile_label(),
         point_shadow_policy,
@@ -356,6 +523,18 @@ pub(crate) fn log_render_quality_config(config: Res<RenderQualityConfig>) {
         config.resolved_cached_point_shadow_update_hz(),
         config.max_cached_point_shadow_updates_per_frame,
     );
+    info!(
+        "SlowMoving point shadows: cross-fade {}, {} sparse slots, snapshots up to {:.1} Hz or {:.3} m displacement, {:.3} s blend",
+        if config.slow_moving_shadow_crossfade_enabled() {
+            "on"
+        } else {
+            "off"
+        },
+        config.resolved_slow_moving_shadow_transition_slots(),
+        config.resolved_slow_moving_shadow_snapshot_hz(),
+        config.resolved_slow_moving_shadow_snapshot_distance_m(),
+        config.resolved_slow_moving_shadow_crossfade_seconds(),
+    );
 }
 
 #[cfg(test)]
@@ -365,6 +544,10 @@ mod tests {
     #[test]
     fn default_point_shadow_residency_tracks_the_imported_light_count() {
         let quality = RenderQualityConfig::default();
+        assert_eq!(
+            quality.local_lighting_pipeline,
+            LocalLightingPipeline::Forward
+        );
         assert_eq!(quality.max_shadowed_point_lights, 0);
         assert_eq!(quality.resolved_point_shadow_resident_count(16), 16);
         assert!(quality.point_light_direct_lighting);
@@ -379,6 +562,57 @@ mod tests {
             quality.point_light_selection_mode_label(),
             "single-scan world reservoir"
         );
+    }
+
+    #[test]
+    fn deferred_reference_is_explicit_and_forces_single_sample_gbuffer() {
+        let quality = RenderQualityConfig {
+            local_lighting_pipeline: LocalLightingPipeline::DeferredReference,
+            msaa_samples: 8,
+            ..default()
+        };
+        assert!(quality.local_lighting_pipeline.uses_deferred_prepass());
+        assert_eq!(quality.resolved_requested_msaa(), Msaa::Sample8);
+        assert_eq!(quality.resolved_msaa(), Msaa::Off);
+        assert_eq!(
+            LocalLightingPipeline::from_debug_label("deferred"),
+            Some(LocalLightingPipeline::DeferredReference)
+        );
+        assert_eq!(LocalLightingPipeline::from_debug_label("unknown"), None);
+    }
+
+    #[test]
+    fn deferred_camera_switch_restores_preexisting_prepass_state() {
+        let mut app = App::new();
+        app.insert_resource(RenderQualityConfig {
+            local_lighting_pipeline: LocalLightingPipeline::DeferredReference,
+            msaa_samples: 4,
+            ..default()
+        })
+        .add_systems(Update, apply_render_quality_to_cameras);
+
+        let camera = app
+            .world_mut()
+            .spawn((Camera3d::default(), Msaa::Sample4, DepthPrepass))
+            .id();
+        app.update();
+
+        let deferred_camera = app.world().entity(camera);
+        assert_eq!(deferred_camera.get::<Msaa>(), Some(&Msaa::Off));
+        assert!(deferred_camera.contains::<DepthPrepass>());
+        assert!(deferred_camera.contains::<DeferredPrepass>());
+        assert!(deferred_camera.contains::<ZevyDeferredLightingCamera>());
+
+        app.world_mut()
+            .resource_mut::<RenderQualityConfig>()
+            .local_lighting_pipeline = LocalLightingPipeline::Forward;
+        app.update();
+
+        let forward_camera = app.world().entity(camera);
+        assert_eq!(forward_camera.get::<Msaa>(), Some(&Msaa::Sample4));
+        assert!(forward_camera.contains::<DepthPrepass>());
+        assert!(!forward_camera.contains::<DeferredPrepass>());
+        assert!(!forward_camera.contains::<ZevyDeferredLightingCamera>());
     }
 
     #[test]
@@ -499,5 +733,42 @@ mod tests {
             ..default()
         };
         assert_eq!(invalid.resolved_point_shadow_proxy_sway_scale(), 1.0);
+    }
+
+    #[test]
+    fn slow_shadow_crossfade_requires_the_complete_cached_shader_path() {
+        let enabled = RenderQualityConfig::default();
+        assert!(enabled.slow_moving_shadow_crossfade_enabled());
+        assert_eq!(enabled.resolved_slow_moving_shadow_transition_slots(), 4);
+
+        let no_cache = RenderQualityConfig {
+            persistent_point_shadow_cache: false,
+            ..enabled
+        };
+        assert!(!no_cache.slow_moving_shadow_crossfade_enabled());
+
+        let no_slots = RenderQualityConfig {
+            slow_moving_shadow_transition_slots: 0,
+            ..enabled
+        };
+        assert!(!no_slots.slow_moving_shadow_crossfade_enabled());
+
+        let clamped = RenderQualityConfig {
+            slow_moving_shadow_transition_slots: 99,
+            slow_moving_shadow_snapshot_hz: f32::INFINITY,
+            slow_moving_shadow_snapshot_distance_m: -1.0,
+            slow_moving_shadow_crossfade_seconds: f32::NAN,
+            ..enabled
+        };
+        assert_eq!(clamped.resolved_slow_moving_shadow_transition_slots(), 16);
+        assert_eq!(clamped.resolved_slow_moving_shadow_snapshot_hz(), 8.0);
+        assert_eq!(
+            clamped.resolved_slow_moving_shadow_snapshot_distance_m(),
+            0.001
+        );
+        assert_eq!(
+            clamped.resolved_slow_moving_shadow_crossfade_seconds(),
+            0.12
+        );
     }
 }
